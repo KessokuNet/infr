@@ -264,6 +264,11 @@ cfg_struct! {
         /// `INFR_KQ_FMA_GEMV`, TRI-state: the fp32 K-quant decode GEMV (`native_gemv_kq_fma`) in
         /// place of quant_q8 + the dp4a GEMV. `None` = auto (on when int8 dot is emulated).
         kq_fma_gemv: Option<bool> = None,
+        /// `INFR_NO_KQ_FMA_NORM` (inverted) — fold the `RmsNorm` feeding a `kq_fma` decode
+        /// GEMV into its prologue (normalize the input row in-kernel instead of a
+        /// standalone dispatch). The standalone norm runs when the GEMV can't take
+        /// the fused path.
+        kq_fma_norm: bool = true,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,

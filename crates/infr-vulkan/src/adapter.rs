@@ -795,6 +795,12 @@ fn linear_add_weight_ok(dt: infr_core::DType) -> bool {
     native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)
 }
 static LINEAR_ADD_WEIGHT_OK: fn(infr_core::DType) -> bool = linear_add_weight_ok;
+/// `RmsNorm -> kq_fma Linear` prologue fusion: only the kq_fma GEMV's Q4_K/Q6_K weights
+/// can normalize their input row in-kernel.
+fn rmsnorm_kq_weight_ok(dt: infr_core::DType) -> bool {
+    matches!(dt, infr_core::DType::Q4K | infr_core::DType::Q6K)
+}
+static RMSNORM_KQ_WEIGHT_OK: fn(infr_core::DType) -> bool = rmsnorm_kq_weight_ok;
 
 /// This adapter's [`FusionCfg`](infr_core::fusion::FusionCfg): the `Linear→Add` residual fusion
 /// (`INFR_NO_FUSE_ADD` hatch) and the `Rope/QkNormRope→WriteKv` KV-write fusion. `plan_fusions`
@@ -807,7 +813,17 @@ fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
             // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
-        rmsnorm_linear: None,
+        rmsnorm_linear: Some(infr_core::fusion::RmsNormLinearCfg {
+            weight_ok: &RMSNORM_KQ_WEIGHT_OK,
+            moe_ok: None,
+            enabled: be_.cfg().kernels.vulkan.kq_fma_norm
+                && be_
+                    .cfg()
+                    .kernels
+                    .vulkan
+                    .kq_fma_gemv
+                    .unwrap_or(!be_.caps().i8_dot_fast),
+        }),
         // F1c's `MoeFfn → Add` fold is un-planned on every live backend: this adapter's MoE lowering accumulates
         // the experts through its own `moe_accumulate`, which has no residual epilogue, so the
         // pattern stays un-planned here and Vulkan dispatches the standalone `Add` exactly as
@@ -1016,6 +1032,7 @@ fn lower_op(
     bindings: &Bindings,
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
+    fused_norm: &HashMap<usize, (TensorId, TensorId, f32)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
     // Per-execute Dynamic-attention contexts: the prologue args AND the pm/pl/pacc split scratch,
@@ -1172,6 +1189,10 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without offset-capable kernels"));
                 }
+                // The streamed kernels have no norm prologue: materialize the folded norm.
+                if let Some(&(x_pre, gamma, eps)) = fused_norm.get(&op_idx) {
+                    rec.rmsnorm(r(x_pre)?, r(gamma)?, xb, 1, in_f, eps);
+                }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
                     // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
@@ -1238,8 +1259,15 @@ fn lower_op(
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
                     if kq_fma_gemv_ok(be_, dt, in_f, out_f, 0) {
-                        rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f);
+                        let norm = match fused_norm.get(&op_idx) {
+                            Some(&(x_pre, gamma, eps)) => Some((r(x_pre)?, r(gamma)?, eps)),
+                            None => None,
+                        };
+                        rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f, norm);
                         return Ok(());
+                    }
+                    if let Some(&(x_pre, gamma, eps)) = fused_norm.get(&op_idx) {
+                        rec.rmsnorm(r(x_pre)?, r(gamma)?, xb, 1, in_f, eps);
                     }
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
@@ -1844,8 +1872,15 @@ fn lower_op(
                 // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
                 // only for a 256k-vocab model's single vocab GEMV.
                 if m == 1 && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off) {
-                    rec.linear_kq_fma(dt, w, w_off, xb, None, y, in_f, out_f);
+                    let norm = match fused_norm.get(&op_idx) {
+                        Some(&(x_pre, gamma, eps)) => Some((r(x_pre)?, r(gamma)?, eps)),
+                        None => None,
+                    };
+                    rec.linear_kq_fma(dt, w, w_off, xb, None, y, in_f, out_f, norm);
                     return Ok(());
+                }
+                if let Some(&(x_pre, gamma, eps)) = fused_norm.get(&op_idx) {
+                    rec.rmsnorm(r(x_pre)?, r(gamma)?, xb, 1, in_f, eps);
                 }
                 let mw = if m == 1
                     && !crate::recorder::bda_weight_breaches(
@@ -5027,6 +5062,7 @@ fn record_decode_replay(
     let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
+    let fused_norm = plan.rmsnorm_linear;
     let mut skip_op = plan.skip;
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
@@ -5142,6 +5178,7 @@ fn record_decode_replay(
             bindings,
             &fused_kv_write,
             &fused_add,
+            &fused_norm,
             &mode,
             &mut transient,
             &mut dyn_args,
@@ -5261,6 +5298,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
+    let fused_norm = plan.rmsnorm_linear;
     let skip_op = plan.skip;
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
@@ -5436,6 +5474,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         bindings,
                         &fused_kv_write,
                         &fused_add,
+                        &fused_norm,
                         &mode,
                         &mut transient,
                         &mut dyn_args,
@@ -5459,6 +5498,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             bindings,
             &fused_kv_write,
             &fused_add,
+            &fused_norm,
             &mode,
             &mut transient,
             &mut dyn_args,

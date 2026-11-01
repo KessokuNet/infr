@@ -3099,6 +3099,8 @@ impl<'a> Recorder<'a> {
 
     /// Decode (m=1) K-quant GEMV on f32 activations (`native_gemv_kq_fma.comp`): `y = x·Wᵀ`, or
     /// `y = residual + x·Wᵀ` with `residual`. Q4_K/Q6_K, `in_f % 256 == 0`, `w_base % 256 == 0`.
+    /// `norm` (`(pre-norm x, gamma, eps)`) folds the feeding `RmsNorm` into the prologue:
+    /// `x` (the norm's elided dst) is then only a shape reference.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_kq_fma(
         &self,
@@ -3110,9 +3112,10 @@ impl<'a> Recorder<'a> {
         y: &dyn Buffer,
         in_f: usize,
         out_f: usize,
+        norm: Option<(&dyn Buffer, &dyn Buffer, f32)>,
     ) {
         let nr = self.kq_fma_gemv_rows(out_f);
-        self.linear_kq_fma_nr(dtype, w, w_base, x, residual, y, in_f, out_f, nr);
+        self.linear_kq_fma_nr(dtype, w, w_base, x, residual, y, in_f, out_f, nr, norm);
     }
 
     /// Rows per workgroup for [`Self::linear_kq_fma`]: 8, or 4 when 8 would leave fewer than
@@ -3139,10 +3142,40 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
         nr: usize,
+        norm: Option<(&dyn Buffer, &dyn Buffer, f32)>,
     ) {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_kq_fma requires a u64 BDA device address");
+        debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
+        if let Some((x_pre, gamma, eps)) = norm {
+            let (name, spv) =
+                crate::gemm::native_gemv_kq_fma_norm_spv(dtype, residual.is_some(), nr)
+                    .expect("linear_kq_fma: dtype/nr gated by native_gemv_kq_fma_norm_spv");
+            self.label_gemv(name, 1, in_f, out_f);
+            let kern = self.be.kernel(name, spv, 4, 24);
+            let mut push = [0u8; 24];
+            push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+            push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+            push[8..12].copy_from_slice(&(w_base as u32).to_ne_bytes());
+            push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+            push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+            push[20..24].copy_from_slice(&eps.to_ne_bytes());
+            let r = residual.unwrap_or(x_pre);
+            self.dispatch_wide(
+                kern,
+                &[
+                    Self::vkb(x_pre),
+                    Self::vkb(r),
+                    Self::vkb(gamma),
+                    Self::vkb(y),
+                ],
+                1,
+                &push,
+                out_f.div_ceil(nr) as u32,
+            );
+            return;
+        }
         let (name, spv) = crate::gemm::native_gemv_kq_fma_spv(dtype, residual.is_some(), nr)
             .expect("linear_kq_fma: dtype/nr gated by native_gemv_kq_fma_spv");
         debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));

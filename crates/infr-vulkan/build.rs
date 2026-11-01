@@ -750,6 +750,48 @@ fn main() {
             "native_gemv_kq_fma_q6k_res_nr4",
             &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
         ),
+        // -DNORM twins: fold the feeding RmsNorm into the prologue (normalize the
+        // input row in-kernel, gamma row from binding 3, eps from push constant).
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_norm",
+            &["-DFMT_Q4K", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_norm",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_norm",
+            &["-DFMT_Q6K", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_norm",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_nr4_norm",
+            &["-DFMT_Q4K", "-DNR=4", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_nr4_norm",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_nr4_norm",
+            &["-DFMT_Q6K", "-DNR=4", "-DDNORM"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_nr4_norm",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4", "-DDNORM"],
+        ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
             "linear_f32r",

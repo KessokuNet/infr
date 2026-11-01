@@ -1095,6 +1095,35 @@ pub(crate) fn native_gemv_kq_fma_spv(
         _ => return None,
     })
 }
+/// RmsNorm-prologue twins of [`native_gemv_kq_fma_spv`] (`-DNORM`: normalize the input
+/// row in-kernel from a gamma row + eps instead of a standalone `RmsNorm` dispatch).
+/// `None` for dtypes without a build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemv_kq_fma_norm_spv(
+    dtype: infr_core::DType,
+    res: bool,
+    nr: usize,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match (dtype, res, nr) {
+        (Q4K, false, 8) => spv!("native_gemv_kq_fma_q4k_norm"),
+        (Q4K, true, 8) => spv!("native_gemv_kq_fma_q4k_res_norm"),
+        (Q6K, false, 8) => spv!("native_gemv_kq_fma_q6k_norm"),
+        (Q6K, true, 8) => spv!("native_gemv_kq_fma_q6k_res_norm"),
+        (Q4K, false, 4) => spv!("native_gemv_kq_fma_q4k_nr4_norm"),
+        (Q4K, true, 4) => spv!("native_gemv_kq_fma_q4k_res_nr4_norm"),
+        (Q6K, false, 4) => spv!("native_gemv_kq_fma_q6k_nr4_norm"),
+        (Q6K, true, 4) => spv!("native_gemv_kq_fma_q6k_res_nr4_norm"),
+        _ => return None,
+    })
+}
 /// Whether `native_gemm_kq_fma` has a build for `dtype`.
 pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
     matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K)

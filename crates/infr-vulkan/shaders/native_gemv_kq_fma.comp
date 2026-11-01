@@ -2,7 +2,8 @@
 // Decode (m=1) K-quant GEMV y = x·Wᵀ on f32 activations (no quant_q8 pass), for GPUs without fast
 // int8 dot. One 64-thread workgroup per NR output rows; 8 lanes per 256-element superblock, and
 // each work item applies one superblock's activations to 4 rows.
-// -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ). Requires in_f % 256 == 0.
+// -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ), optional -DDNORM (x is
+// RMS-normalized in-kernel; gamma at binding 2, y at binding 3). Requires in_f % 256 == 0.
 #extension GL_EXT_control_flow_attributes : require
 
 #ifndef NR
@@ -13,18 +14,34 @@ const uint RG = uint(NR) / 4u;
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+#ifdef DNORM
+    float eps;
+#endif
 } pc;
 layout(binding = 0) readonly buffer XB { vec4 x4[]; };
 #ifdef USE_RES
 layout(binding = 1) readonly buffer RB { float res[]; };
 #endif
+#ifdef DNORM
+layout(binding = 2) readonly buffer GB { vec4 g4[]; };
+layout(binding = 3) writeonly buffer YB { float y[]; };
+#else
 layout(binding = 2) writeonly buffer YB { float y[]; };
+#endif
 
 #include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 #include "native_decode.glsl"
 
-shared float red[NR * 64];
+#ifdef DNORM
+// y = s·W(x∘γ): the inverse RMS s is applied after the reduction; Σx² rides along in ssq.
+const uint NRED = uint(NR) + 1u;
+float ssq = 0.0;
+bool count_ssq = false;
+#else
+const uint NRED = uint(NR);
+#endif
+shared float red[NRED * 64u];
 
 // Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
 uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
@@ -35,7 +52,16 @@ float dot4b(uint q, vec4 xv) {
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
-// Superblock `sb` of rows row0..row0+3 (rows past out_f clamp to the last row; never written).
+#ifdef DNORM
+vec4 nx4(uint i) {
+    vec4 v = x4[i];
+    if (count_ssq) ssq += dot(v, v);
+    return v * g4[i];
+}
+#define NX4(b, w) nx4((b) + (w))
+#else
+#define NX4(b, w) x4[(b) + (w)]
+#endif
 #if defined(FMT_Q4K)
 vec4 item(uint row0, uint sb, uint l8) {
     uint g = l8 >> 1u;
@@ -44,8 +70,8 @@ vec4 item(uint row0, uint sb, uint l8) {
     vec4 xa[4];
     vec4 xc[4];
     [[unroll]] for (uint w = 0u; w < 4u; w++) {
-        xa[w] = x4[xb + w];
-        xc[w] = x4[xb + 8u + w];
+        xa[w] = NX4(xb, w);
+        xc[w] = NX4(xb + 8u, w);
     }
     float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
     float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
@@ -76,8 +102,8 @@ vec4 item(uint row0, uint sb, uint l8) {
     vec4 xv[8];
     float sx[4];
     [[unroll]] for (uint og = 0u; og < 4u; og++) {
-        xv[og * 2u] = x4[xb + og * 8u];
-        xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
+        xv[og * 2u] = NX4(xb, og * 8u);
+        xv[og * 2u + 1u] = NX4(xb, og * 8u + 1u);
         sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
     }
     vec4 out4;
@@ -128,6 +154,9 @@ void main() {
     [[unroll]] for (uint g = 0u; g < RG; g++) acc[g] = vec4(0.0);
     for (uint it = slot; it < RG * nsb; it += 8u) {
         uint g = it / nsb;
+#ifdef DNORM
+        count_ssq = g == 0u; // row group 0 visits every activation exactly once
+#endif
         vec4 v = item(o0 + 4u * g, it - g * nsb, l8);
         [[unroll]] for (uint k = 0u; k < RG; k++) {
             if (g == k) acc[k] += v;
@@ -135,15 +164,21 @@ void main() {
     }
     [[unroll]] for (uint g = 0u; g < RG; g++)
         [[unroll]] for (uint r = 0u; r < 4u; r++) red[(4u * g + r) * 64u + lane] = acc[g][r];
+#ifdef DNORM
+    red[uint(NR) * 64u + lane] = ssq;
+#endif
     barrier();
     [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
         if (lane < s) {
-            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[r * 64u + lane] += red[r * 64u + lane + s];
+            [[unroll]] for (uint r = 0u; r < NRED; r++) red[r * 64u + lane] += red[r * 64u + lane + s];
         }
         barrier();
     }
     if (lane < uint(NR) && o0 + lane < pc.out_f) {
         float v = red[lane * 64u];
+#ifdef DNORM
+        v *= inversesqrt(red[uint(NR) * 64u] / float(pc.in_f) + pc.eps);
+#endif
 #ifdef USE_RES
         v += res[o0 + lane];
 #endif
