@@ -311,6 +311,7 @@ fn kq_fma_mrow_bw() {
     // Verify-shaped (m = drafts+1): the MTP draft window is <= 7 (spec.k default 6); 13/16 probe
     // the second mrow band.
     for (label, dt, in_f, out_f) in [
+        ("gate+up", DType::Q4K, 2560, 20480),
         ("down q4", DType::Q4K, 10240, 2560),
         ("down q6", DType::Q6K, 10240, 2560),
         ("q", DType::Q4K, 2560, 2048),
@@ -421,6 +422,11 @@ fn kq_fma_mtp_verify_tight() {
             (7, 2048, 4096),
             (8, 2048, 4101),
             (13, 1024, 8192),
+            // Wide shapes past the mrow bands' out_f cutoff (the bypass): gate_up width,
+            // and a vocab-width lm_head that also forces the dispatch_wide 2-D grid split
+            // (32768 tiles x 2 groups > 65535).
+            (7, 2560, 20480),
+            (5, 1024, 262144),
         ] {
             let case = infr_testkit::LinearCase::new(dt, m, in_f, out_f).with_seed(0x9e7);
             let (w_bytes, x) = infr_testkit::case_inputs(case);
