@@ -1417,30 +1417,35 @@ fn lower_op(
                 && mmv_gate
                 && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
                 && be_.cfg().kernels.vulkan.mrow16;
+            // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier
+            // (GCN4) — band-independent: the bands' wide-n cutoff (`out_f <= 8192`) encodes "the
+            // GEMM wins wide", but on this tier the GEMM is the masked-waste `nc_kq_fma` tile
+            // (BM=64/128 rows computed for m real rows) — measured 5-8 GB/s effective vs 20-90
+            // for this kernel, so the cutoff never holds here. Decode runs fp32 too
+            // (`linear_kq_fma`), while the below arms would both be wrong for verify: the int8
+            // `mrow` runs ALU-bound on emulated dp4a AND its int8-quantized activations flip
+            // near-tie greedy tokens vs the fp32 decode stream (the Gemma4 MTP verify failure
+            // mode), and the dequant `mrow` is 2-3x slower at the same exactness (RX580).
+            // Same per-row math as decode, bit-identical row-for-row (see
+            // `native_gemv_kq_fma_mrow.comp`'s header) — the verify stream agrees with decode
+            // exactly. Keyed off the DECODE knob (`kq_fma_gemv_ok`), not the GEMM tier knob:
+            // if decode isn't fp32, verify must not be either. Verify-scoped
+            // (`graph.mtp_verify`) — ordinary prefill keeps the band policy and the arms below
+            // bit-for-bit: nothing about the prefill path changes on any device.
+            if graph.mtp_verify
+                && (2..=16).contains(&m)
+                && be_.cfg().kernels.vulkan.mrow
+                && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
+                && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
+            {
+                rec.linear_kq_fma_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
+                return Ok(());
+            }
             if (in_band(MROW_BAND) || mrow16)
                 && in_f % 32 == 0
                 && crate::gemm::native_mrow_kernel_name(dt).is_some()
                 && be_.cfg().kernels.vulkan.mrow
             {
-                // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier
-                // (GCN4): decode runs fp32 here (`linear_kq_fma`), and the arms below would both
-                // be wrong for verify — the int8 `mrow` runs ALU-bound on emulated dp4a AND its
-                // int8-quantized activations flip near-tie greedy tokens vs the fp32 decode
-                // stream (the Gemma4 MTP verify failure mode), while the dequant `mrow` is 2-3x
-                // slower than this kernel at the same exactness (RX580: kq/deq +68..+250%).
-                // Same per-row math as decode, bit-identical row-for-row (see
-                // `native_gemv_kq_fma_mrow.comp`'s header) — the verify stream agrees with decode
-                // exactly. Keyed off the DECODE knob (`kq_fma_gemv_ok`), not the GEMM tier knob:
-                // if decode isn't fp32, verify must not be either. Verify-scoped
-                // (`graph.mtp_verify`) — ordinary prefill keeps the int8/dequant arms below
-                // bit-for-bit: nothing about the prefill path changes on any device.
-                if graph.mtp_verify
-                    && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
-                    && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
-                {
-                    rec.linear_kq_fma_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
-                    return Ok(());
-                }
                 // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
                 // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
                 // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound

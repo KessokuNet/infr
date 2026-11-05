@@ -60,6 +60,12 @@ verify-flagged graphs score rel ~2e-7 vs the host oracle (pure f32 reassociation
 noise), where the int8 path scores ~4e-3 — the noise that flipped greedy tokens
 and collapsed draft acceptance.
 
+End-to-end (E4B Q4_K_M, RX 580): routing the wide verify Linears (`gate_up` 20480
+and `lm_head`, past the mrow bands' out_f cutoff) from the masked-waste tiled GEMM
+(5–8 GB/s) to this kernel cut verify time 2× (6.6 s → 3.2 s for 128 tokens) — MTP
+decode 18.2 → 35.0 tok/s vs a 40.2 non-speculative baseline, with byte-identical
+output. Remaining gap is draft cost (~17 ms/cycle) plus acceptance (0.64 here).
+
 ## Status and plans
 
 Tracked on the fork's project board. Next up: single-pass sliding-window attention for
