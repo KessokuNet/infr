@@ -732,8 +732,10 @@ impl SeamModel {
         // placement scope, as in `vulkan_session_default_on`.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
-        let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1);
+        let refused = self.check_vram_tier(&vk, Some(max_ctx), 1).and_then(|()| {
+            self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
+            self.refuse_explicit_ctx(&vk, max_ctx, 1)
+        });
         drop(scope);
         refused?;
         Ok(DenseVulkanSession {
@@ -767,7 +769,9 @@ impl SeamModel {
         // placement scope so the decision lands on its own pins, not a process-global cell.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let max_ctx = self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train));
+        let max_ctx = self
+            .check_vram_tier(&vk, None, 1)
+            .and_then(|()| self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train)));
         drop(scope);
         let max_ctx = max_ctx?;
         Ok(DenseVulkanSession {
@@ -802,8 +806,11 @@ impl SeamModel {
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
-        let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
+        let fit = self
+            .check_vram_tier(&vk, None, 1)
+            .map(|()| self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train));
         drop(scope);
+        let fit = fit?;
         let max_ctx = self.session_ctx(((fit as f64 * frac) as usize).max(1024));
         Ok(DenseVulkanSession {
             be: vk,
@@ -906,7 +913,19 @@ impl SeamModel {
         // format, else the format they did set) cannot serve even a minimally-useful window.
         let best = fit.max(fit_q8.unwrap_or(0));
         if best < crate::seam::MIN_SESSION_CTX {
-            let free = vram.available.saturating_sub(fp.total());
+            let tier = crate::seam::vram_tier_bytes(&self.ecfg)?;
+            let free = vram
+                .available
+                .saturating_sub(fp.total())
+                .saturating_sub(tier);
+            let tier_note = if tier == 0 {
+                String::new()
+            } else {
+                format!(
+                    " - {:.2} GiB kv.tiers[0] (vram)",
+                    tier as f64 / (1u64 << 30) as f64
+                )
+            };
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
             let need = crate::seam::kv_bytes_estimate_fmt(
@@ -923,7 +942,7 @@ impl SeamModel {
                  fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
                  fits at q8_0 KV     : {}\n  \
                  KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
-                 free after weights  : {:.2} GiB ({:.2} GiB {} - {:.2} GiB weights)\n\
+                 free after weights  : {:.2} GiB ({:.2} GiB {} - {:.2} GiB weights{})\n\
                  Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
                  (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
                  in system RAM, or a smaller quant of the model.",
@@ -936,6 +955,7 @@ impl SeamModel {
                 gib(vram.available),
                 if vram.live { "free, live" } else { "heap" },
                 gib(fp.total()),
+                tier_note,
             ));
         }
         tracing::warn!(
@@ -946,6 +966,31 @@ impl SeamModel {
             if vram.live { ", live" } else { ", total heap" },
         );
         Ok(fit)
+    }
+
+    /// The one gate every open path runs before it sizes a window: a `vram` tier that alone takes
+    /// the window away (`want` tokens, else one minimum window, in `copies` caches) is refused
+    /// naming the tier, pricing the best KV format the session could pick. A malformed tier is an
+    /// error here too.
+    fn check_vram_tier(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        want: Option<usize>,
+        copies: usize,
+    ) -> Result<()> {
+        let mut fmts = vec![self.kv_fit_fmts(crate::seam::kv_auto_q8())];
+        if self.may_auto_q8() {
+            fmts.push(self.kv_fit_fmts(true));
+        }
+        crate::seam::refuse_vram_tier(
+            &self.cfg,
+            &self.ecfg,
+            self.footprint().total(),
+            &vk.vram(),
+            &fmts,
+            want,
+            copies,
+        )
     }
 
     /// Whether a fit may switch the KV cache to Q8_0 on its own: the user set no KV format and no
@@ -1415,20 +1460,22 @@ impl SeamModel {
         want: Option<infr_core::SizeSpec>,
     ) -> Result<usize> {
         let n_slots = n_slots.max(1);
+        // A paged session prices ONE window: the pool is shared, so N slots do not each own a copy.
+        let copies = if self.ecfg.kv.paged == Some(true) {
+            1
+        } else {
+            n_slots
+        };
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
-        // the cache to q8_0 when that is what it takes to fit. A paged session prices ONE window:
-        // the pool is shared, so N slots do not each own a copy of it.
+        // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = self.session_ctx((c as usize).max(1));
-            let copies = if self.ecfg.kv.paged == Some(true) {
-                1
-            } else {
-                n_slots
-            };
+            self.check_vram_tier(vk, Some(ctx), copies)?;
             self.auto_q8_for_explicit_ctx(vk, ctx, copies);
             self.refuse_explicit_ctx(vk, ctx, copies)?;
             return Ok(ctx);
         }
+        self.check_vram_tier(vk, None, copies)?;
         let trained = self.session_ctx(self.cfg.n_ctx_train);
         if n_slots == 1 && want.is_none() {
             return self.clamp_default_ctx(vk, trained);

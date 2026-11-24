@@ -241,6 +241,10 @@ read falls through and promotes it back:
 
 ```toml
 [[kv.tiers]]
+backend = "vram"
+size = "2g"                 # device bytes held for retained idle pages
+
+[[kv.tiers]]
 backend = "redb"
 size = "1g"                 # bytes this tier keeps before evicting
 path = "/var/cache/infr/kv-prefix.redb"   # optional: unset keeps it in memory
@@ -255,6 +259,17 @@ so a restart keeps its prefixes; leaving `path` out keeps the same database in
 anonymous memory, which is faster and gone with the process. A redb tier with
 no `size` keeps 1 GiB. A redis tier is shared, so several servers can point at
 it; its budget is the server's `maxmemory`, which is why it goes last.
+
+Every entry has to name its `backend` (`vram`, `redb`, `redis` or `valkey`): an
+entry with only a `path` or a `size`, and any other name, is an error when the
+config loads rather than a guessed `redb` tier. A `vram` entry is device
+memory, valid only as the first entry, with a byte `size` and no `path` or
+`url`. It is a reservation beside the live windows: the slots divide what is
+left after it, so the context window shrinks by its `size`, and a paged pool
+(`paged`) grows by the same bytes to keep parked pages resident, capped at
+that size. A `vram` tier that leaves less than one window of KV (or less than an
+explicit `--ctx`) on a device that would otherwise serve it is refused at open,
+naming the tier. Without one, nothing changes.
 
 Sizes take the shared size grammar (`1g`, `512m`). The config file is the only
 place a tier list is written, because the store holds prompt-derived data and

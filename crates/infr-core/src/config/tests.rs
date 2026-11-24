@@ -230,13 +230,13 @@ fn a_kv_tier_list_parses_from_a_config_file() {
 
     let tiers = partial.kv.tiers.expect("two tiers");
     assert_eq!(tiers.len(), 2);
-    assert_eq!(tiers[0].backend, "redb");
+    assert_eq!(tiers[0].backend, Some(super::KvBackend::Redb));
     assert_eq!(tiers[0].bytes(), Some(1 << 30));
     assert!(
         tiers[0].path.is_none(),
         "no path keeps the database in memory"
     );
-    assert_eq!(tiers[1].backend, "redis");
+    assert_eq!(tiers[1].backend, Some(super::KvBackend::Redis));
     assert_eq!(tiers[1].url.as_deref(), Some("redis://127.0.0.1:6379/2"));
     assert_eq!(tiers[1].bytes(), None);
 }
@@ -1756,4 +1756,134 @@ fn a_relative_tuning_file_in_a_config_file_is_beside_it() {
         cfg.kernels.vulkan.tuning.file.as_deref(),
         Some(Path::new("tune.toml"))
     );
+}
+
+fn vram(size: Option<crate::SizeSpec>) -> super::KvTier {
+    super::KvTier {
+        backend: Some(super::KvBackend::Vram),
+        size,
+        ..super::KvTier::default()
+    }
+}
+
+fn redb() -> super::KvTier {
+    super::KvTier {
+        backend: Some(super::KvBackend::Redb),
+        ..super::KvTier::default()
+    }
+}
+
+/// A `[[kv.tiers]]` entry with a `path` or `size` but no `backend` is a load error naming the
+/// entry, never a silent `redb` tier; `--set` on a single field of an entry is refused the same way.
+#[test]
+fn a_kv_tier_without_a_backend_is_a_load_error() {
+    for text in [
+        "[[kv.tiers]]\npath = \"/tmp/kv.redb\"\nsize = \"1g\"\n",
+        "[[kv.tiers]]\nbackend = \"redb\"\n\n[[kv.tiers]]\nsize = \"1g\"\n",
+    ] {
+        let err = file::parse_str(text, Path::new("infr.toml")).expect_err(text);
+        let shown = err.to_string();
+        assert!(
+            shown.contains("kv.tiers.") && shown.contains("backend"),
+            "{shown}"
+        );
+    }
+    let (_, _) = file::parse_str(
+        "[[kv.tiers]]\nbackend = \"redb\"\nsize = \"1g\"\n",
+        Path::new("infr.toml"),
+    )
+    .expect("a named backend loads");
+
+    let mut partial = PartialConfig::default();
+    partial.set_path("kv.tiers.0.size", "1g").expect("sets");
+    let merged = Config::load_from_layers(&[partial]);
+    assert_eq!(
+        super::check_kv_tier_backends(&merged.kv.tiers),
+        Err((0, "`backend` is required (vram, redb or redis)".to_string()))
+    );
+    assert!(super::kv_vram_tier_bytes(&merged.kv.tiers)
+        .expect_err("consumers refuse it too")
+        .contains("kv.tiers[0]"));
+}
+
+/// A backend name is checked when the config loads, `valkey` spells redis, and anything else is
+/// refused by `--set` and by a config file alike.
+#[test]
+fn a_kv_tier_backend_is_validated_at_parse() {
+    use super::KvBackend;
+    assert_eq!("VRAM".parse(), Ok(KvBackend::Vram));
+    assert_eq!("valkey".parse(), Ok(KvBackend::Redis));
+    let err = "lmcache".parse::<KvBackend>().expect_err("unknown");
+    assert!(err.contains("lmcache"), "{err}");
+    assert!(file::parse_str(
+        "[[kv.tiers]]\nbackend = \"lmcache\"\n",
+        Path::new("infr.toml")
+    )
+    .is_err());
+}
+
+/// A `vram` entry parses from a config file like any other and sizes the first tier.
+#[test]
+fn a_vram_tier_parses_and_reports_its_bytes() {
+    let (partial, warnings) = file::parse_str(
+        "[[kv.tiers]]\nbackend = \"vram\"\nsize = \"2g\"\n\n[[kv.tiers]]\nbackend = \"redb\"\n",
+        Path::new("infr.toml"),
+    )
+    .expect("a vram tier must load");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let tiers = partial.kv.tiers.expect("two tiers");
+    assert!(tiers[0].is_vram() && !tiers[1].is_vram());
+    assert_eq!(super::kv_vram_tier_bytes(&tiers), Ok(Some(2 << 30)));
+    assert_eq!(tiers[0].describe(), format!("vram ({} bytes)", 2u64 << 30));
+}
+
+#[test]
+fn no_vram_tier_means_no_reservation() {
+    assert_eq!(super::kv_vram_tier_bytes(&[]), Ok(None));
+    assert_eq!(super::kv_vram_tier_bytes(&[redb()]), Ok(None));
+}
+
+/// Every way a `vram` entry can be wrong is refused with the entry named.
+#[test]
+fn a_malformed_vram_tier_is_refused_by_entry() {
+    use crate::SizeSpec::{Bytes, Percent};
+    let cases = [
+        (
+            vec![redb(), vram(Some(Bytes(1 << 20)))],
+            "kv.tiers[1]",
+            "first",
+        ),
+        (vec![vram(None)], "kv.tiers[0]", "needs a byte"),
+        (vec![vram(Some(Bytes(0)))], "kv.tiers[0]", "more than zero"),
+        (
+            vec![vram(Some(Percent(50.0)))],
+            "kv.tiers[0]",
+            "not a share",
+        ),
+        (
+            vec![super::KvTier {
+                path: Some("/tmp/kv".into()),
+                ..vram(Some(Bytes(1 << 20)))
+            }],
+            "kv.tiers[0]",
+            "`path` or `url`",
+        ),
+        (
+            vec![super::KvTier {
+                url: Some("redis://x".into()),
+                ..vram(Some(Bytes(1 << 20)))
+            }],
+            "kv.tiers[0]",
+            "`path` or `url`",
+        ),
+        (
+            vec![vram(Some(Bytes(1 << 20))), vram(Some(Bytes(1 << 20)))],
+            "kv.tiers[1]",
+            "first",
+        ),
+    ];
+    for (tiers, entry, why) in cases {
+        let err = super::kv_vram_tier_bytes(&tiers).expect_err(why);
+        assert!(err.contains(entry) && err.contains(why), "{err}");
+    }
 }

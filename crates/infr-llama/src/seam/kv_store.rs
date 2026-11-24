@@ -16,6 +16,7 @@
 use crate::Config;
 use anyhow::{anyhow, Result};
 use infr_core::backend::Backend;
+use infr_core::config::KvBackend;
 use infr_core::{DType, Metadata, TensorInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -261,6 +262,9 @@ pub(crate) struct BlockCache<S: KvStore> {
     v_fmt: DType,
     /// Parked page maps, held in the pool until a restore adopts them or pressure spills them.
     resident: Vec<Resident>,
+    /// Most pages the residents may hold together: the `vram` tier's size. `None` leaves them
+    /// bounded only by the pool's free pages.
+    resident_cap: Option<usize>,
     tick: u64,
     /// Restores that read rows from the store, and the tokens they read.
     pub(crate) restores: u64,
@@ -285,6 +289,7 @@ impl<S: KvStore> BlockCache<S> {
             k_fmt: DType::F16,
             v_fmt: DType::F16,
             resident: Vec::new(),
+            resident_cap: None,
             tick: 0,
             restores: 0,
             restored_tokens: 0,
@@ -630,7 +635,8 @@ impl<S: KvStore> BlockCache<S> {
             return false;
         }
         let pages = (kv.cached.len().min(kv.max_ctx) / PAGE_ROWS).min(p.map.len());
-        if pages == 0 {
+        // Past the retention budget on its own, these pages would only evict themselves.
+        if pages == 0 || self.resident_cap.is_some_and(|cap| pages > cap) {
             return false;
         }
         if self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
@@ -673,11 +679,50 @@ impl<S: KvStore> BlockCache<S> {
             tokens,
             tick: self.tick,
         });
+        let mut evicted = 0;
+        while self
+            .resident_cap
+            .is_some_and(|cap| self.resident_pages() > cap)
+            && self.evict_lru()
+        {
+            evicted += 1;
+        }
+        self.resident_spills += evicted;
         tracing::debug!(
             pages,
             residents = self.resident.len(),
             "kv store: kept a parked slot's pages"
         );
+        true
+    }
+
+    /// Bound the pages residents hold together. Takes effect at the next [`retain`](Self::retain).
+    pub(crate) fn set_resident_cap(&mut self, pages: Option<usize>) {
+        self.resident_cap = pages;
+    }
+
+    /// Distinct physical pages the residents hold together; a page two residents share counts once.
+    pub(crate) fn resident_pages(&self) -> usize {
+        self.resident
+            .iter()
+            .flat_map(|r| r.map.physical())
+            .collect::<std::collections::HashSet<u32>>()
+            .len()
+    }
+
+    /// Drop the least recently used resident, forgetting the blocks only it held. `false` when
+    /// there is none.
+    fn evict_lru(&mut self) -> bool {
+        let Some(i) = (0..self.resident.len()).min_by_key(|&i| self.resident[i].tick) else {
+            return false;
+        };
+        let gone = self.resident.swap_remove(i);
+        for id in &gone.blocks {
+            let only_here = self.index.get(id).is_some_and(|e| !e.stored);
+            if only_here && !self.resident_covers(*id) {
+                self.index.remove(id);
+            }
+        }
         true
     }
 
@@ -690,18 +735,7 @@ impl<S: KvStore> BlockCache<S> {
         };
         let want = pool.free_pages() + pages;
         let mut spilled = 0;
-        while pool.free_pages() < want {
-            let Some(i) = (0..self.resident.len()).min_by_key(|&i| self.resident[i].tick) else {
-                break;
-            };
-            let gone = self.resident.swap_remove(i);
-            for id in &gone.blocks {
-                let only_here = self.index.get(id).is_some_and(|e| !e.stored);
-                if only_here && !self.resident_covers(*id) {
-                    self.index.remove(id);
-                }
-            }
-            drop(gone);
+        while pool.free_pages() < want && self.evict_lru() {
             spilled += 1;
         }
         self.resident_spills += spilled as u64;
@@ -861,14 +895,20 @@ pub(crate) fn redact(url: &str) -> String {
 
 /// The store `kv.tiers` declares: one backend per entry, fastest first, folded so an eviction from
 /// one entry demotes into the next and a read promotes back up. `None` when the cache is off. A
-/// tier that cannot be opened costs only that tier: log and keep the rest.
-pub(crate) fn prefix_store_for(kv: &crate::EngineConfig, key: u64) -> Option<Box<dyn KvStore>> {
+/// tier that cannot be opened costs only that tier: log and keep the rest. A leading `vram` entry
+/// is the live slots' memory, not a store, so the chain starts below it; a malformed one is an
+/// error.
+pub(crate) fn prefix_store_for(
+    kv: &crate::EngineConfig,
+    key: u64,
+) -> anyhow::Result<Option<Box<dyn KvStore>>> {
     let tiers = &kv.kv.tiers;
-    if tiers.is_empty() {
-        return None;
+    let skipped = storage_tiers_start(tiers)?;
+    if tiers.len() == skipped {
+        return Ok(None);
     }
     let mut chain: Option<Box<dyn KvStore>> = None;
-    for (i, tier) in tiers.iter().enumerate().rev() {
+    for (i, tier) in tiers.iter().enumerate().skip(skipped).rev() {
         let opened = match open_tier(tier, key) {
             Ok(opened) => opened,
             Err(e) => {
@@ -894,7 +934,13 @@ pub(crate) fn prefix_store_for(kv: &crate::EngineConfig, key: u64) -> Option<Box
             }),
         };
     }
-    chain
+    Ok(chain)
+}
+
+/// Index of the first storage entry: `1` when the list leads with a valid `vram` tier, else `0`.
+fn storage_tiers_start(tiers: &[infr_core::config::KvTier]) -> anyhow::Result<usize> {
+    let vram = infr_core::config::kv_vram_tier_bytes(tiers).map_err(|e| anyhow!(e))?;
+    Ok(usize::from(vram.is_some()))
 }
 
 /// A tier that can demote (it has a budget) or one that cannot (the server owns its eviction).
@@ -907,8 +953,11 @@ enum Opened {
 const DEFAULT_TIER_BYTES: u64 = 1 << 30;
 
 fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opened> {
-    match tier.backend.trim().to_ascii_lowercase().as_str() {
-        "redb" => {
+    let Some(backend) = tier.backend else {
+        return Err(anyhow!("`backend` is required (vram, redb or redis)"));
+    };
+    match backend {
+        KvBackend::Redb => {
             if tier.url.is_some() {
                 return Err(anyhow!(
                     "a redb tier keeps its blocks in `path`, and `url` belongs to a redis tier"
@@ -930,7 +979,7 @@ fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opene
             };
             Ok(Opened::Budgeted(Box::new(store)))
         }
-        "redis" | "valkey" => {
+        KvBackend::Redis => {
             if tier.path.is_some() {
                 return Err(anyhow!(
                     "a redis tier is named by `url`, and `path` belongs to a redb tier"
@@ -950,7 +999,9 @@ fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opene
                 .map(|store| Opened::Plain(Box::new(store)))
                 .map_err(|e| anyhow!("{}: {e}", redact(url)))
         }
-        other => Err(anyhow!("unknown backend {other:?} (redb, redis)")),
+        KvBackend::Vram => Err(anyhow!(
+            "a vram tier is device memory, not a store; the chain starts below it"
+        )),
     }
 }
 
@@ -1388,35 +1439,85 @@ mod tests {
     #[test]
     fn a_tier_is_checked_against_its_backend() {
         use infr_core::SizeSpec;
-        let tier = |backend: &str| infr_core::config::KvTier {
-            backend: backend.to_string(),
+        let tier = |backend: KvBackend| infr_core::config::KvTier {
+            backend: Some(backend),
             ..Default::default()
         };
-        let Ok(Opened::Budgeted(redb)) = open_tier(&tier("redb"), 7) else {
+        let Ok(Opened::Budgeted(redb)) = open_tier(&tier(KvBackend::Redb), 7) else {
             panic!("a redb tier with no size opens")
         };
         assert_eq!(redb.capacity(), DEFAULT_TIER_BYTES as usize);
 
         let wrong_url = infr_core::config::KvTier {
             url: Some("redis://127.0.0.1:1/0".into()),
-            ..tier("redb")
+            ..tier(KvBackend::Redb)
         };
         assert!(open_tier(&wrong_url, 7).is_err(), "redb has no url");
 
         let wrong_path = infr_core::config::KvTier {
             path: Some(std::path::PathBuf::from("/tmp/kv.redb")),
-            ..tier("redis")
+            ..tier(KvBackend::Redis)
         };
         assert!(open_tier(&wrong_path, 7).is_err(), "redis has no path");
 
         for size in [SizeSpec::Bytes(0), SizeSpec::Percent(50.0)] {
             let bad = infr_core::config::KvTier {
                 size: Some(size),
-                ..tier("redb")
+                ..tier(KvBackend::Redb)
             };
             assert!(open_tier(&bad, 7).is_err(), "{size:?} is not a budget");
         }
-        assert!(open_tier(&tier("lmcache"), 7).is_err(), "unknown backend");
+    }
+
+    fn engine_with(tiers: Vec<infr_core::config::KvTier>) -> crate::EngineConfig {
+        let mut ec = crate::EngineConfig::default();
+        ec.kv.tiers = tiers;
+        ec
+    }
+
+    fn tier_of(backend: KvBackend, size: Option<u64>) -> infr_core::config::KvTier {
+        infr_core::config::KvTier {
+            backend: Some(backend),
+            size: size.map(infr_core::SizeSpec::Bytes),
+            ..Default::default()
+        }
+    }
+
+    /// A leading vram entry is skipped, so a list holding only that entry keeps the cache
+    /// resident-only and the tiers below it build the chain they always did.
+    #[test]
+    fn a_leading_vram_tier_is_not_a_store() {
+        let vram = tier_of(KvBackend::Vram, Some(1 << 20));
+        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
+        let ec = engine_with(vec![vram.clone()]);
+        assert!(prefix_store_for(&ec, 7).unwrap().is_none());
+
+        let ec = engine_with(vec![vram.clone(), redb.clone()]);
+        assert!(prefix_store_for(&ec, 7).unwrap().is_some());
+        assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), 1);
+        let ec = engine_with(vec![redb.clone()]);
+        assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), 0);
+        assert!(prefix_store_for(&ec, 7).unwrap().is_some());
+        assert!(prefix_store_for(&engine_with(Vec::new()), 7)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A vram entry below the first slot, or a malformed leading one, is an error rather than a
+    /// dropped tier.
+    #[test]
+    fn a_misplaced_or_malformed_vram_tier_is_an_error() {
+        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
+        let late = engine_with(vec![redb, tier_of(KvBackend::Vram, Some(1 << 20))]);
+        let Err(err) = prefix_store_for(&late, 7) else {
+            panic!("vram after a storage tier must be refused")
+        };
+        assert!(err.to_string().contains("kv.tiers[1]"), "{err}");
+        for size in [None, Some(0)] {
+            let bad = engine_with(vec![tier_of(KvBackend::Vram, size)]);
+            assert!(prefix_store_for(&bad, 7).is_err(), "{size:?}");
+        }
+        assert!(open_tier(&tier_of(KvBackend::Vram, Some(1)), 7).is_err());
     }
 
     /// A block rewritten while an older copy sits below it must not leave that copy behind: the
@@ -1747,6 +1848,120 @@ mod tests {
 
         assert_eq!(s.make_room(&dst, 1024), 0, "the tail page is already held");
         assert_eq!(s.resident.len(), 1);
+    }
+
+    /// The `vram` tier is a reservation beside the live windows: a paged session whose window is
+    /// full still has the tier's bytes of pool left for retained pages. A pool sized by the tier
+    /// alone (the old rule) cannot even hold the window.
+    #[test]
+    fn a_full_window_leaves_the_vram_tier_free_in_the_pool() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let page_bytes = crate::seam::kv_page_bytes(&cfg, DType::F16, DType::F16);
+        let window_pages = 2usize;
+        let tier_pages = 3usize;
+        let ec = engine_with(vec![tier_of(
+            KvBackend::Vram,
+            Some(tier_pages as u64 * page_bytes),
+        )]);
+        // The zero page rides on top of the windows, as `paged_pages_for` counts it.
+        let windows = (1 + window_pages) as u64 * page_bytes;
+        let cap = crate::seam::kv_pool_cap_bytes(&ec, windows)
+            .unwrap()
+            .unwrap();
+        let pages = crate::seam::pool_pages_for_cap(cap, page_bytes).unwrap();
+        assert_eq!(pages, 1 + window_pages + tier_pages);
+
+        let pool =
+            crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, pages).unwrap();
+        assert_eq!(
+            pool.page_bytes(),
+            page_bytes,
+            "the sizer and the pool agree"
+        );
+        let slot = paged_slot(&be, &cfg, &pool, window_pages * 512);
+        assert_eq!(pool.used_pages(), window_pages);
+        assert_eq!(pool.free_pages(), tier_pages);
+        assert_eq!(pool.free_pages() as u64 * page_bytes, ec_tier(&ec));
+        drop(slot);
+    }
+
+    fn ec_tier(ec: &crate::EngineConfig) -> u64 {
+        crate::seam::vram_tier_bytes(ec).unwrap()
+    }
+
+    /// Retained pages are capped at the tier: the oldest resident goes first, and a park larger
+    /// than the whole budget is not retained at all.
+    #[test]
+    fn residents_are_capped_at_the_vram_tier() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
+        let park = |s: &mut Cache, seed: u32| {
+            let mut kv = paged_slot(&be, &cfg, &pool, 1024);
+            kv.cached = tokens(seed, 1024);
+            assert!(s.retain(&cfg, &mut kv));
+        };
+
+        let mut open = cache();
+        park(&mut open, 3);
+        park(&mut open, 4);
+        assert_eq!(open.resident.len(), 2, "no tier, no retention cap");
+
+        let mut s = cache();
+        s.set_resident_cap(Some(2));
+        park(&mut s, 3);
+        park(&mut s, 4);
+        assert_eq!(s.resident_pages(), 2);
+        assert_eq!(s.resident.len(), 1);
+        assert_eq!(
+            s.resident[0].tokens,
+            tokens(4, 1024),
+            "the oldest went first"
+        );
+        assert_eq!(s.resident_spills, 1);
+
+        s.set_resident_cap(Some(1));
+        let mut big = paged_slot(&be, &cfg, &pool, 1024);
+        big.cached = tokens(5, 1024);
+        assert!(
+            !s.retain(&cfg, &mut big),
+            "two pages cannot fit a one-page budget"
+        );
+        assert_eq!(
+            big.paged.as_ref().unwrap().map.len(),
+            2,
+            "the slot keeps its pages"
+        );
+    }
+
+    /// Two retained branches that share a prefix page hold three physical pages, not four, so a
+    /// three-page budget keeps both.
+    #[test]
+    fn the_resident_cap_counts_a_shared_page_once() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
+        let mut s = cache();
+        s.set_resident_cap(Some(3));
+
+        let trunk = tokens(7, 512);
+        let mut a = paged_slot(&be, &cfg, &pool, 1024);
+        a.cached = [trunk.clone(), tokens(8, 512)].concat();
+        let mut b = paged_slot(&be, &cfg, &pool, 1024);
+        b.paged
+            .as_mut()
+            .unwrap()
+            .map
+            .share_prefix(&a.paged.as_ref().unwrap().map, 1)
+            .unwrap();
+        b.cached = [trunk, tokens(9, 512)].concat();
+
+        assert!(s.retain(&cfg, &mut a));
+        assert!(s.retain(&cfg, &mut b));
+        assert_eq!(s.resident.len(), 2, "neither branch was evicted");
+        assert_eq!(s.resident_pages(), 3);
+        assert_eq!(s.resident_spills, 0);
     }
 
     /// A restore whose blocks cannot fill the destination's window re-prefills instead of leaving

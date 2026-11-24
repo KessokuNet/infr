@@ -1,6 +1,7 @@
 # Plan 19: KV cache as a store, anywhere
 
-Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2–P4 scoped. 18 unified where idle blocks
+Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 slice A done (the `vram` tier in config
+and sizing); the rest of P2 and P3–P4 scoped. 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
 the default rather than a hard-coded device buffer.
 
@@ -63,13 +64,16 @@ block it covers matched (512 rows against 128-token blocks), partial coverage fa
 storage tiers, and a retired entry is where the download happens — capture to the next tier, then
 free the pages.
 
-**The `vram` tier owns one budget and pins live windows.** A slot that is generating cannot have its
-rows evicted underneath the kernels, so the tier's bytes are reserved per busy slot and only idle
-extents sit in the LRU. A demote is `Backend::copy_buffer_at` between two device buffers, the
-primitive the recurrent snapshot and the continuation seed already use, so `KvRows` never appears in
-that path. The tier's `size` is what `kv_fit_ctx` subtracts before dividing the remainder among
-slots; a configuration that leaves no usable window is refused at open with both numbers, not
-silently clamped.
+**The `vram` tier is a reservation beside the live windows.** A slot that is generating cannot have
+its rows evicted underneath the kernels, so live windows are never in the tier's LRU: the tier holds
+only retained idle pages. Its `size` is what `kv_fit_ctx` subtracts before dividing the remainder
+among slots, and the paged pool's total is the bytes the slots' windows need plus the tier's `size`,
+so a full window still leaves the tier's bytes for retention; the retained pages are capped at that
+size. A demote is `Backend::copy_buffer_at` between two device buffers, the primitive the recurrent
+snapshot and the continuation seed already use, so `KvRows` never appears in that path. A
+configuration whose tier alone removes the requested window (an explicit `--ctx`, else one minimum
+window, priced at the best KV format the session could pick) is refused at open with the tier size,
+the window's bytes and what is left, not silently clamped; every open path runs the same check.
 
 **Host residency is `backend = "host"`, the same shape.** Host-allocated KV buffers the kernels
 address directly (`alloc_kv_host`, `INFR_KV_OVERFLOW`'s existing path), which is the `-nkvo`
@@ -87,8 +91,8 @@ tier, and keep working through a config migration.
 - **P2** (scoped) the `vram` tier: `backend = "vram"` in `[[kv.tiers]]`, implicit as the default when
   the list is absent, a budget covering pinned live windows plus idle extents with LRU eviction,
   device→device transfers, and `kv_fit_ctx` priced from the tier `size`. Gate: demote and promote
-  never stage through the host, a vram tier still demotes into a `redb` tier, a vram tier smaller
-  than one window is refused at open, and the implicit tier allocates what today's default path
+  never stage through the host, a vram tier still demotes into a `redb` tier, a vram tier that
+  leaves less than one window is refused at open, and the implicit tier allocates what today's default path
   allocates.
 - **P3** (scoped) the `host` tier: `backend = "host"` as first entry, host-visible mapped buffers
   with unchanged kernels, working with paging (today paging and `kv.overflow` are mutually

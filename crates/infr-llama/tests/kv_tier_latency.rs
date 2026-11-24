@@ -50,7 +50,7 @@ fn engine(
     let mut c = infr_llama::EngineConfig::default();
     c.kv.slots = 1;
     let mut redb = infr_core::config::KvTier {
-        backend: "redb".to_string(),
+        backend: Some(infr_core::config::KvBackend::Redb),
         size: Some(infr_core::SizeSpec::Bytes(store_mb << 20)),
         ..Default::default()
     };
@@ -58,7 +58,7 @@ fn engine(
     c.kv.tiers.push(redb);
     if let Some(url) = url {
         c.kv.tiers.push(infr_core::config::KvTier {
-            backend: "redis".to_string(),
+            backend: Some(infr_core::config::KvBackend::Redis),
             url: Some(url.to_string()),
             ..Default::default()
         });

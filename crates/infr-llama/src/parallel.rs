@@ -286,7 +286,7 @@ impl ParallelSeam {
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         // One store per `[[kv.tiers]]` entry, fastest first, with Redis above it when asked for.
         let store_key = crate::seam::store_key(&model);
-        let store = crate::seam::prefix_store_for(model.cfg(), store_key);
+        let store = crate::seam::prefix_store_for(model.cfg(), store_key)?;
         let enabled = store.is_some();
         let store: Box<dyn crate::seam::KvStore> =
             store.unwrap_or_else(|| Box::new(crate::seam::NoStore));
@@ -379,6 +379,14 @@ impl ParallelSeam {
         // what the server advertises and admits requests against.
         self.max_ctx = slot0.max_ctx();
         self.paged_pool = slot0.paged_pool().map(Arc::clone);
+        // The `vram` tier is the retention budget: parked pages stay resident only up to its size.
+        if let Some(pool) = &self.paged_pool {
+            let pages = crate::seam::vram_tier_pages(self.model.engine_cfg(), pool.page_bytes());
+            self.store
+                .get_mut()
+                .map_err(|_| anyhow!("kv store lock poisoned"))?
+                .set_resident_cap(pages);
+        }
         if self.model.engine_cfg().kv.paged == Some(true) && n_slots == 1 {
             tracing::info!(
                 "kv.paged: single-slot engine never forks, so no page pool is allocated; KV stays \

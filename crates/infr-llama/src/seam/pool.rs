@@ -176,6 +176,17 @@ impl KvPool {
         self.pps + 1
     }
 
+    /// Bytes one page occupies across every pooled layer's K and V buffers.
+    pub(crate) fn page_bytes(&self) -> u64 {
+        (0..self.k.len())
+            .filter(|&l| self.k[l].is_some())
+            .map(|l| {
+                kv_side_bytes(self.k_fmt, PAGE_ROWS * self.k_row[l]) as u64
+                    + kv_side_bytes(self.v_fmt, PAGE_ROWS * self.v_row[l]) as u64
+            })
+            .sum()
+    }
+
     /// Physical pages in the budget, page 0 included.
     pub(crate) fn pages(&self) -> usize {
         self.total_pages
@@ -278,6 +289,11 @@ impl SlotMap {
     /// Logical pages this slot has allocated (a prefix; the rest are zero page).
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// The physical pages this slot has allocated, in logical order.
+    pub(crate) fn physical(&self) -> impl Iterator<Item = u32> + '_ {
+        self.map.iter().copied().filter(|&p| p != 0)
     }
 
     /// Physical page holding logical page `j`, 0 when unallocated.

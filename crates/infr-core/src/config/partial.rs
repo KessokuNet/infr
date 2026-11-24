@@ -208,20 +208,21 @@ impl ConfigValue for Vec<super::KvTier> {
     /// `--set`'s shorthand: backend names, comma separated, each with no options. A config file
     /// spells the same list as `[[kv.tiers]]` tables, which arrive here as `<i>.<field>` paths.
     fn parse_set(raw: &str) -> Result<Self, String> {
-        Ok(raw
-            .split(',')
+        raw.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|backend| super::KvTier {
-                backend: backend.to_string(),
-                ..super::KvTier::default()
+            .map(|backend| {
+                Ok(super::KvTier {
+                    backend: Some(backend.parse()?),
+                    ..super::KvTier::default()
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn to_display(&self) -> String {
         self.iter()
-            .map(|t| t.backend.clone())
+            .map(|t| t.backend.map(|b| b.to_string()).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -236,7 +237,7 @@ impl ConfigValue for Vec<super::KvTier> {
         }
         let tier = &mut list[index];
         match field {
-            "backend" => tier.backend = raw.to_string(),
+            "backend" => tier.backend = Some(raw.parse().map_err(SetPathError::Value)?),
             "size" => {
                 tier.size = Some(SizeSpec::parse_set(raw).map_err(SetPathError::Value)?);
             }

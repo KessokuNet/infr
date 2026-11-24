@@ -1581,18 +1581,13 @@ pub(crate) fn generate_dense_backend_bound(
         // The guard prices the whole pool, so measure the budget before allocating it.
         let room = be.device_alloc_room();
         let mut pool_pages = paged_blocks;
-        if let (Some(pages), Some(mb)) = (pool_pages.as_mut(), ec.kv.pool_mb) {
-            let page_bytes: u64 = (0..c.n_layer)
-                .filter(|&l| crate::seam::paged_layer(c, l))
-                .map(|l| {
-                    let (kr, vr) = crate::seam::kv_row_elems(c, l);
-                    crate::seam::kv_side_bytes(k_fmt, infr_vulkan::paged::PAGE_ROWS * kr) as u64
-                        + crate::seam::kv_side_bytes(v_fmt, infr_vulkan::paged::PAGE_ROWS * vr)
-                            as u64
-                })
-                .sum();
-            if let Some(pages_from_budget) = (mb << 20).checked_div(page_bytes) {
-                *pages = (pages_from_budget as usize).max(2);
+        if let Some(pages) = pool_pages.as_mut() {
+            let page_bytes = crate::seam::kv_page_bytes(c, k_fmt, v_fmt);
+            let windows = (*pages as u64).saturating_mul(page_bytes);
+            if let Some(from_cap) = crate::seam::kv_pool_cap_bytes(ec, windows)?
+                .and_then(|cap| crate::seam::pool_pages_for_cap(cap, page_bytes))
+            {
+                *pages = from_cap;
             }
         }
         let pool = match pool_pages.filter(|_| caps.kv_paging) {

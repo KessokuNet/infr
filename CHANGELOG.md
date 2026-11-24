@@ -85,6 +85,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   after upgrading loses the prefixes that file held. There is no env spelling for
   the list; the config file is the only place it is written (`--set
   kv.tiers=redb` gives a single in-memory tier for a quick comparison).
+  `backend = "vram"` is also accepted as the first entry: device memory of a
+  byte `size` reserved beside the live windows. The slots divide what is left, a
+  paged pool grows by the tier's bytes to keep parked pages resident (capped at
+  that size), and an open whose tier alone removes the requested window is
+  refused naming it. Every entry must now name its `backend`; a missing or
+  unknown one is an error when the config loads, where an entry with only a
+  `path` or `size` used to become a `redb` tier.
 
 - **A request that outgrows the page pool parks an idle conversation instead of
   failing.** `infr serve` with `kv.paged` and a pool too small for every slot now

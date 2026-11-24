@@ -703,8 +703,9 @@ cfg_struct! {
 /// that policy.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KvTier {
-    /// `redb` (local: a file, or memory when `path` is unset) or `redis` (a shared server).
-    pub backend: String,
+    /// Where this entry keeps blocks: see [`KvBackend`]. `None` only while a config is being
+    /// assembled; every entry has to name one, and a config that loads without one is an error.
+    pub backend: Option<KvBackend>,
     /// Bytes this entry keeps before evicting (or demoting, when an entry follows it).
     pub size: Option<SizeSpec>,
     /// `redb`: the database file. Unset keeps the database in memory.
@@ -722,8 +723,25 @@ impl KvTier {
         }
     }
 
+    /// Whether this entry is the addressable device-memory tier rather than a storage backend.
+    pub fn is_vram(&self) -> bool {
+        self.backend == Some(KvBackend::Vram)
+    }
+
+    /// The backend's name for logs and messages.
+    fn backend_name(&self) -> String {
+        self.backend
+            .map_or_else(|| "?".to_string(), |b| b.to_string())
+    }
+
     /// A one-line description for logs, with any credentials stripped from a `url`.
     pub fn describe(&self) -> String {
+        if self.is_vram() {
+            return match self.bytes() {
+                Some(b) => format!("{} ({b} bytes)", self.backend_name()),
+                None => self.backend_name(),
+            };
+        }
         let where_ = self
             .path
             .as_ref()
@@ -731,10 +749,97 @@ impl KvTier {
             .or_else(|| self.url.as_deref().map(redact_url))
             .unwrap_or_else(|| "memory".to_string());
         match self.bytes() {
-            Some(b) => format!("{} {where_} ({b} bytes)", self.backend),
-            None => format!("{} {where_}", self.backend),
+            Some(b) => format!("{} {where_} ({b} bytes)", self.backend_name()),
+            None => format!("{} {where_}", self.backend_name()),
         }
     }
+}
+
+/// What a `[[kv.tiers]]` entry is backed by. `vram` is addressable (live slots' memory, first
+/// entry only); `redb` and `redis` are storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvBackend {
+    /// Device memory.
+    Vram,
+    /// Local: a file, or memory when `path` is unset.
+    Redb,
+    /// A shared server (`valkey` is accepted as a spelling).
+    Redis,
+}
+
+impl std::str::FromStr for KvBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vram" => Ok(Self::Vram),
+            "redb" => Ok(Self::Redb),
+            "redis" | "valkey" => Ok(Self::Redis),
+            other => Err(format!(
+                "unknown kv tier backend {other:?} (vram, redb, redis)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for KvBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Vram => "vram",
+            Self::Redb => "redb",
+            Self::Redis => "redis",
+        })
+    }
+}
+
+/// The byte size of the `vram` tier in `tiers`, `None` when the list names none. A `vram` entry is
+/// valid only first, with a byte `size` above zero and no `path` or `url`; anything else is an
+/// error naming the entry.
+pub fn kv_vram_tier_bytes(tiers: &[KvTier]) -> Result<Option<u64>, String> {
+    check_kv_tier_backends(tiers).map_err(|(i, why)| format!("kv.tiers[{i}]: {why}"))?;
+    let mut bytes = None;
+    for (i, tier) in tiers.iter().enumerate().filter(|(_, t)| t.is_vram()) {
+        let name = format!("kv.tiers[{i}] (vram)");
+        if i != 0 {
+            return Err(format!(
+                "{name}: the vram tier holds live slots and must be the first entry"
+            ));
+        }
+        if tier.path.is_some() || tier.url.is_some() {
+            return Err(format!(
+                "{name}: a vram tier is device memory and takes no `path` or `url`"
+            ));
+        }
+        bytes = match tier.size {
+            Some(SizeSpec::Bytes(b)) if b > 0 => Some(b),
+            Some(SizeSpec::Bytes(_)) => {
+                return Err(format!("{name}: `size` has to be more than zero"));
+            }
+            Some(SizeSpec::Percent(_)) => {
+                return Err(format!("{name}: `size` is bytes, not a share of something"));
+            }
+            None => return Err(format!("{name}: a vram tier needs a byte `size`")),
+        };
+    }
+    Ok(bytes)
+}
+
+/// Every `[[kv.tiers]]` entry has to name its `backend`: an entry with only a `path` or a `size`
+/// is refused rather than guessed to be `redb`. Returns the first offender's index and why.
+pub fn check_kv_tier_backends(tiers: &[KvTier]) -> Result<(), (usize, String)> {
+    match tiers.iter().position(|t| t.backend.is_none()) {
+        Some(i) => Err((i, "`backend` is required (vram, redb or redis)".to_string())),
+        None => Ok(()),
+    }
+}
+
+/// [`check_kv_tier_backends`] over a layer's list, as the load error naming the entry's path.
+fn check_layer_tiers(tiers: Option<&Vec<KvTier>>) -> Result<(), ConfigError> {
+    tiers.map_or(Ok(()), |t| {
+        check_kv_tier_backends(t).map_err(|(i, message)| ConfigError::Value {
+            path: format!("kv.tiers.{i}.backend"),
+            message,
+        })
+    })
 }
 
 /// `scheme://user:secret@host` as `scheme://host`: a URL in a log line keeps its shape and loses
@@ -1108,6 +1213,7 @@ impl Config {
         let env_layer = ConfigLayer::env()?;
         let cli_layer = ConfigLayer::cli(overrides)?;
         let cfg = Config::load_from_layers(&[file_layer.clone(), env_layer, cli_layer]);
+        check_layer_tiers(Some(&cfg.kv.tiers))?;
         // The file MAY set the diagnostic knobs, but it has to say so — otherwise
         // "why is my server printing timings" is unanswerable from the command line.
         if let Some(path) = &file_path {

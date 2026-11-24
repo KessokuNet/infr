@@ -92,6 +92,7 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
     let mut partial = PartialConfig::default();
     let mut warnings = Vec::new();
     walk(&doc, "", &known, &mut partial, &mut warnings)?;
+    super::check_layer_tiers(partial.kv.tiers.as_ref())?;
     // A relative tuning-file path inside a config file names a file beside THAT file, the usual
     // convention for a path in a config file; `INFR_TUNE_FILE` and `--set` stay relative to the
     // working directory.

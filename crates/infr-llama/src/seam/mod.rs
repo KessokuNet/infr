@@ -2125,7 +2125,7 @@ pub(crate) fn dense_placement_fits(
         0
     };
     dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
-        <= vram.alloc_room()
+        <= net_of_vram_tier(ec, vram.alloc_room())
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -2168,7 +2168,7 @@ pub(crate) fn dense_stream_budget_at(
     } else {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
     };
-    vram.alloc_room()
+    net_of_vram_tier(ec, vram.alloc_room())
         .saturating_sub(dense_resident_need(
             cfg,
             resident_weights,
@@ -2193,8 +2193,13 @@ const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 /// [`MOE_ACT_HEADROOM`] — against the allocator's ceiling, like every other budget here. `None`
 /// when the dense half alone does not fit, which is not a paging decision but a hard error (dense
 /// layer streaming does not cover an MoE model's dense part).
-pub(crate) fn moe_expert_budget(vram: &infr_vulkan::VramInfo, dense: u64, kv: u64) -> Option<u64> {
-    let room = vram.alloc_room();
+pub(crate) fn moe_expert_budget(
+    ec: &EngineConfig,
+    vram: &infr_vulkan::VramInfo,
+    dense: u64,
+    kv: u64,
+) -> Option<u64> {
+    let room = net_of_vram_tier(ec, vram.alloc_room());
     let base = dense.saturating_add(kv);
     (base <= room).then(|| room.saturating_sub(base.saturating_add(MOE_ACT_HEADROOM)))
 }
@@ -2236,23 +2241,142 @@ pub(crate) fn kv_fit_ctx_for(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
-    // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
-    // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
-    // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are budgeted by
-    // `moe_expert_budget`, not by the dense activation reserve.
-    let moe_reserve = cfg
-        .moe
-        .is_some()
-        .then(|| (vram.total / 12).max(1024 * 1024 * 1024));
+    let (budget, moe_reserve) = fit_budget(cfg, weights, vram);
     kv_fit_ctx_in_budget(
         cfg,
         ec,
-        vram.alloc_room().saturating_sub(weights),
+        budget,
         moe_reserve,
         &ubatch_candidates(ec),
         k_fmt,
         v_fmt,
         1,
+    )
+}
+
+/// The budget [`kv_fit_ctx_for`] searches (before any `vram` tier) and the MoE arm's flat reserve.
+///
+/// The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
+/// decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
+/// MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are budgeted by
+/// `moe_expert_budget`, not by the dense activation reserve.
+fn fit_budget(cfg: &Config, weights: u64, vram: &infr_vulkan::VramInfo) -> (u64, Option<u64>) {
+    let moe_reserve = cfg
+        .moe
+        .is_some()
+        .then(|| (vram.total / 12).max(1024 * 1024 * 1024));
+    (vram.alloc_room().saturating_sub(weights), moe_reserve)
+}
+
+/// Bytes the configured `vram` tier reserves beside the live windows, `0` with no tier. A malformed
+/// tier counts as none here; [`vram_tier_bytes`] is the checked spelling every open path runs
+/// first, so the error is reported before any budget is read.
+fn vram_tier_reserve(ec: &EngineConfig) -> u64 {
+    infr_core::config::kv_vram_tier_bytes(&ec.kv.tiers)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// [`vram_tier_reserve`], with a malformed `vram` entry an error naming the entry.
+pub(crate) fn vram_tier_bytes(ec: &EngineConfig) -> AResult<u64> {
+    infr_core::config::kv_vram_tier_bytes(&ec.kv.tiers)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| anyhow!(e))
+}
+
+/// What is left of `room` once the `vram` tier is reserved. The one place the tier comes off a
+/// device budget: the fit math, the residency predicate, the streaming budget and the MoE expert
+/// budget all read their ceiling through it.
+pub(crate) fn net_of_vram_tier(ec: &EngineConfig, room: u64) -> u64 {
+    room.saturating_sub(vram_tier_reserve(ec))
+}
+
+/// Bytes one pool page costs across every pooled layer at these formats.
+pub(crate) fn kv_page_bytes(cfg: &Config, k_fmt: DType, v_fmt: DType) -> u64 {
+    (0..cfg.n_layer)
+        .filter(|&l| paged_layer(cfg, l))
+        .map(|l| {
+            let (kr, vr) = kv_row_elems(cfg, l);
+            kv_side_bytes(k_fmt, infr_vulkan::paged::PAGE_ROWS * kr) as u64
+                + kv_side_bytes(v_fmt, infr_vulkan::paged::PAGE_ROWS * vr) as u64
+        })
+        .sum()
+}
+
+/// The byte cap on the paged KV pool, `None` when nothing sets one (the pool keeps its default
+/// page count). `window_bytes` is what the slots' windows need by default; `kv.pool_mb` replaces
+/// it. A `vram` tier is a reservation BESIDE those windows for retained idle pages, so it adds to
+/// the cap instead of replacing it: a full window still leaves the tier's bytes for retention.
+pub(crate) fn kv_pool_cap_bytes(ec: &EngineConfig, window_bytes: u64) -> AResult<Option<u64>> {
+    let windows = ec.kv.pool_mb.map(|mb| mb << 20);
+    Ok(match vram_tier_bytes(ec)? {
+        0 => windows,
+        tier => Some(windows.unwrap_or(window_bytes).saturating_add(tier)),
+    })
+}
+
+/// Pool pages a byte cap buys at `page_bytes` per page, never fewer than the zero page plus one.
+pub(crate) fn pool_pages_for_cap(cap: u64, page_bytes: u64) -> Option<usize> {
+    cap.checked_div(page_bytes).map(|p| (p as usize).max(2))
+}
+
+/// Whole pool pages the `vram` tier holds for retention, `None` with no tier.
+pub(crate) fn vram_tier_pages(ec: &EngineConfig, page_bytes: u64) -> Option<usize> {
+    match vram_tier_reserve(ec) {
+        0 => None,
+        tier => Some(tier.checked_div(page_bytes).unwrap_or(0) as usize),
+    }
+}
+
+/// Refuse an open whose `vram` tier alone takes away the window it asked for: `want` tokens when
+/// the user chose one, else one [`MIN_SESSION_CTX`] window, in each of `copies` caches. `fmts` are
+/// every KV format the session may end up with (the auto-q8 rung included), and the best of them
+/// is what is priced, so a config the q8 rung or a smaller explicit window still serves is not
+/// blamed on the tier. A device that cannot serve the window even without the tier is left to the
+/// ordinary refuse rungs. A malformed tier is an error here, on every open path.
+pub(crate) fn refuse_vram_tier(
+    cfg: &Config,
+    ec: &EngineConfig,
+    weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    fmts: &[(DType, DType)],
+    want: Option<usize>,
+    copies: usize,
+) -> AResult<()> {
+    let tier = vram_tier_bytes(ec)?;
+    // Host overflow places the KV the device cannot hold in system RAM, so it rescues the window.
+    if tier == 0 || ec.kv.overflow {
+        return Ok(());
+    }
+    let (budget, moe_reserve) = fit_budget(cfg, weights, vram);
+    let cands = ubatch_candidates(ec);
+    let best = |budget: u64| {
+        fmts.iter()
+            .filter_map(|&(k, v)| {
+                kv_fit_ctx_in_budget(cfg, ec, budget, moe_reserve, &cands, k, v, copies)
+                    .map(|n| (n, (k, v)))
+            })
+            .max_by_key(|&(n, _)| n)
+    };
+    let (Some((with, _)), Some((without, (k_fmt, v_fmt)))) =
+        (best(budget), best(budget.saturating_add(tier)))
+    else {
+        return Ok(());
+    };
+    let required = want.unwrap_or(MIN_SESSION_CTX);
+    if with >= required || without < required {
+        return Ok(());
+    }
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    let window = kv_bytes_estimate_fmt(cfg, required, ring, ubatch_rows(ec), k_fmt, v_fmt)
+        .saturating_mul(copies.max(1) as u64);
+    anyhow::bail!(
+        "kv.tiers[0] (vram) reserves {tier} bytes, which leaves {} bytes after the {weights} bytes \
+         of weights ({} bytes available): not enough for a {required}-token window ({window} bytes \
+         of KV at {k_fmt:?}/{v_fmt:?}); shrink its `size`",
+        net_of_vram_tier(ec, budget),
+        vram.alloc_room(),
     )
 }
 
@@ -2281,6 +2405,8 @@ pub(crate) fn kv_fit_ctx_in_budget(
     if (0..cfg.n_layer).all(|l| kv_row_elems(cfg, l) == (0, 0)) {
         return None;
     }
+    // A configured `vram` tier is carved off before slots divide what is left.
+    let budget = net_of_vram_tier(ec, budget);
     // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
     let copies = slot_copies.max(1) as u64;
@@ -2365,6 +2491,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
     v_fmt: DType,
     slot_copies: usize,
 ) -> AResult<usize> {
+    // Every cold init passes here, so a malformed `vram` tier is reported even on a path that
+    // opened without the model-level gate.
+    vram_tier_bytes(ec)?;
     let Some(room) = be.device_alloc_room() else {
         return Ok(want_ctx);
     };
@@ -2799,7 +2928,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // scope for dense layer streaming — `None`, and we fail with a clear message
                 // instead of letting a degenerate expert budget stumble into the alloc-time VRAM
                 // guard's generic over-commit error.
-                let Some(budget) = moe_expert_budget(&vram, fp.dense, kv_bytes) else {
+                let Some(budget) = moe_expert_budget(ec, &vram, fp.dense, kv_bytes) else {
                     return Err(anyhow!(
                         "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
                          the allocatable VRAM ({:.2} GB, free minus the guard headroom) — dense \
@@ -6498,12 +6627,12 @@ mod seam_helper_tests {
 
         // MoE expert placement: same ceiling, minus the pager's own headroom.
         assert_eq!(
-            super::moe_expert_budget(&vram, 0, 0),
+            super::moe_expert_budget(&ec, &vram, 0, 0),
             Some(XTX_ROOM - super::MOE_ACT_HEADROOM)
         );
-        assert_eq!(super::moe_expert_budget(&vram, XTX_ROOM, 0), Some(0));
+        assert_eq!(super::moe_expert_budget(&ec, &vram, XTX_ROOM, 0), Some(0));
         assert_eq!(
-            super::moe_expert_budget(&vram, XTX_ROOM + 1, 0),
+            super::moe_expert_budget(&ec, &vram, XTX_ROOM + 1, 0),
             None,
             "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
         );
@@ -6711,6 +6840,288 @@ mod seam_helper_tests {
         assert!(
             fit < super::MIN_SESSION_CTX,
             "must report the real (unusable) fit, got {fit}"
+        );
+    }
+
+    fn ec_with_tiers(tiers: Vec<infr_core::config::KvTier>) -> EngineConfig {
+        let mut ec = EngineConfig::default();
+        ec.kv.tiers = tiers;
+        ec
+    }
+
+    fn vram_tier(bytes: u64) -> infr_core::config::KvTier {
+        infr_core::config::KvTier {
+            backend: Some(infr_core::config::KvBackend::Vram),
+            size: Some(infr_core::SizeSpec::Bytes(bytes)),
+            ..Default::default()
+        }
+    }
+
+    /// With no `vram` tier the budget is untouched: a storage-only list prices like no list, and
+    /// a tier of `S` bytes prices exactly like `S` more bytes of weights, so the window shrinks by
+    /// `S` and nothing else moves.
+    #[test]
+    fn a_vram_tier_shrinks_the_fit_by_its_size_and_nothing_else() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let weights = GEMMA3_12B_WEIGHTS;
+        let fit = |ec: &EngineConfig, weights: u64| {
+            super::kv_fit_ctx_for(&cfg, ec, weights, &xtx(XTX_FREE), DType::F16, DType::F16)
+                .expect("has KV")
+        };
+        let implicit = fit(&EngineConfig::default(), weights);
+        let storage = infr_core::config::KvTier {
+            backend: Some(infr_core::config::KvBackend::Redb),
+            ..Default::default()
+        };
+        assert_eq!(
+            fit(&ec_with_tiers(vec![storage.clone()]), weights),
+            implicit
+        );
+
+        let tier = 2 * 1024 * 1024 * 1024;
+        let sized = ec_with_tiers(vec![vram_tier(tier), storage]);
+        let shrunk = fit(&sized, weights);
+        assert!(shrunk < implicit, "{shrunk} vs {implicit}");
+        assert_eq!(
+            shrunk,
+            fit(&EngineConfig::default(), weights + tier),
+            "the tier is priced as bytes off the budget"
+        );
+    }
+
+    const F16: (DType, DType) = (DType::F16, DType::F16);
+    const Q8: (DType, DType) = (DType::Q8_0, DType::Q8_0);
+
+    /// A tier that takes the minimum window away is refused naming its size, the window's bytes and
+    /// what is left; a device that could not hold a window anyway, and a list with no vram tier,
+    /// are not blamed on the tier.
+    #[test]
+    fn an_oversized_vram_tier_is_refused_with_its_figures() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let refuse = |ec: &EngineConfig, weights: u64, want: Option<usize>| {
+            super::refuse_vram_tier(&cfg, ec, weights, &xtx(XTX_FREE), &[F16], want, 1)
+        };
+        let weights = GEMMA3_12B_WEIGHTS;
+        assert!(refuse(&EngineConfig::default(), weights, None).is_ok());
+        assert!(refuse(&ec_with_tiers(vec![vram_tier(1 << 30)]), weights, None).is_ok());
+
+        let tier = XTX_ROOM - weights;
+        let err = refuse(&ec_with_tiers(vec![vram_tier(tier)]), weights, None)
+            .expect_err("a tier that takes the whole budget leaves no window")
+            .to_string();
+        let window = super::kv_bytes_estimate_fmt(
+            &cfg,
+            super::MIN_SESSION_CTX,
+            super::placement_ring(&cfg, &EngineConfig::default(), F16.0, F16.1),
+            super::ubatch_rows(&EngineConfig::default()),
+            F16.0,
+            F16.1,
+        );
+        assert!(err.contains("kv.tiers[0] (vram)"), "{err}");
+        assert!(err.contains(&format!("reserves {tier} bytes")), "{err}");
+        assert!(err.contains(&format!("({window} bytes")), "{err}");
+        assert!(
+            err.contains("leaves 0 bytes")
+                && err.contains(&format!("({XTX_ROOM} bytes available)")),
+            "the left-over figure is net of the tier: {err}"
+        );
+
+        let no_room = XTX_ROOM - 64 * 1024 * 1024;
+        assert!(refuse(&ec_with_tiers(vec![vram_tier(1 << 30)]), no_room, None).is_ok());
+
+        let mut overflow = ec_with_tiers(vec![vram_tier(tier)]);
+        overflow.kv.overflow = true;
+        assert!(
+            refuse(&overflow, weights, None).is_ok(),
+            "host overflow serves the window the tier-net device room cannot"
+        );
+    }
+
+    /// A malformed tier is an error on the open path, never a tier that quietly is not there.
+    #[test]
+    fn a_malformed_vram_tier_is_refused_at_open() {
+        let cfg = gemma3_12b();
+        for bad in [
+            vec![vram_tier(0)],
+            vec![infr_core::config::KvTier {
+                backend: Some(infr_core::config::KvBackend::Vram),
+                ..Default::default()
+            }],
+            vec![infr_core::config::KvTier::default()],
+        ] {
+            let ec = ec_with_tiers(bad);
+            let err = super::refuse_vram_tier(
+                &cfg,
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                &[F16],
+                None,
+                1,
+            )
+            .expect_err("malformed")
+            .to_string();
+            assert!(err.contains("kv.tiers[0]"), "{err}");
+            assert!(super::vram_tier_bytes(&ec).is_err());
+        }
+    }
+
+    /// The best format the session could pick is what gets priced: a tier an auto-q8 cache still
+    /// serves is not refused, and one it does not serve is.
+    #[test]
+    fn the_auto_q8_rung_is_priced_before_the_tier_is_blamed() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let weights = GEMMA3_12B_WEIGHTS;
+        let vram = xtx(XTX_FREE);
+        let (budget, moe) = super::fit_budget(&cfg, weights, &vram);
+        let cands = super::ubatch_candidates(&EngineConfig::default());
+        let fit = |tier: u64, fmt: (DType, DType)| {
+            super::kv_fit_ctx_in_budget(
+                &cfg,
+                &ec_with_tiers(vec![vram_tier(tier)]),
+                budget,
+                moe,
+                &cands,
+                fmt.0,
+                fmt.1,
+                1,
+            )
+            .expect("has KV")
+        };
+        // The smallest tier (8 MiB steps) at which f16 can no longer hold the minimum window.
+        let step = 8 << 20;
+        let tier = (1..)
+            .map(|i| i * step)
+            .find(|&t| fit(t, F16) < super::MIN_SESSION_CTX)
+            .expect("a tier eventually starves f16");
+        assert!(
+            fit(tier, Q8) >= super::MIN_SESSION_CTX,
+            "premise: q8 still serves what f16 no longer does"
+        );
+        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let refuse = |fmts: &[(DType, DType)]| {
+            super::refuse_vram_tier(&cfg, &ec, weights, &vram, fmts, None, 1)
+        };
+        assert!(refuse(&[F16]).is_err(), "f16 alone is starved by the tier");
+        assert!(refuse(&[F16, Q8]).is_ok(), "the q8 rung serves the window");
+    }
+
+    /// An explicit `--ctx` is compared against that window, not the minimum: refused only when
+    /// the tier alone is what pulls the fit under it.
+    #[test]
+    fn an_explicit_ctx_is_priced_against_the_tier() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let weights = GEMMA3_12B_WEIGHTS;
+        let vram = xtx(XTX_FREE);
+        let tier = 2u64 << 30;
+        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let fit = |ec: &EngineConfig| {
+            super::kv_fit_ctx_for(&cfg, ec, weights, &vram, F16.0, F16.1).expect("has KV")
+        };
+        let (without, with) = (fit(&EngineConfig::default()), fit(&ec));
+        assert!(with < without, "premise: the tier shrinks the fit");
+        let refuse =
+            |want: usize| super::refuse_vram_tier(&cfg, &ec, weights, &vram, &[F16], Some(want), 1);
+        assert!(refuse(with).is_ok(), "a window the tier leaves is fine");
+        let err = refuse(with + 1).expect_err("one token past what the tier leaves");
+        assert!(err.to_string().contains("kv.tiers[0] (vram)"), "{err}");
+        assert!(refuse(without).is_err());
+        assert!(
+            refuse(without + 1).is_ok(),
+            "a window that fails without the tier too is the ordinary refuse rung's"
+        );
+    }
+
+    /// The pool cap is the windows' bytes plus the tier: `kv.pool_mb` replaces the default windows
+    /// figure, a tier adds to either, and no tier leaves today's rule alone.
+    #[test]
+    fn the_pool_cap_adds_the_vram_tier_beside_the_windows() {
+        let windows = 100 << 20;
+        let mut ec = EngineConfig::default();
+        assert_eq!(super::kv_pool_cap_bytes(&ec, windows).unwrap(), None);
+        ec.kv.pool_mb = Some(64);
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, windows).unwrap(),
+            Some(64 << 20)
+        );
+        ec.kv.tiers = vec![vram_tier(5 << 20)];
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, windows).unwrap(),
+            Some((64 << 20) + (5 << 20)),
+            "the tier is on top of pool_mb"
+        );
+        ec.kv.pool_mb = None;
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, windows).unwrap(),
+            Some(windows + (5 << 20)),
+            "…and on top of the default windows, never in place of them"
+        );
+        ec.kv.tiers = vec![vram_tier(0)];
+        assert!(super::kv_pool_cap_bytes(&ec, windows).is_err());
+    }
+
+    /// The tier comes off the residency predicate, the streaming budget and the MoE expert budget
+    /// exactly as it comes off the fit: one byte either side of the ceiling net of the tier.
+    #[test]
+    fn the_vram_tier_comes_off_placement_as_it_comes_off_the_fit() {
+        if !default_chunk_is_discrete("the_vram_tier_comes_off_placement_as_it_comes_off_the_fit") {
+            return;
+        }
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let vram = xtx(XTX_FREE);
+        let cfg = gemma3_12b();
+        let tier = 1u64 << 30;
+        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let (ctx, ub) = (32768usize, 256usize);
+        let kv_and_act = super::dense_resident_need(&cfg, 0, ctx, true, ub, F16.0, F16.1);
+        let exact = XTX_ROOM - tier - kv_and_act;
+        let fits = |ec: &EngineConfig, w: u64| {
+            super::dense_placement_fits(&cfg, ec, w, &vram, ctx, ub, F16.0, F16.1)
+        };
+        assert!(fits(&ec, exact));
+        assert!(
+            !fits(&ec, exact + 1),
+            "a byte into the tier's reservation is not resident"
+        );
+        assert!(
+            fits(&EngineConfig::default(), exact + 1),
+            "…which only the tier-less ceiling would have accepted"
+        );
+        let stream = |ec: &EngineConfig, w: u64| {
+            super::dense_stream_budget_at(&cfg, ec, w, &vram, ctx, ub, F16.0, F16.1)
+        };
+        let lm = super::layer_major_act_bytes(&cfg, ctx, ub);
+        assert_eq!(stream(&ec, exact), 0);
+        assert_eq!(stream(&ec, exact - (1 << 30)), (1 << 30) - lm);
+        assert_eq!(
+            super::moe_expert_budget(&ec, &vram, XTX_ROOM - tier, 0),
+            Some(0)
+        );
+        assert_eq!(
+            super::moe_expert_budget(&ec, &vram, XTX_ROOM - tier + 1, 0),
+            None
+        );
+        // The fit math lands on the same boundary the predicate does.
+        let fit = super::kv_fit_ctx_for(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, F16.0, F16.1)
+            .expect("has KV");
+        assert!(super::dense_resident_rung(
+            &cfg,
+            &ec,
+            GEMMA3_12B_WEIGHTS,
+            &vram,
+            fit,
+            F16.0,
+            F16.1
+        )
+        .is_some());
+        assert_eq!(
+            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit + 1, F16.0, F16.1),
+            None,
+            "one token past the tier-net fit must miss at every rung"
         );
     }
 

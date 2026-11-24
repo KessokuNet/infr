@@ -57,7 +57,7 @@ fn engine_kv(paged: bool, fmt: infr_core::DType) -> infr_llama::EngineConfig {
     // A tiny host store, so a recycled slot restores into its block (and copies a shared page
     // before it writes) — the two prefix mechanisms have to compose.
     c.kv.tiers.push(infr_core::config::KvTier {
-        backend: "redb".to_string(),
+        backend: Some(infr_core::config::KvBackend::Redb),
         size: Some(infr_core::SizeSpec::Bytes(64 << 20)),
         ..Default::default()
     });
