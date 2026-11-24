@@ -8,7 +8,7 @@ block size, and nothing else.
 2. **Reuse inside a slot set.** Two live sequences share a prefix, so their
    page tables point at the same physical rows and diverge by copy-on-write.
 
-This tree ships both: (1) as the `[[kv.tiers]]` cache, (2) as `kv.paged`. When writing
+This tree ships both: (1) as the `[[kv.block]]` cache, (2) as `kv.paged`. When writing
 about them, be blunt: (1) is **reverse PagedAttention** — paging turned inside
 out. Physical rows stay contiguous in a slot; the blocks are the thing that
 travels, and the "restore" is a bulk upload back into a linear buffer. It is a
@@ -16,14 +16,21 @@ cache in the CPU sense, not an allocator. (2) is the allocator.
 
 ## Knobs
 
-Two mechanisms, two knobs, and neither implies the other:
+Two mechanisms and three sections, and none implies another:
 
-| Knob | Config / env | Direction | Status |
-| --- | --- | --- | --- |
-| `tiers` | `[[kv.tiers]]` (config file) | reverse (host block store) | shipped |
-| `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | shipped |
+| Knob | Config / env | Holds | Direction | Status |
+| --- | --- | --- | --- | --- |
+| window | `[[kv.window]]` (config file) | the live rows, in VRAM or host RAM | placement | shipped |
+| pages | `[kv.pages]` (config file) | retained page maps of parked slots, above the windows | forward (page pool) | shipped |
+| blocks | `[[kv.block]]` (config file) | 128-token prefix extents in redb or Redis | reverse (block store) | shipped |
+| `paged` | `kv.paged` / `INFR_KV_PAGED` | whether the slots share a page pool; on by default | forward (page pool) | shipped |
 
-`kv.paged` puts a session's KV in one page pool at the first fork: the slot that
+The three nouns differ in how long their data lasts: the window is short (one request), pages are
+medium (until pressure or the reserve evicts a parked map), blocks are long (until the store
+evicts them). The window is always addressable and never spills to a block store.
+
+`kv.paged` (on by default wherever a session has several slots, a page-capable backend and a
+poolable layer) puts a session's KV in one page pool at the first fork: the slot that
 was forked from keeps its block, the fork points at its parent's complete pages,
 and only a page it later writes is copied. Everything about the size is
 unchanged — the pool holds one block per slot the session may fork, which is
@@ -91,12 +98,29 @@ even though only the tail changed.
 The inversion fixes that: a page table maps logical 512-row pages to physical
 pages in a shared pool, a fork points at its parent's pages, and the first write
 into a shared page copies it. Restore becomes "fill the table", with uploads
-only for pages that are not resident. The host store survives as the cold tier
+only for pages that are not resident. The block store survives as the cold tier
 under the pool instead of being the whole mechanism.
 
-## The tiers
+### What long context is made of
 
-The store's blocks can outlive the slot that produced them, and `[[kv.tiers]]` says where: one
+Long context does not come from the block store. The live window is always addressable
+(`[[kv.window]]`: VRAM, or host RAM read over PCIe) and never spills to a block store, because
+attention reads every row of it on every step and a store cannot serve that (the store-backed
+table below is the measurement). A block store is a prefill cache: it is read once per request to
+skip prefill, and it is not a swap. A long window comes from four things instead:
+
+- **Fewer bytes per token**: q8 or TurboQuant K/V, MLA, sliding-window rings and recurrent layers
+  shrink what a token costs, so the same VRAM holds more of them.
+- **Host spill at a priced PCIe cost**: a `host` window holds the rows that do not fit, and the
+  table below prices the read (15% at 2k, 28% at 8k on the RX 580).
+- **Page sharing**: slots that share a prefix share its pages, so a branching agent pays for the
+  shared part once.
+- **Honest clamping**: a window the device cannot hold is clamped to the fit, or refused at open
+  with the numbers, never silently served from a store.
+
+## The block stores
+
+The store's blocks can outlive the slot that produced them, and `[[kv.block]]` says where: one
 entry per store, fastest first. `backend = "redb"` is one database, in a file when `path` is set
 (prefixes survive a restart) or in redb's in-memory backend otherwise; `backend = "redis"` puts the
 same blocks in Redis or Valkey under a per-model prefix, which lets several servers share one
@@ -112,9 +136,9 @@ block.
 
 Measured on the RX 580 with Qwen2.5-0.5B-Instruct q4_k_m, one slot, 4k ctx, a 2k-token prompt and
 one generated token (the clock covers the whole call, so the restore is inside it), after a 512-token
-run built the pipelines the prompt's chunk heights use. One `[[kv.tiers]]` entry in each row:
+run built the pipelines the prompt's chunk heights use. One `[[kv.block]]` entry in each row:
 
-| Tier | Prompt tokens | First call | Same prompt again | Speedup |
+| Store | Prompt tokens | First call | Same prompt again | Speedup |
 | --- | ---: | ---: | ---: | ---: |
 | `redb`, no `path` (in memory) | 1999 | 864 ms | 43 ms | 20× |
 | `redb`, `path` on NVMe | 2000 | 856 ms | 43 ms | 20× |
@@ -156,14 +180,14 @@ rest is the upload. Cheap next to the 38.5 s prefill it replaces.
 So: keep the store for chat-shaped workloads, and finish the table so a slot can
 stop being a contiguous buffer.
 
-## A host tier: what the placement costs
+## A host window: what the placement costs
 
-A leading `host` entry puts the slot's K/V in system RAM and attention reads it over PCIe by device
+A host-first `[[kv.window]]` puts the slot's K/V in system RAM and attention reads it over PCIe by device
 address; nothing is copied per step, but every row of the window is fetched every step. Measured with
 128 greedy tokens at depth on the RX 580, `--ctx` fixed per row so only the placement differs
-(Qwen2.5-0.5B q4_k_m, q8_0 K/V, 5.1 KiB per token, from the tier's own report):
+(Qwen2.5-0.5B q4_k_m, q8_0 K/V, 5.1 KiB per token, from the window's own report):
 
-| Tier | Depth | Rows read per step | Bytes per step | Decode tok/s |
+| Window | Depth | Rows read per step | Bytes per step | Decode tok/s |
 | --- | ---: | ---: | ---: | ---: |
 | `vram` (default) | 2048 | 2048 | 0 | 137.8 |
 | `host`, 2g | 2048 | 2048 | 10.7 MB | 116.4 |
@@ -179,7 +203,8 @@ card with a wider link pays less.
 
 ## A store-backed window: what a step costs when the store holds the live rows
 
-A storage entry that leads `[[kv.tiers]]` makes the store the authoritative copy of the live window:
+A store-backed window (the first `[[kv.block]]` store, switched on by the measurement harness only:
+the switch has no config key) makes the store the authoritative copy of the live window:
 the slot's buffers are host-allocated, and after every forward each row is written to the store and
 read back. The window is moved twice per step — once out, once in — so this table is the price of
 the policy, not a tuning knob. `crates/infr-llama/tests/kv_store_backed.rs` fills it in; it runs
@@ -203,7 +228,7 @@ takes `Qwen/Qwen2.5-0.5B-Instruct-GGUF` from the HF cache. It prints one row per
 moved per step, and the two running totals; copy them into the table below and note the GPU, the
 Vulkan driver and the Redis version beside it.
 
-| Tier leading `kv.tiers` | Context | Decode tok/s | Rows | Bytes/step | Steps | Written | Read |
+| Store backing the window | Context | Decode tok/s | Rows | Bytes/step | Steps | Written | Read |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `vram` (baseline, no mirror) | ~2k | 141.5 | 2005 | 0 | 0 | 0 | 0 |
 | `redb`, `path` on disk | ~2k | 27.7 | 2006 | 25,423,872 | 21 | 337,428,480 | 337,428,480 |

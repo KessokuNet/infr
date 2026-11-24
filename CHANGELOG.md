@@ -70,19 +70,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   returning an `ActivatedListener` enum because the inherited systemd socket may
   be a Unix-domain listener as well as a TCP one.
 
-- **A storage tier that leads `[[kv.tiers]]` is now the slot's backing.** A list
-  whose first entry is `redb` or `redis` makes that store the authoritative copy
-  of the live window: the slot's buffers are host-allocated and the window is
-  written to the store and read back after every forward. This changes what an
-  existing list means — `[[kv.tiers]] backend = "redb"` alone, or
-  `--set kv.tiers=redb` — now runs under it, and a bare redb entry's 1 GiB
-  default becomes the window's bound. Lead with a `vram` or `host` entry to keep
-  the live window in memory with the store for idle blocks: the first entry is
-  what a slot's rows live in, so `vram` + `redb` is the old behavior with an
-  explicit retention reservation. An experiment, not a recommendation (the bytes
-  per step are in `docs/perf/kv-prefix.md`), it runs in `infr serve` and
-  `infr multi`, and one-shot `infr run` places the window host-side and warns
-  that it opens no store.
+- **The KV config surface is three sections, and `kv.overflow*` and `kv.pool_mb`
+  are gone.** `[[kv.window]]` places the live rows (`vram` first, then `host`,
+  at most one of each), `[kv.pages]` reserves retained pages above the windows,
+  and `[[kv.block]]` is the prefix-store chain (`redb`, `redis`). Each removed
+  key is a load error that prints its replacement, never an ignored line:
+  `kv.overflow` and `kv.overflow_vram_mb` (`INFR_KV_OVERFLOW`,
+  `INFR_KV_OVERFLOW_VRAM_MB`, shipped in 0.1.0) become a `vram` window of that
+  `size` followed by a `host` window, and the old host side was unbounded, so a
+  cap has to be chosen; `kv.overflow_reserve_mb` (`INFR_KV_OVERFLOW_RESERVE_MB`)
+  is removed with no replacement, because the VRAM guard's device headroom is a
+  fixed constant and the key never reached it; `kv.pool_mb` (`INFR_KV_POOL_MB`)
+  capped the whole pool, which is now the windows plus the pages, so its number
+  becomes a `vram` window's `size` or the `[kv.pages]` `size`. `[[kv.tiers]]`
+  never shipped in a release, so it has no migration: its storage entries are
+  `[[kv.block]]` and its leading `vram`/`host` entries are `[[kv.window]]`. The
+  fit no longer keeps a legacy rescue rung for an unbounded host spill: every
+  window prices exactly what it says. A store-backed live window (the first
+  block store as the authoritative copy of the window) exists only as a
+  programmatic switch for the measurement harness, with no config key.
+
+- **Paged KV is on by default.** `kv.paged` unset now means on wherever it can do
+  something (several slots, a backend with a page-table path, a poolable
+  layer); `kv.paged = false` opts out, a one-slot server still builds no pool,
+  and `infr run` builds one only when a second conversation forks into it. A
+  TurboQuant `type_k`/`type_v` with `paged` unset turns paging
+  off for the run with a warning at load, and with `kv.paged = true` or
+  `[kv.pages]` it is a load error naming both keys; `kv.paged = false` together
+  with `[kv.pages]` is a load error too.
+
+- **`-np` means something different under paging.** With paging the per-request
+  window `infr serve -np N` advertises is the pool's fit, not the fit divided by
+  `N`, because a slot owns pages only while it uses them. A script that read the
+  per-slot window off a multi-slot server now sees the larger figure; pass
+  `kv.paged = false` to get the divided window back.
 
 ### Added
 
@@ -104,10 +125,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ThinkMarkers`, the two-rendering diff that says which marker closes a
   template's block.
 
-- **The KV prefix cache is a list of pluggable stores.** `[[kv.tiers]]` replaces
+- **The KV prefix cache is a list of pluggable stores.** `[[kv.block]]` replaces
   `kv.store_mb`, `kv.store_file` and `kv.store_url`: one entry per store, fastest
   first, each naming a `backend` and its own `size`. A write that no longer fits
-  a tier is demoted to the next one, and a read falls through and promotes it
+  a store is demoted to the next one, and a read falls through and promotes it
   back. `backend = "redb"` is one database — `path` keeps it in a file so
   prefixes survive a restart, and leaving `path` out keeps the same database in
   memory. `backend = "redis"` (or `"valkey"`) is a shared tier; its budget is
@@ -116,36 +137,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   old `kv.store_file` journal opens as an empty database, so the first start
   after upgrading loses the prefixes that file held. There is no env spelling for
   the list; the config file is the only place it is written (`--set
-  kv.tiers=redb` gives a single in-memory tier for a quick comparison).
-  `backend = "vram"` is also accepted as the first entry: device memory of a
-  byte `size` reserved beside the live windows. The slots divide what is left, a
-  paged pool grows by the tier's bytes to keep parked pages resident (capped at
-  that size), and an open whose tier alone removes the requested window is
-  refused naming it. Every entry must now name its `backend`; a missing or
-  unknown one is an error when the config loads, where an entry with only a
-  `path` or `size` used to become a `redb` tier.
-  `backend = "host"` is the host-memory twin: the live slot's KV buffers are
-  allocated in system RAM and addressed directly by the unchanged kernels, sized
-  from the tier's byte `size` instead of the device budget, so the context fit
-  stops pricing KV in VRAM (activations still count). It is valid first, or
-  right after a leading `vram` entry, whose `size` is then the device-resident
-  part with the host entry taking the rest; the paged pool allocates its pages
-  host-side under it, and a window the tier cannot hold is refused at open.
-  `kv.overflow` and `kv.overflow_vram_mb` (`INFR_KV_OVERFLOW`,
-  `INFR_KV_OVERFLOW_VRAM_MB`) are deprecated spellings of a `vram` entry of that
-  size followed by an unbounded `host` entry; they behave as before, and a
-  `host` entry in the list takes precedence over them. `kv.overflow_vram_mb` now
-  caps live device KV bytes rather than lifetime bytes (identical until KV
-  buffers are freed and reallocated).
-  A storage entry may also lead the list, and then it is the slot's backing
-  instead of a demotion target (see the change note above). The store also keeps
-  the window's tokens, so a later request sharing that prefix resumes without
-  re-prefilling; a model whose cache carries state the rows do not (compressor
-  rings, delta nets) leaves the window in its slot instead. A leading redb
-  tier's `size` must hold one window per slot (the tier is also the host cap),
-  a leading redis tier takes no `size` and cannot have another store below it
-  (the server owns its eviction, so it cannot be the bounded half of a chain),
-  and `ParallelSeam::kv_mirror_stats` reports steps and bytes moved. Window
+  kv.block=redb` gives a single in-memory store for a quick comparison). Every
+  entry must name its `backend`; a missing or unknown one is an error when the
+  config loads, where an entry with only a `path` or `size` used to become a
+  `redb` store. A `redis` entry takes no `size` and cannot have another store
+  below it (the server owns its eviction, so it cannot be the bounded half of a
+  chain).
+  `[[kv.window]]` with `backend = "host"` puts the live slot's KV buffers in
+  system RAM, addressed directly by the unchanged kernels and sized from its byte
+  `size` instead of the device budget, so the context fit stops pricing KV in
+  VRAM (activations still count). It is valid alone or right after a `vram`
+  window, whose `size` is then the device-resident part with the host window
+  taking the rest, and a window the plan cannot hold is refused at open.
+  `[kv.pages]` is the device bytes reserved beside the live windows for parked
+  page maps: the slots divide what is left, and a paged pool grows by its bytes
+  (capped at that size). A store-backed window keeps the window's tokens, so a
+  later request sharing that prefix resumes without re-prefilling; a model whose
+  cache carries state the rows do not (compressor rings, delta nets) leaves the
+  window in its slot instead. `ParallelSeam::kv_mirror_stats` reports steps and
+  bytes moved. Window
   extents live in a reserved id range, kept out of the content-addressed block
   namespace (a re-derived index, so prefixes saved by the previous id
   derivation are unreachable), are never evicted as cache blocks, and a window

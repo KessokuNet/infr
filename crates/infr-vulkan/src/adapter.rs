@@ -1235,7 +1235,7 @@ fn canvas_chunk(kv_len: usize, n: usize) -> usize {
 
 /// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` (see
 /// [`ATTN_MAX_CHUNKS`]). Raises the chunk floor to `span.div_ceil(1024)`; only bites when
-/// `span > 512*1024` (≈524k keys, reachable under `INFR_KV_OVERFLOW` huge ctx). Below that it
+/// `span > 512*1024` (≈524k keys, reachable with a `host` window and a huge ctx). Below that it
 /// returns `chunk` unchanged, so the recorded dispatch is byte-identical for every realistic span.
 fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
     infr_core::tier::cap_chunk_count(span, chunk, ATTN_MAX_CHUNKS)
@@ -3439,7 +3439,7 @@ fn lower_op(
                 // `shared float wexp[1024]` by chunk, so n_chunks (= span.div_ceil(chunk), computed
                 // in the `split_ok` arm below) must stay <= 1024. Raising the chunk floor to
                 // span.div_ceil(1024) caps n_chunks at 1024. This only bites above ~524k keys
-                // (span > 512*1024, reachable under INFR_KV_OVERFLOW huge ctx); for every realistic
+                // (span > 512*1024, reachable with a host window and huge ctx); for every realistic
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
@@ -8744,7 +8744,7 @@ mod tests {
 
     /// #2 regression guard: the chunk-COUNT cap must NOT change `chunk` (and thus `n_chunks`, the
     /// recorded dispatch) for any realistic span — it may only kick in above ~524k keys. AND it
-    /// must actually bound `n_chunks <= 1024` for the huge spans reachable under INFR_KV_OVERFLOW,
+    /// must actually bound `n_chunks <= 1024` for the huge spans reachable with a host window,
     /// across every static branch's base chunk (the else formula, the ring/cap 512, the batched
     /// 256). attn_combine.comp indexes `shared float wexp[1024]` by chunk, so >1024 is an OOB write.
     #[test]

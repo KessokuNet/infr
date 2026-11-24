@@ -532,15 +532,15 @@ struct VulkanShared {
     uma_overflow_type: Option<u32>,
     /// The host-visible memory type on a NON-device-local heap, probed on EVERY device (unlike
     /// `uma_overflow_type`, which is UMA-only). On a discrete card this heap is system RAM across
-    /// PCIe. `None` if the device exposes no such type. Used ONLY by the opt-in
-    /// `INFR_KV_OVERFLOW` path to place the KV cache in system RAM (read by attention over PCIe
+    /// PCIe. `None` if the device exposes no such type. Used ONLY by a `host` `[[kv.window]]`
+    /// to place the KV cache in system RAM (read by attention over PCIe
     /// via its device address — the KV read seam is 100% `bufferDeviceAddress`, so the bytes may
     /// live off-device with no shader change). See [`Self::alloc_kv_host`].
     host_overflow_type: Option<u32>,
-    /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
-    /// buffers landed in device-local VRAM vs spilled to system RAM, and their byte totals. Purely
-    /// for the one-shot placement banner (`kv_overflow_report`) so the user sees the resident/spilled
-    /// split; the actual budgeting is `device_used` alone. All 0 when the flag is off. The
+    /// VRAM-first KV placement tally (`[[kv.window]]`): how many `BufferUsage::KvCache` buffers
+    /// landed in device-local VRAM vs spilled to system RAM, and their byte totals. Purely for the
+    /// one-shot placement banner (`kv_overflow_report`) so the user sees the resident/spilled
+    /// split; the actual budgeting is `device_used` alone. All 0 when no window is declared. The
     /// bookkeeping (and the cumulative-cap gate) is the shared [`SpillTally`].
     kv_spill: SpillTally,
     /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
@@ -933,32 +933,34 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
     })
 }
 
-/// Opt-in (`kv.overflow`, or a `host` entry in `[[kv.tiers]]`): place the KV cache VRAM-FIRST,
-/// spilling to system RAM only what does not fit. Each
+/// Opt-in (a sized `vram` window or a `host` window in `[[kv.window]]`): place the KV cache
+/// VRAM-FIRST, spilling to system RAM only what does not fit. Each
 /// per-layer/per-side KV buffer is tried in device-local VRAM (budget-guarded); once the VRAM
 /// budget is reached, that buffer — and, since the budget only shrinks as later buffers land, every
 /// subsequent one — is placed in host RAM and read by attention over PCIe via its device address
 /// (the KV read seam is 100% `bufferDeviceAddress`, so off-device bytes need no shader change). So a
 /// context whose KV overflows VRAM by a modest amount keeps most layers resident and pays PCIe only
 /// on the spilled tail; a context that overflows entirely spills entirely (slice-1 whole-host as the
-/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (empty or `0` = off) =
-/// today's VRAM-only behavior, unchanged. See [`VulkanBackend::alloc_kv_host`],
-/// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
+/// limiting case). No window (or an unsized `vram` one alone) is today's VRAM-only behavior,
+/// unchanged. See [`VulkanBackend::alloc_kv_host`], [`VulkanBackend::vram_budget_fits`], and the
+/// ctx-clamp ladder.
 ///
-/// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
-/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer. A
-/// malformed tier list is an error, so a backend built from one fails its first KV allocation
-/// instead of silently keeping the cache in VRAM; the banner readers treat it as no plan.
+/// Read off the backend's `Config`, not the process environment. A malformed window list is an
+/// error, so a backend built from one fails its first KV allocation instead of silently keeping
+/// the cache in VRAM; the banner readers treat it as no plan.
 ///
-/// `KvSpill::device_cap` caps the LIVE KV bytes placed device-local before the rest goes to host
-/// (`kv.overflow_vram_mb`, or the `vram` entry before a `host` one); unset = spill only when VRAM
-/// is genuinely full, `0` = whole-host. It gates KV placement alone, never the real VRAM guard,
-/// and keeps a partial-spill mix reproducible on a model that would otherwise fit.
-fn kv_spill_plan(cfg: &infr_core::config::Config) -> Result<Option<infr_core::config::KvSpill>> {
+/// `WindowPlan::device_cap` caps the LIVE KV bytes placed device-local before the rest goes to
+/// host (the `vram` window's `size`); unset = spill only when VRAM is genuinely full, `0` = a
+/// host-first window. `host_cap` is the `host` window's `size`, and `None` means there is no host
+/// window to spill into. It gates KV placement alone, never the real VRAM guard.
+fn kv_spill_plan(cfg: &infr_core::config::Config) -> Result<Option<infr_core::config::WindowPlan>> {
     cfg.kv
-        .residency()
-        .map(|r| r.spill)
-        .map_err(|e| be(format!("kv tiers: {e}")))
+        .layout()
+        .map(|layout| {
+            Some(layout.placement())
+                .filter(|plan| *plan != infr_core::config::WindowPlan::default())
+        })
+        .map_err(|e| be(format!("kv window: {e}")))
 }
 
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
@@ -966,7 +968,7 @@ fn kv_spill_plan(cfg: &infr_core::config::Config) -> Result<Option<infr_core::co
 /// bytes are ordinary host-visible memory (not page-locked) and attention reaches them
 /// by DEVICE ADDRESS, which is the fact that makes off-device KV work at all here.
 const KV_SPILL: SpillNouns<'static> = SpillNouns {
-    env: "INFR_KV_OVERFLOW",
+    env: "kv.window",
     noun: "KV buffers",
     resident_note: "no PCIe KV reads.",
     spill_note: "SYSTEM RAM — attention reads those K/V over PCIe by device address (PCIe-bound \
@@ -3794,8 +3796,8 @@ impl VulkanBackend {
     }
 
     /// Non-erroring budget probe: would a device-local allocation of `want` bytes fit under the SAME
-    /// budget [`check_vram_budget`](Self::check_vram_budget) enforces? The VRAM-first KV-overflow
-    /// path (`make_alloc`'s `KvCache` arm with `INFR_KV_OVERFLOW`) needs "would this fit?" to choose
+    /// budget [`check_vram_budget`](Self::check_vram_budget) enforces? The VRAM-first KV window
+    /// path (`make_alloc`'s `KvCache` arm with a `[[kv.window]]` plan) needs "would this fit?" to choose
     /// VRAM vs host placement, not "error if not" — but it must agree with the guard to the byte, so
     /// this and the guard share `GUARD_HEADROOM` and the same `used`/`budget` math. A `true` here
     /// means `check_vram_budget(want)` returns `Ok` (the guard errors iff this returns `false`);
@@ -3940,7 +3942,11 @@ impl VulkanBackend {
     /// edge can still fail the allocation, so a device failure spills to host rather than erroring:
     /// the point of a host plan is to degrade, never to hard-fail. The device part gates KV
     /// placement alone, never the real guard, which keeps protecting weights and activations.
-    fn alloc_kv_planned(&self, bytes: usize, plan: infr_core::config::KvSpill) -> Result<VkBuffer> {
+    fn alloc_kv_planned(
+        &self,
+        bytes: usize,
+        plan: infr_core::config::WindowPlan,
+    ) -> Result<VkBuffer> {
         let tally = &self.shared.kv_spill;
         let size = bytes as u64;
         if let Ok(claim) = tally.claim(KvMemory::Device, size, plan.device_cap) {
@@ -3963,22 +3969,29 @@ impl VulkanBackend {
         Ok(keep_kv(buf, claim))
     }
 
-    /// Claim `size` bytes of the host tier, refusing past its `size`.
+    /// Claim `size` bytes of the host window, refusing past its `size`. Without a host window
+    /// there is nowhere to spill, which is its own error.
     fn claim_kv_host(&self, size: u64, host_cap: Option<u64>) -> Result<KvClaim<'_>> {
+        let Some(cap) = host_cap else {
+            return Err(be(format!(
+                "the vram kv window has no room for another {size} bytes of KV cache and no host \
+                 window is declared to take them: grow the vram window's `size` or add a \
+                 `[[kv.window]]` with `backend = \"host\"`"
+            )));
+        };
         self.shared
             .kv_spill
-            .claim(KvMemory::Host, size, host_cap)
+            .claim(KvMemory::Host, size, Some(cap))
             .map_err(|held| {
                 be(format!(
-                    "the host kv tier (size {} bytes) cannot take another {size} bytes of KV \
-                     cache: {held} bytes are already placed in it",
-                    host_cap.unwrap_or(u64::MAX)
+                    "the host kv window (size {cap} bytes) cannot take another {size} bytes of KV \
+                     cache: {held} bytes are already placed in it"
                 ))
             })
     }
 
     /// Allocate one KV-cache buffer in SYSTEM RAM (host-visible, non-device-local heap) WITH a
-    /// device address — the opt-in `INFR_KV_OVERFLOW` path. The KV read seam is 100%
+    /// device address — the `host` window's path. The KV read seam is 100%
     /// `bufferDeviceAddress` (issue #74: `attn_partial`/`attention_kv`/dequant read K/V only
     /// through `k_addr`/`v_addr` pointers), so a KV buffer whose bytes live off-device is read by
     /// attention over PCIe with NO shader change; only the store→read barrier's inert bound
@@ -3993,8 +4006,8 @@ impl VulkanBackend {
     fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
         let ty =
             self.shared.host_overflow_type.ok_or_else(|| {
-                be("host KV placement (kv.overflow or a host kv tier) is set but this device exposes no host-visible non-device-local \
-                memory type to place the KV cache in — unset it to run in VRAM".to_string())
+                be("host KV placement (a host `[[kv.window]]`) is set but this device exposes no host-visible non-device-local \
+                memory type to place the KV cache in — remove the window to run in VRAM".to_string())
             })?;
         // KV buffers are addressed by device address (issue #74), so this buffer needs the
         // SHADER_DEVICE_ADDRESS usage exactly like the VRAM KV path (`make_buf_ex(.., true)`).

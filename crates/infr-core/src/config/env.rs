@@ -70,15 +70,6 @@ fn opt_num<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
     num::<T>(get, key).map(Some)
 }
 
-/// A MiB-valued knob: trimmed, then a plain `u64` count — so a float, a negative or an empty value
-/// leaves the knob unspecified (`mib_and_size_string_spellings`). Stored in MiB; the byte
-/// conversion belongs to the accessor ([`crate::budget::mib_bytes`], R5).
-fn opt_mib(get: Get, key: &str) -> Option<Option<u64>> {
-    get(key)
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Some)
-}
-
 /// The shared size/count grammar (`crate::parse_size`) behind an `Option<SizeSpec>` field.
 fn opt_size(get: Get, key: &str) -> Option<Option<SizeSpec>> {
     get(key).and_then(|v| crate::parse_size(&v)).map(Some)
@@ -198,10 +189,13 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
     p.kv.coopmat_bda = presence(get, "INFR_KV_COOPMAT_BDA");
-    p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");
-    p.kv.overflow_vram_mb = opt_mib(get, "INFR_KV_OVERFLOW_VRAM_MB");
-    p.kv.overflow_reserve_mb = opt_mib(get, "INFR_KV_OVERFLOW_RESERVE_MB");
-    p.kv.pool_mb = opt_mib(get, "INFR_KV_POOL_MB");
+    // The removed spill and pool knobs are load errors naming their replacement, not ignored.
+    for &key in super::kv::REMOVED_KV_ENV {
+        if get(key).is_some() {
+            let message = super::kv::removed_kv_env(key).unwrap_or_default();
+            return Err(ConfigError::Env { key, message });
+        }
+    }
     p.kv.paged = flag(get, "INFR_KV_PAGED").map(Some);
 
     // ── paging ───────────────────────────────────────────────────────────────

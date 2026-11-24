@@ -64,6 +64,15 @@ pub fn parse_reporting(
             message: "expected `--set <config.path>=<value>`".to_string(),
         })?;
         let path = path.trim();
+        if let Some(message) = super::kv::removed_kv_key(path, None) {
+            return Err(ConfigError::Value {
+                path: path.to_string(),
+                message,
+            });
+        }
+        if super::kv::programmatic_kv_key(path).is_some() {
+            return Err(super::file::refused_path(path));
+        }
         if seen.iter().any(|p| p == path) {
             return Err(ConfigError::DuplicateSet {
                 path: path.to_string(),

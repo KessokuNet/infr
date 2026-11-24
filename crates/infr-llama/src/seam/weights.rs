@@ -437,8 +437,8 @@ pub(crate) struct SeamKv {
     /// prefix instead of re-prefilling from zero. Capped by
     /// [`RECURRENT_SNAP_CAP_BYTES`], oldest evicted first.
     pub(super) recurrent_snaps: Vec<RecurrentSnap>,
-    /// Where this slot's live window is mirrored every step, when a storage tier leads
-    /// `[[kv.tiers]]` (see [`crate::seam::LiveWindow`]). `None` on every other placement, which
+    /// Where this slot's live window is mirrored every step, when the window is store-backed
+    /// (see [`crate::seam::LiveWindow`]). `None` on every other placement, which
     /// makes the runner's hook a no-op and the run byte-identical to one without it.
     ///
     /// Per SLOT, not per process: the mirror names the slot's own extent id, and N sequences run

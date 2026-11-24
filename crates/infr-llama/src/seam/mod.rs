@@ -34,7 +34,9 @@ mod wshape;
 pub(crate) use kv_store::{capture_upto, prefix_store_for, store_key, BlockCache};
 pub(crate) use kv_tier::{KvStore, NoStore};
 pub(crate) use mirror::{attach as attach_mirror, LiveWindow};
-pub(crate) use pool::{paged_layer, KvPool, PagedSlot, POOL_BLOCKS};
+pub(crate) use pool::{
+    no_poolable_layer, paged_layer, retention_refusal, KvPool, PagedSlot, POOL_BLOCKS,
+};
 pub use routing::Routing;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
@@ -2129,7 +2131,7 @@ pub(crate) fn dense_placement_fits(
         0
     };
     dense_resident_need(cfg, ec, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
-        <= net_of_vram_tier(ec, vram.alloc_room())
+        <= net_of_pages(ec, vram.alloc_room())
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -2172,7 +2174,7 @@ pub(crate) fn dense_stream_budget_at(
     } else {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
     };
-    net_of_vram_tier(ec, vram.alloc_room())
+    net_of_pages(ec, vram.alloc_room())
         .saturating_sub(dense_resident_need(
             cfg,
             ec,
@@ -2204,7 +2206,7 @@ pub(crate) fn moe_expert_budget(
     dense: u64,
     kv: u64,
 ) -> Option<u64> {
-    let room = net_of_vram_tier(ec, vram.alloc_room());
+    let room = net_of_pages(ec, vram.alloc_room());
     let base = dense.saturating_add(kv);
     (base <= room).then(|| room.saturating_sub(base.saturating_add(MOE_ACT_HEADROOM)))
 }
@@ -2273,59 +2275,82 @@ fn fit_budget(cfg: &Config, weights: u64, vram: &infr_vulkan::VramInfo) -> (u64,
     (vram.alloc_room().saturating_sub(weights), moe_reserve)
 }
 
-/// The live rows' residency, `None` for a malformed tier list; [`kv_residency`] is the checked
-/// spelling every open path runs first, so the error is reported before any budget is read.
-fn residency_or_default(ec: &EngineConfig) -> infr_core::config::KvResidency {
-    ec.kv.residency().unwrap_or_default()
+/// The KV layout, the default for a malformed section; [`kv_layout`] is the checked spelling
+/// every open path runs first, so the error is reported before any budget is read.
+fn layout_or_default(ec: &EngineConfig) -> infr_core::config::KvLayout {
+    ec.kv.layout().unwrap_or_default()
 }
 
-/// Where live KV rows sit, with a malformed addressable entry an error naming it.
-pub(crate) fn kv_residency(ec: &EngineConfig) -> AResult<infr_core::config::KvResidency> {
-    ec.kv.residency().map_err(|e| anyhow!(e))
+/// The KV layout, with a malformed section an error naming it.
+pub(crate) fn kv_layout(ec: &EngineConfig) -> AResult<infr_core::config::KvLayout> {
+    ec.kv.layout().map_err(|e| anyhow!(e))
 }
 
-/// The host spill plan for live rows, `None` when they stay device-local.
-pub(crate) fn kv_spill(ec: &EngineConfig) -> Option<infr_core::config::KvSpill> {
-    residency_or_default(ec).spill
+/// Where the live rows sit.
+pub(crate) fn kv_window(ec: &EngineConfig) -> infr_core::config::WindowPlan {
+    layout_or_default(ec).window
 }
 
-/// Whether a spill leaves the fit with nothing to price exactly: the legacy flag keeps the full
-/// cache in the fit and rescues a window that misses it, so the fit is no bound on what is served.
-pub(crate) fn kv_spill_rescues(ec: &EngineConfig) -> bool {
-    kv_spill(ec).is_some_and(|s| !s.prices_device_kv())
+/// Whether a window plan bounds the live rows at all: no window, or an unsized `vram` one alone,
+/// leaves every KV buffer to the ordinary device allocation.
+pub(crate) fn kv_window_bounds(ec: &EngineConfig) -> bool {
+    kv_window(ec) != infr_core::config::WindowPlan::default()
 }
 
-/// Bytes the configured `vram` tier reserves beside the live windows, `0` with no such tier.
-fn vram_tier_reserve(ec: &EngineConfig) -> u64 {
-    residency_or_default(ec).vram_reserve
+/// The configured `[[kv.window]]` entries as one log line, each named by its index.
+fn describe_windows(ec: &EngineConfig) -> String {
+    ec.kv
+        .window
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| format!("kv.window[{i}] {}", entry.describe()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// [`vram_tier_reserve`], with a malformed addressable entry an error naming it.
-pub(crate) fn vram_tier_bytes(ec: &EngineConfig) -> AResult<u64> {
-    kv_residency(ec).map(|r| r.vram_reserve)
-}
-
-/// Device bytes `kv` bytes of live KV cost: all of it, unless a `host` tier states the device part
-/// and the rest sits in host memory.
-pub(crate) fn kv_device_bytes(ec: &EngineConfig, kv: u64) -> u64 {
-    match kv_spill(ec) {
-        Some(s) if s.prices_device_kv() => kv.min(s.device_cap.unwrap_or(0)),
-        _ => kv,
+/// Bytes of retained pages that sit in device memory beside the windows: the `[kv.pages]` size,
+/// unless a `host` window takes the pages with it.
+fn device_pages(ec: &EngineConfig) -> u64 {
+    let layout = layout_or_default(ec);
+    match layout.window.host_cap {
+        Some(_) => 0,
+        None => layout.pages.unwrap_or(0),
     }
 }
 
-/// Whether `buffers`, allocated in this order, place under the plan. The allocator puts each one
-/// whole in the device part while it fits what is left of it, else in the `host` tier, so a total
-/// below the two sizes' sum can still fail: a buffer that misses the device remainder moves whole
-/// to host. A plan with no host size bounds nothing.
+/// [`device_pages`], with a malformed section an error naming it.
+pub(crate) fn device_pages_bytes(ec: &EngineConfig) -> AResult<u64> {
+    kv_layout(ec)?;
+    Ok(device_pages(ec))
+}
+
+/// Device bytes `kv` bytes of live KV cost: all of it, unless the window plan puts part of it
+/// elsewhere. A sized `vram` window caps the device part; an unsized one under a `host` window is
+/// the room the fit leaves, so the plan's placement check prices the split and nothing here does;
+/// with no `host` window the whole cache competes for device memory.
+pub(crate) fn kv_device_bytes(ec: &EngineConfig, kv: u64) -> u64 {
+    let plan = kv_window(ec);
+    match (plan.device_cap, plan.host_cap) {
+        (Some(cap), _) => kv.min(cap),
+        (None, Some(_)) => 0,
+        (None, None) => kv,
+    }
+}
+
+/// Whether `buffers`, allocated in this order, place under the plan when `device_room` bytes of
+/// device memory are free for them. The allocator puts each one whole in the device part while it
+/// fits what is left of it, else in the `host` window, so a total below the two sizes' sum can
+/// still fail: a buffer that misses the device remainder moves whole to host. With no `host`
+/// window there is nowhere to move it.
 pub(crate) fn kv_placement_fits(
-    spill: &infr_core::config::KvSpill,
+    plan: &infr_core::config::WindowPlan,
+    device_room: u64,
     buffers: impl IntoIterator<Item = u64>,
 ) -> bool {
-    let Some(mut host) = spill.host_cap else {
-        return true;
-    };
-    let mut device = spill.device_cap.unwrap_or(0);
+    let mut host = plan.host_cap.unwrap_or(0);
+    let mut device = plan
+        .device_cap
+        .map_or(device_room, |cap| cap.min(device_room));
     buffers.into_iter().all(|bytes| {
         let room = if bytes <= device {
             &mut device
@@ -2420,7 +2445,8 @@ pub(crate) fn kv_paged_slot_bytes(
 }
 
 /// The most pool pages, at most `pages` and never fewer than two, whose whole session (the pool,
-/// then each slot's private buffers and page table) places under a `host` tier.
+/// then each slot's private buffers and page table) places under the window plan, the retained
+/// pages included, when `device_room` bytes of device memory are free for it.
 pub(crate) fn kv_pool_pages_placing(
     cfg: &Config,
     ec: &EngineConfig,
@@ -2429,11 +2455,13 @@ pub(crate) fn kv_pool_pages_placing(
     ubatch: usize,
     fmts: (DType, DType),
     slots: usize,
+    device_room: u64,
     pages: usize,
 ) -> usize {
-    let Some(spill) = kv_spill(ec).filter(|s| s.host_cap.is_some()) else {
+    if !kv_window_bounds(ec) {
         return pages;
-    };
+    }
+    let plan = layout_or_default(ec).placement();
     let slot = kv_paged_slot_buffers(cfg, ctx, ring, ubatch, fmts);
     let session = |pages| {
         kv_pool_buffers(cfg, fmts, pages)
@@ -2442,7 +2470,7 @@ pub(crate) fn kv_pool_pages_placing(
     };
     (2..=pages)
         .rev()
-        .find(|&p| kv_placement_fits(&spill, session(p)))
+        .find(|&p| kv_placement_fits(&plan, device_room, session(p)))
         .unwrap_or(2)
 }
 
@@ -2451,6 +2479,68 @@ pub(crate) fn linear_kv_config(ec: &EngineConfig) -> EngineConfig {
     let mut linear = ec.clone();
     linear.kv.paged = Some(false);
     linear
+}
+
+/// Whether a session built from `ec` prices its KV as a page pool: paging is on and at least one
+/// layer is poolable. A single-slot run never builds the pool, so it has a page and a table to
+/// spare against this price.
+/// Whether the fit prices a page pool: paging is on, a layer is poolable, and the session has
+/// several slots to share the pool. A lone slot never builds one (see [`session_pages`]).
+fn kv_prices_pool(cfg: &Config, ec: &EngineConfig, copies: usize) -> bool {
+    copies > 1 && ec.kv.paging().is_on() && no_poolable_layer(cfg).is_none()
+}
+
+/// Say why a session's KV stays linear. A session that asked for paging by name (`kv.paged = true`
+/// or `[kv.pages]`) gets a warning; one that only has the default gets an info line.
+pub(crate) fn log_paging_off(ec: &EngineConfig, why: std::fmt::Arguments<'_>) {
+    if ec.kv.declares_paging() {
+        tracing::warn!("kv.paged: {why}");
+    } else {
+        tracing::info!("kv: paging is the default but {why}");
+    }
+}
+
+/// Whether a session of `n_slots` slots on a backend with `caps` pages its KV: paging is on, there
+/// are several slots to share a pool, the backend has a page-table path, and a layer is poolable.
+pub(crate) fn session_pages(
+    cfg: &Config,
+    ec: &EngineConfig,
+    caps: &infr_core::backend::Capabilities,
+    n_slots: usize,
+) -> bool {
+    ec.kv.paging().is_on() && n_slots > 1 && caps.kv_paging && no_poolable_layer(cfg).is_none()
+}
+
+/// Say why a session that has paging on stays linear: paging is the default, so a session that
+/// cannot page (a lone slot, a backend with no page-table path, a model with no poolable layer)
+/// stays linear quietly unless the config asked for paging by name. Silent when it does page.
+pub(crate) fn log_unpaged_session(
+    cfg: &Config,
+    ec: &EngineConfig,
+    caps: &infr_core::backend::Capabilities,
+    n_slots: usize,
+) {
+    if session_pages(cfg, ec, caps, n_slots) || !ec.kv.paging().is_on() {
+        return;
+    }
+    if n_slots <= 1 {
+        let why = "a single-slot engine never forks, so no page pool is allocated; KV stays linear";
+        if ec.kv.declares_paging() {
+            tracing::info!("kv.paged: {why}");
+        } else {
+            tracing::debug!("kv: {why}");
+        }
+    } else if !caps.kv_paging {
+        log_paging_off(
+            ec,
+            format_args!(
+                "backend {} reads KV by position and has no page-table path; slots stay linear",
+                caps.name
+            ),
+        );
+    } else if let Some(why) = no_poolable_layer(cfg) {
+        log_paging_off(ec, format_args!("{why}; slots stay linear"));
+    }
 }
 
 /// The KV buffers `copies` slots allocate for a `ctx`-token window, in allocation order: a paged
@@ -2466,7 +2556,7 @@ fn kv_window_buffers(
     copies: usize,
 ) -> Vec<u64> {
     let copies = copies.max(1);
-    if ec.kv.paged == Some(true) {
+    if kv_prices_pool(cfg, ec, copies) {
         let pages = 1 + ctx.div_ceil(infr_vulkan::paged::PAGE_ROWS).max(1);
         let slot = kv_paged_slot_buffers(cfg, ctx, ring, ubatch, fmts);
         return kv_pool_buffers(cfg, fmts, pages)
@@ -2478,11 +2568,11 @@ fn kv_window_buffers(
     std::iter::repeat_n(slot, copies).flatten().collect()
 }
 
-/// What is left of `room` once the `vram` tier is reserved. The one place the tier comes off a
-/// device budget: the fit math, the residency predicate, the streaming budget and the MoE expert
-/// budget all read their ceiling through it.
-pub(crate) fn net_of_vram_tier(ec: &EngineConfig, room: u64) -> u64 {
-    room.saturating_sub(vram_tier_reserve(ec))
+/// What is left of `room` once the retained pages that sit in device memory are reserved. The one
+/// place the reserve comes off a device budget: the fit math, the residency predicate, the
+/// streaming budget and the MoE expert budget all read their ceiling through it.
+pub(crate) fn net_of_pages(ec: &EngineConfig, room: u64) -> u64 {
+    room.saturating_sub(device_pages(ec))
 }
 
 /// Bytes one pool page costs across every pooled layer at these formats.
@@ -2498,29 +2588,28 @@ pub(crate) fn kv_page_bytes(cfg: &Config, k_fmt: DType, v_fmt: DType) -> u64 {
 }
 
 /// The byte cap on the paged KV pool, `None` when nothing sets one (the pool keeps its default
-/// page count). `window_bytes` is what the slots' windows need by default; `kv.pool_mb` replaces
-/// it. A `vram` tier is a reservation BESIDE those windows for retained idle pages, so it adds to
-/// the cap instead of replacing it: a full window still leaves the tier's bytes for retention.
-/// `slot_bytes` is what the slots allocate beside the pool ([`kv_paged_slot_bytes`]): a `host`
-/// tier's size covers it too, so it comes off before the pool's pages.
+/// page count). `window_bytes` is what the slots' windows need by default: the windows' share of
+/// the cap is that, held to what the window plan can hold (`slot_bytes`, what the slots allocate
+/// beside the pool ([`kv_paged_slot_bytes`]), comes off the plan's capacity first). `[kv.pages]`
+/// is a reservation BESIDE those windows for retained idle pages, so it adds to the cap instead
+/// of replacing it: a full window still leaves the reserve's bytes for retention.
 pub(crate) fn kv_pool_cap_bytes(
     ec: &EngineConfig,
     window_bytes: u64,
     slot_bytes: u64,
 ) -> AResult<Option<u64>> {
-    let residency = kv_residency(ec)?;
-    let windows = ec.kv.pool_mb.map(|mb| mb << 20);
-    let cap = match residency.vram_reserve {
-        0 => windows,
-        tier => Some(windows.unwrap_or(window_bytes).saturating_add(tier)),
-    };
-    // A `host` tier bounds the pool, whose pages are host-allocated beside the device part.
-    Ok(match residency.spill.and_then(|s| s.capacity()) {
-        Some(capacity) => Some(
-            cap.unwrap_or(window_bytes)
-                .min(capacity.saturating_sub(slot_bytes)),
-        ),
-        None => cap,
+    let layout = kv_layout(ec)?;
+    let windows = kv_window_bounds(ec).then(|| {
+        window_bytes.min(
+            layout
+                .window
+                .capacity(window_bytes)
+                .saturating_sub(slot_bytes),
+        )
+    });
+    Ok(match layout.pages {
+        Some(pages) => Some(windows.unwrap_or(window_bytes).saturating_add(pages)),
+        None => windows,
     })
 }
 
@@ -2529,21 +2618,29 @@ pub(crate) fn pool_pages_for_cap(cap: u64, page_bytes: u64) -> Option<usize> {
     cap.checked_div(page_bytes).map(|p| (p as usize).max(2))
 }
 
-/// Whole pool pages the `vram` tier holds for retention, `None` with no tier.
-pub(crate) fn vram_tier_pages(ec: &EngineConfig, page_bytes: u64) -> Option<usize> {
-    match vram_tier_reserve(ec) {
-        0 => None,
-        tier => Some(tier.checked_div(page_bytes).unwrap_or(0) as usize),
-    }
+/// The window one slot can map in a pool of `pages` physical pages: whole pages past the zero
+/// page. Pages are shared, so the number does not divide by the slot count — parking is what lets
+/// several conversations take turns in one conversation's worth of pages. That is what a pool
+/// which placed fewer pages than the window asked for can still serve.
+pub(crate) fn pool_slot_ctx(pages: usize) -> usize {
+    pages.saturating_sub(1) * infr_vulkan::paged::PAGE_ROWS
 }
 
-/// Refuse an open whose `vram` tier alone takes away the window it asked for: `want` tokens when
-/// the user chose one, else one [`MIN_SESSION_CTX`] window, in each of `copies` caches. `fmts` are
-/// every KV format the session may end up with (the auto-q8 rung included), and the best of them
-/// is what is priced, so a config the q8 rung or a smaller explicit window still serves is not
-/// blamed on the tier. A device that cannot serve the window even without the tier is left to the
-/// ordinary refuse rungs. A malformed tier is an error here, on every open path.
-pub(crate) fn refuse_vram_tier(
+/// Whole pool pages the `[kv.pages]` reserve holds for retention, `None` with no reserve.
+pub(crate) fn retained_pages(ec: &EngineConfig, page_bytes: u64) -> Option<usize> {
+    layout_or_default(ec)
+        .pages
+        .map(|pages| pages.checked_div(page_bytes).unwrap_or(0) as usize)
+}
+
+/// Refuse an open whose window configuration alone takes away the window it asked for: `want`
+/// tokens when the user chose one, else one [`MIN_SESSION_CTX`] window, in each of `copies`
+/// caches. `fmts` are every KV format the session may end up with (the auto-q8 rung included), and
+/// the best of them is what is priced, so a config the q8 rung or a smaller explicit window still
+/// serves is not blamed on the config. A device that cannot serve the window even without the
+/// configuration is left to the ordinary refuse rungs. A malformed section is an error here, on
+/// every open path.
+pub(crate) fn refuse_window(
     cfg: &Config,
     ec: &EngineConfig,
     weights: u64,
@@ -2552,11 +2649,11 @@ pub(crate) fn refuse_vram_tier(
     want: Option<usize>,
     copies: usize,
 ) -> AResult<()> {
-    let residency = kv_residency(ec)?;
-    if let Some(spill) = residency.spill {
-        return refuse_host_tier(cfg, ec, spill, fmts, want, copies);
+    let layout = kv_layout(ec)?;
+    if kv_window_bounds(ec) {
+        refuse_window_plan(cfg, ec, layout.window, fmts, want, copies)?;
     }
-    let tier = residency.vram_reserve;
+    let tier = device_pages(ec);
     if tier == 0 {
         return Ok(());
     }
@@ -2583,28 +2680,25 @@ pub(crate) fn refuse_vram_tier(
     let window = kv_bytes_estimate_fmt(cfg, required, ring, ubatch_rows(ec), k_fmt, v_fmt)
         .saturating_mul(copies.max(1) as u64);
     anyhow::bail!(
-        "kv.tiers[0] (vram) reserves {tier} bytes, which leaves {} bytes after the {weights} bytes \
-         of weights ({} bytes available): not enough for a {required}-token window ({window} bytes \
+        "[kv.pages] reserves {tier} bytes, which leaves {} bytes after the {weights} bytes of \
+         weights ({} bytes available): not enough for a {required}-token window ({window} bytes \
          of KV at {k_fmt:?}/{v_fmt:?}); shrink its `size`",
-        net_of_vram_tier(ec, budget),
+        net_of_pages(ec, budget),
         vram.alloc_room(),
     )
 }
 
-/// Refuse an open whose `host` tier (with the `vram` entry before it) cannot hold the window the
-/// session asked for, priced at the best KV format it could pick. A spill with no host size, the
-/// legacy flag, has no bound to refuse against.
-fn refuse_host_tier(
+/// Refuse an open whose window plan cannot hold the window the session asked for, priced at the
+/// best KV format it could pick. The device part that is not sized takes whatever room the
+/// device has, so only the sized parts can refuse.
+fn refuse_window_plan(
     cfg: &Config,
     ec: &EngineConfig,
-    spill: infr_core::config::KvSpill,
+    plan: infr_core::config::WindowPlan,
     fmts: &[(DType, DType)],
     want: Option<usize>,
     copies: usize,
 ) -> AResult<()> {
-    let (Some(capacity), Some(host)) = (spill.capacity(), spill.host_cap) else {
-        return Ok(());
-    };
     let required = want.unwrap_or(MIN_SESSION_CTX);
     let window = |&(k, v): &(DType, DType)| {
         let ring = placement_ring(cfg, ec, k, v);
@@ -2614,16 +2708,20 @@ fn refuse_host_tier(
     if windows.is_empty()
         || windows
             .iter()
-            .any(|w| kv_placement_fits(&spill, w.iter().copied()))
+            .any(|w| kv_placement_fits(&plan, u64::MAX, w.iter().copied()))
     {
         return Ok(());
     }
     let smallest: u64 = windows.iter().map(|w| w.iter().sum()).min().unwrap_or(0);
-    let at = ec.kv.tiers.iter().position(|t| t.is_host()).unwrap_or(0);
+    let (device, host) = (plan.device_cap, plan.host_cap.unwrap_or(0));
+    let held = match device {
+        Some(device) => format!("{device} bytes of vram window and {host} bytes of host window"),
+        None => format!("the device room and {host} bytes of host window"),
+    };
     anyhow::bail!(
-        "kv.tiers[{at}] (host) holds {host} bytes ({capacity} with the device part before it): \
-         not enough for a {required}-token window ({smallest} bytes of KV, each buffer placed \
-         whole in one of them); grow its `size` or ask for a smaller window"
+        "[[kv.window]] holds {held}: not enough for a {required}-token window ({smallest} bytes of \
+         KV, each buffer placed whole in one of them); grow a window's `size` or ask for a smaller \
+         window"
     )
 }
 
@@ -2652,8 +2750,9 @@ pub(crate) fn kv_fit_ctx_in_budget(
     if (0..cfg.n_layer).all(|l| kv_row_elems(cfg, l) == (0, 0)) {
         return None;
     }
-    // A configured `vram` tier is carved off before slots divide what is left.
-    let budget = net_of_vram_tier(ec, budget);
+    // Retained pages that sit in device memory are carved off before slots divide what is left.
+    let budget = net_of_pages(ec, budget);
+    let plan = kv_window(ec);
     // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
     let copies = slot_copies.max(1) as u64;
@@ -2663,11 +2762,11 @@ pub(crate) fn kv_fit_ctx_in_budget(
                 kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt).saturating_mul(copies);
             let reserve = moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, ctx, ubatch));
             kv_device_bytes(ec, kv).saturating_add(reserve) <= budget
-                && kv_spill(ec).is_none_or(|spill| {
+                && (!kv_window_bounds(ec) || {
                     let fmts = (k_fmt, v_fmt);
                     let buffers =
                         kv_window_buffers(cfg, ec, ctx, ring, ubatch, fmts, copies as usize);
-                    kv_placement_fits(&spill, buffers)
+                    kv_placement_fits(&plan, budget.saturating_sub(reserve), buffers)
                 })
         })
     };
@@ -2730,7 +2829,9 @@ pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
 /// is documented as taken verbatim (never clamped), so it is warned about and honored —
 /// [`refuse_unallocatable_kv`] refuses one whose KV cache alone cannot land, and the alloc-time
 /// VRAM guard stays the backstop for the rest. Returns `want_ctx` unchanged on a backend with no
-/// budget to report (`Backend::device_alloc_room` → `None`: CPU, Metal today).
+/// budget to report (`Backend::device_alloc_room` → `None`: CPU, Metal today) — one memory cannot
+/// place a buffer by device or host, so no window cap is enforced there and the open says so once
+/// when the config names any.
 ///
 /// May also LOWER the pinned prefill chunk ([`repin_ubatch_lower`]) when a shorter one serves more
 /// context — the same trade the pre-load sweep makes, retaken with the weight bytes known.
@@ -2744,10 +2845,24 @@ pub(crate) fn reclamp_ctx_to_live_room(
     v_fmt: DType,
     slot_copies: usize,
 ) -> AResult<usize> {
-    // Every cold init passes here, so a malformed `vram` tier is reported even on a path that
+    // Every cold init passes here, so a malformed KV section is reported even on a path that
     // opened without the model-level gate.
-    vram_tier_bytes(ec)?;
+    kv_layout(ec)?;
     let Some(room) = be.device_alloc_room() else {
+        // One memory to allocate from: CPU and Metal have no device/host split, so a
+        // `[[kv.window]]` cannot be placed and nothing here can enforce its caps. Say so where
+        // the session opens (this is the cold init), rather than let a configured window read as
+        // if it bounded anything on a backend that never honours it.
+        if !ec.kv.window.is_empty() {
+            let name = be.name();
+            tracing::warn!(
+                windows = %describe_windows(ec),
+                backend = name,
+                "kv: `[[kv.window]]` caps are enforced on Vulkan only — {name} has one memory and \
+                 cannot place KV by device/host, so this session allocates its cache unbounded by \
+                 the configured windows",
+            );
+        }
         return Ok(want_ctx);
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -2991,18 +3106,17 @@ pub(crate) fn dsv4_comp_allocs(
 
 /// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing
 /// can be proven: no budget to compare against, or a configuration where the guard is not the last
-/// word (`INFR_KV_OVERFLOW` places what does not fit in system RAM; `INFR_NO_VRAM_GUARD` turns the
+/// word (a window plan places what does not fit in system RAM; `INFR_NO_VRAM_GUARD` turns the
 /// guard off).
 ///
-/// A split plan stands down here because this check prices the device alone; whether the window
-/// fits the device plus the `host` tier is [`refuse_host_tier`]'s, which every open path runs
-/// first (`refuse_vram_tier`).
+/// A window plan stands down here because this check prices the device alone; whether the window
+/// fits the plan is [`refuse_window`]'s, which every open path runs first.
 ///
 /// A LOWER bound on what the guard will see, never an over-estimate: a sub-MiB request is skipped
 /// even though its aligned size may reach the guard, and the guard checks `requirements.size`,
 /// which is never below the request.
 fn kv_guarded_bytes(sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConfig) -> Option<u64> {
-    if room.is_none() || kv_spill(ec).is_some() || ec.kernels.vulkan.no_vram_guard {
+    if room.is_none() || kv_window_bounds(ec) || ec.kernels.vulkan.no_vram_guard {
         return None;
     }
     let total = sizes
@@ -3047,8 +3161,8 @@ pub(crate) fn refuse_unallocatable_kv(
         "context {want_ctx} cannot be served on this device: its KV cache alone needs at least \
          {:.2} GiB (requested {k_fmt:?}/{v_fmt:?}), and only {:.2} GiB can be allocated {room_is}.\n  \
          Try a smaller window (--ctx N / INFR_CTX=N{}), a more quantized cache (INFR_KV_TYPE_K / \
-         INFR_KV_TYPE_V), INFR_KV_OVERFLOW=1 to place the cache in system RAM, or a smaller quant \
-         of the model.",
+         INFR_KV_TYPE_V), a `host` `[[kv.window]]` to place the cache in system RAM, or a smaller \
+         quant of the model.",
         gib(need),
         gib(room),
         match fit() {
@@ -7111,26 +7225,45 @@ mod seam_helper_tests {
         );
     }
 
-    fn ec_with_tiers(tiers: Vec<infr_core::config::KvTier>) -> EngineConfig {
+    fn ec_with_windows(windows: Vec<infr_core::config::WindowEntry>) -> EngineConfig {
         let mut ec = EngineConfig::default();
-        ec.kv.tiers = tiers;
+        ec.kv.window = windows;
         ec
     }
 
-    fn vram_tier(bytes: u64) -> infr_core::config::KvTier {
-        infr_core::config::KvTier {
-            backend: Some(infr_core::config::KvBackend::Vram),
+    /// `[kv.pages]` with a size: the retained-pages reserve beside the windows.
+    fn ec_with_pages(bytes: u64) -> EngineConfig {
+        let mut ec = EngineConfig::default();
+        ec.kv.pages = infr_core::config::KvPages {
+            declared: true,
             size: Some(infr_core::SizeSpec::Bytes(bytes)),
-            ..Default::default()
+        };
+        ec
+    }
+
+    fn vram_window(bytes: Option<u64>) -> infr_core::config::WindowEntry {
+        infr_core::config::WindowEntry {
+            backend: Some(infr_core::config::KvBackend::Vram),
+            size: bytes.map(infr_core::SizeSpec::Bytes),
         }
     }
 
-    /// With no `vram` tier the budget is untouched and a tier of `S` bytes prices exactly like `S`
-    /// more bytes of weights, so the window shrinks by `S` and nothing else moves. A storage entry
-    /// that LEADS the list is the slot's backing instead, so it prices like a `host` entry of the
-    /// window that store can hold (the redb default when it states no `size`).
+    /// An engine whose live window is store-backed by a default redb store.
+    fn ec_store_backed() -> EngineConfig {
+        let mut ec = EngineConfig::default();
+        ec.kv.block = vec![infr_core::config::KvBlock {
+            backend: Some(infr_core::config::KvBackend::Redb),
+            ..Default::default()
+        }];
+        ec.kv.store_backed = true;
+        ec
+    }
+
+    /// `[kv.pages]` of `S` bytes prices exactly like `S` more bytes of weights, so the window
+    /// shrinks by `S` and nothing else moves; a block store beside the windows moves nothing at
+    /// all.
     #[test]
-    fn a_vram_tier_shrinks_the_fit_by_its_size_and_nothing_else() {
+    fn a_pages_reserve_shrinks_the_fit_by_its_size_and_nothing_else() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let weights = GEMMA3_12B_WEIGHTS;
@@ -7139,121 +7272,32 @@ mod seam_helper_tests {
                 .expect("has KV")
         };
         let implicit = fit(&EngineConfig::default(), weights);
-        let storage = infr_core::config::KvTier {
+        let mut stored = EngineConfig::default();
+        stored.kv.block = vec![infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redb),
             ..Default::default()
-        };
+        }];
         assert_eq!(
-            fit(&ec_with_tiers(vec![storage.clone()]), weights),
-            fit(
-                &ec_with_tiers(vec![host_tier(infr_core::config::KV_REDB_DEFAULT_BYTES)]),
-                weights
-            ),
-            "a leading storage tier bounds the window like a host tier of its size"
+            fit(&stored, weights),
+            implicit,
+            "a block store prices nothing"
         );
 
         let tier = 2 * 1024 * 1024 * 1024;
-        let sized = ec_with_tiers(vec![vram_tier(tier), storage]);
-        let shrunk = fit(&sized, weights);
+        let shrunk = fit(&ec_with_pages(tier), weights);
         assert!(shrunk < implicit, "{shrunk} vs {implicit}");
         assert_eq!(
             shrunk,
             fit(&EngineConfig::default(), weights + tier),
-            "the tier is priced as bytes off the budget"
+            "the reserve is priced as bytes off the budget"
         );
     }
 
-    const F16: (DType, DType) = (DType::F16, DType::F16);
-    const Q8: (DType, DType) = (DType::Q8_0, DType::Q8_0);
-
-    /// A tier that takes the minimum window away is refused naming its size, the window's bytes and
-    /// what is left; a device that could not hold a window anyway, and a list with no vram tier,
-    /// are not blamed on the tier.
+    /// A sized `vram` window caps the device bytes the fit counts, and with no `host` window the
+    /// window is that size; an unsized one fills whatever the device leaves, so it fits exactly
+    /// what no window does and prices the whole cache in the device.
     #[test]
-    fn an_oversized_vram_tier_is_refused_with_its_figures() {
-        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
-        let cfg = gemma3_12b();
-        let refuse = |ec: &EngineConfig, weights: u64, want: Option<usize>| {
-            super::refuse_vram_tier(&cfg, ec, weights, &xtx(XTX_FREE), &[F16], want, 1)
-        };
-        let weights = GEMMA3_12B_WEIGHTS;
-        assert!(refuse(&EngineConfig::default(), weights, None).is_ok());
-        assert!(refuse(&ec_with_tiers(vec![vram_tier(1 << 30)]), weights, None).is_ok());
-
-        let tier = XTX_ROOM - weights;
-        let err = refuse(&ec_with_tiers(vec![vram_tier(tier)]), weights, None)
-            .expect_err("a tier that takes the whole budget leaves no window")
-            .to_string();
-        let window = super::kv_bytes_estimate_fmt(
-            &cfg,
-            super::MIN_SESSION_CTX,
-            super::placement_ring(&cfg, &EngineConfig::default(), F16.0, F16.1),
-            super::ubatch_rows(&EngineConfig::default()),
-            F16.0,
-            F16.1,
-        );
-        assert!(err.contains("kv.tiers[0] (vram)"), "{err}");
-        assert!(err.contains(&format!("reserves {tier} bytes")), "{err}");
-        assert!(err.contains(&format!("({window} bytes")), "{err}");
-        assert!(
-            err.contains("leaves 0 bytes")
-                && err.contains(&format!("({XTX_ROOM} bytes available)")),
-            "the left-over figure is net of the tier: {err}"
-        );
-
-        let no_room = XTX_ROOM - 64 * 1024 * 1024;
-        assert!(refuse(&ec_with_tiers(vec![vram_tier(1 << 30)]), no_room, None).is_ok());
-
-        let mut overflow = ec_with_tiers(vec![vram_tier(tier)]);
-        overflow.kv.overflow = true;
-        assert!(
-            refuse(&overflow, weights, None).is_ok(),
-            "host overflow serves the window the tier-net device room cannot"
-        );
-    }
-
-    /// A malformed tier is an error on the open path, never a tier that quietly is not there.
-    #[test]
-    fn a_malformed_vram_tier_is_refused_at_open() {
-        let cfg = gemma3_12b();
-        for bad in [
-            vec![vram_tier(0)],
-            vec![infr_core::config::KvTier {
-                backend: Some(infr_core::config::KvBackend::Vram),
-                ..Default::default()
-            }],
-            vec![infr_core::config::KvTier::default()],
-        ] {
-            let ec = ec_with_tiers(bad);
-            let err = super::refuse_vram_tier(
-                &cfg,
-                &ec,
-                GEMMA3_12B_WEIGHTS,
-                &xtx(XTX_FREE),
-                &[F16],
-                None,
-                1,
-            )
-            .expect_err("malformed")
-            .to_string();
-            assert!(err.contains("kv.tiers[0]"), "{err}");
-            assert!(super::vram_tier_bytes(&ec).is_err());
-        }
-    }
-
-    fn host_tier(bytes: u64) -> infr_core::config::KvTier {
-        infr_core::config::KvTier {
-            backend: Some(infr_core::config::KvBackend::Host),
-            size: Some(infr_core::SizeSpec::Bytes(bytes)),
-            ..Default::default()
-        }
-    }
-
-    /// A `host` tier says the live rows are not in VRAM, so the fit stops pricing them there: the
-    /// window grows past the device-only one and is bound by the tier's size instead, while the
-    /// activation reserve still counts.
-    #[test]
-    fn a_host_tier_takes_the_kv_bytes_out_of_the_device_fit() {
+    fn a_vram_window_shrinks_the_fit_by_its_size() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let fit = |ec: &EngineConfig| {
@@ -7268,32 +7312,40 @@ mod seam_helper_tests {
             .expect("has KV")
         };
         let implicit = fit(&EngineConfig::default());
-        let roomy = ec_with_tiers(vec![host_tier(1 << 40)]);
-        assert_eq!(super::kv_device_bytes(&roomy, 7 << 30), 0);
-        assert!(fit(&roomy) > implicit, "{} vs {implicit}", fit(&roomy));
-
-        let host_fit = |bytes: u64| fit(&ec_with_tiers(vec![host_tier(bytes)]));
-        let small = host_fit(1 << 30);
-        assert!(
-            0 < small && small < host_fit(4 << 30),
-            "the tier bounds the fit"
-        );
-        assert!(host_fit(1 << 20) < super::MIN_SESSION_CTX);
-
-        let split = ec_with_tiers(vec![vram_tier(1 << 30), host_tier(4 << 30)]);
-        assert_eq!(super::kv_device_bytes(&split, 7 << 30), 1 << 30);
+        let unsized_vram = ec_with_windows(vec![vram_window(None)]);
         assert_eq!(
-            super::vram_tier_reserve(&split),
-            0,
-            "vram is the device part here"
+            fit(&unsized_vram),
+            implicit,
+            "unsized fills, it is not zero"
+        );
+        assert_eq!(super::kv_device_bytes(&unsized_vram, 7 << 30), 7 << 30);
+
+        let size = 2u64 << 30;
+        let sized = ec_with_windows(vec![vram_window(Some(size))]);
+        assert_eq!(super::kv_device_bytes(&sized, 7 << 30), size);
+        assert_eq!(super::kv_device_bytes(&sized, 1 << 20), 1 << 20);
+        let ctx = fit(&sized);
+        assert!(0 < ctx && ctx < implicit, "{ctx} vs {implicit}");
+        let f16 = (DType::F16, DType::F16);
+        let plan = super::kv_window(&sized);
+        let places = |ctx: usize| {
+            let ring = super::placement_ring(&cfg, &sized, f16.0, f16.1);
+            super::ubatch_candidates(&sized).into_iter().any(|ub| {
+                let buffers = super::kv_window_buffers(&cfg, &sized, ctx, ring, ub, f16, 1);
+                super::kv_placement_fits(&plan, u64::MAX, buffers)
+            })
+        };
+        assert!(places(ctx), "{ctx} tokens must place in {size} bytes");
+        assert!(
+            !places(ctx + 4096),
+            "the window is the size the vram window states"
         );
     }
 
-    /// The legacy overflow keys keep their sizing: the fit still prices the whole cache in VRAM and
-    /// the spill stays the clamp ladder's last rung, while the spill itself resolves to the same
-    /// device part as the tier list that spells it.
+    /// A store-backed window has no device part and holds what its store holds, so the fit prices
+    /// it like a `host` window of that size (the redb default when the store states no `size`).
     #[test]
-    fn the_legacy_overflow_keys_size_as_they_always_did() {
+    fn a_store_backed_window_bounds_the_fit_like_a_host_window() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let fit = |ec: &EngineConfig| {
@@ -7307,29 +7359,202 @@ mod seam_helper_tests {
             )
             .expect("has KV")
         };
-        let mut legacy = EngineConfig::default();
-        legacy.kv.overflow = true;
-        legacy.kv.overflow_vram_mb = Some(512);
-        assert_eq!(fit(&legacy), fit(&EngineConfig::default()));
-        assert_eq!(super::kv_device_bytes(&legacy, 7 << 30), 7 << 30);
-        assert!(super::kv_spill_rescues(&legacy));
-
-        let listed = ec_with_tiers(vec![vram_tier(512 << 20), host_tier(1 << 40)]);
-        assert!(!super::kv_spill_rescues(&listed));
-        let device_part = |ec: &EngineConfig| super::kv_spill(ec).map(|s| s.device_cap);
-        assert_eq!(device_part(&legacy), Some(Some(512 << 20)));
-        assert_eq!(device_part(&legacy), device_part(&listed));
+        assert_eq!(
+            fit(&ec_store_backed()),
+            fit(&ec_with_windows(vec![host_window(
+                infr_core::config::KV_REDB_DEFAULT_BYTES
+            )])),
+        );
     }
 
-    /// A `host` tier too small for the window is refused at open naming the entry and its sizes;
-    /// a roomy one, the device part before it, and the legacy flag (no host size to refuse
-    /// against) are not.
+    const F16: (DType, DType) = (DType::F16, DType::F16);
+    const Q8: (DType, DType) = (DType::Q8_0, DType::Q8_0);
+
+    /// A pages reserve that takes the minimum window away is refused naming its size, the window's
+    /// bytes and what is left; a device that could not hold a window anyway, and a config with no
+    /// reserve, are not blamed on it.
     #[test]
-    fn a_host_tier_that_cannot_hold_a_window_is_refused() {
+    fn an_oversized_pages_reserve_is_refused_with_its_figures() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let refuse = |ec: &EngineConfig, weights: u64, want: Option<usize>| {
+            super::refuse_window(&cfg, ec, weights, &xtx(XTX_FREE), &[F16], want, 1)
+        };
+        let weights = GEMMA3_12B_WEIGHTS;
+        assert!(refuse(&EngineConfig::default(), weights, None).is_ok());
+        assert!(refuse(&ec_with_pages(1 << 30), weights, None).is_ok());
+
+        let tier = XTX_ROOM - weights;
+        let err = refuse(&ec_with_pages(tier), weights, None)
+            .expect_err("a reserve that takes the whole budget leaves no window")
+            .to_string();
+        let window = super::kv_bytes_estimate_fmt(
+            &cfg,
+            super::MIN_SESSION_CTX,
+            super::placement_ring(&cfg, &EngineConfig::default(), F16.0, F16.1),
+            super::ubatch_rows(&EngineConfig::default()),
+            F16.0,
+            F16.1,
+        );
+        assert!(err.contains("[kv.pages]"), "{err}");
+        assert!(err.contains(&format!("reserves {tier} bytes")), "{err}");
+        assert!(err.contains(&format!("({window} bytes")), "{err}");
+        assert!(
+            err.contains("leaves 0 bytes")
+                && err.contains(&format!("({XTX_ROOM} bytes available)")),
+            "the left-over figure is net of the reserve: {err}"
+        );
+
+        let no_room = XTX_ROOM - 64 * 1024 * 1024;
+        assert!(refuse(&ec_with_pages(1 << 30), no_room, None).is_ok());
+
+        let mut hosted = ec_with_pages(tier);
+        hosted.kv.window = vec![host_window(1 << 40)];
+        assert!(
+            refuse(&hosted, weights, None).is_ok(),
+            "a host window takes the retained pages with it, so the device room is untouched"
+        );
+    }
+
+    /// A malformed section is an error on the open path, never a window that quietly is not there.
+    #[test]
+    fn a_malformed_window_section_is_refused_at_open() {
+        let cfg = gemma3_12b();
+        let mut zero_pages = EngineConfig::default();
+        zero_pages.kv.pages = infr_core::config::KvPages {
+            declared: true,
+            size: Some(infr_core::SizeSpec::Bytes(0)),
+        };
+        let cases = [
+            (ec_with_windows(vec![vram_window(Some(0))]), "kv.window[0]"),
+            (
+                ec_with_windows(vec![infr_core::config::WindowEntry::default()]),
+                "kv.window[0]",
+            ),
+            (ec_with_windows(vec![host_window(0)]), "kv.window[0]"),
+            (zero_pages, "kv.pages"),
+        ];
+        for (ec, section) in cases {
+            let err = super::refuse_window(
+                &cfg,
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                &[F16],
+                None,
+                1,
+            )
+            .expect_err("malformed")
+            .to_string();
+            assert!(err.contains(section), "{err}");
+            assert!(super::device_pages_bytes(&ec).is_err());
+        }
+    }
+
+    fn host_window(bytes: u64) -> infr_core::config::WindowEntry {
+        infr_core::config::WindowEntry {
+            backend: Some(infr_core::config::KvBackend::Host),
+            size: Some(infr_core::SizeSpec::Bytes(bytes)),
+        }
+    }
+
+    /// A `host` window says the live rows are not in VRAM, so the fit stops pricing them there:
+    /// the window grows past the device-only one and is bound by the window's size instead, while
+    /// the activation reserve still counts.
+    #[test]
+    fn a_host_window_takes_the_kv_bytes_out_of_the_device_fit() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let fit = |ec: &EngineConfig| {
+            super::kv_fit_ctx_for(
+                &cfg,
+                ec,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                DType::F16,
+                DType::F16,
+            )
+            .expect("has KV")
+        };
+        let implicit = fit(&EngineConfig::default());
+        let roomy = ec_with_windows(vec![host_window(1 << 40)]);
+        assert_eq!(super::kv_device_bytes(&roomy, 7 << 30), 0);
+        assert!(fit(&roomy) > implicit, "{} vs {implicit}", fit(&roomy));
+
+        let host_fit = |bytes: u64| fit(&ec_with_windows(vec![host_window(bytes)]));
+        let small = host_fit(1 << 30);
+        assert!(
+            0 < small && small < host_fit(4 << 30),
+            "the window bounds the fit"
+        );
+        assert!(host_fit(1 << 20) < super::MIN_SESSION_CTX);
+
+        let split = ec_with_windows(vec![vram_window(Some(1 << 30)), host_window(4 << 30)]);
+        assert_eq!(super::kv_device_bytes(&split, 7 << 30), 1 << 30);
+        assert_eq!(
+            super::device_pages_bytes(&split).unwrap(),
+            0,
+            "vram is the device part here"
+        );
+    }
+
+    /// With a sized `vram` window and a `host` window the device part is priced at its size and the
+    /// remainder lands in host memory, so the fit grows past the vram-only window by what the host
+    /// window holds. An unsized `vram` window is the room the fit leaves, so the same host window
+    /// extends it the same way instead of being left to catch a refused buffer.
+    #[test]
+    fn host_spill_prices_the_remainder_past_the_device_part() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let fit = |ec: &EngineConfig| {
+            super::kv_fit_ctx_for(
+                &cfg,
+                ec,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                DType::F16,
+                DType::F16,
+            )
+            .expect("has KV")
+        };
+        let vram_only = fit(&ec_with_windows(vec![vram_window(Some(1 << 30))]));
+        let split = |host: u64| {
+            fit(&ec_with_windows(vec![
+                vram_window(Some(1 << 30)),
+                host_window(host),
+            ]))
+        };
+        assert!(
+            vram_only < split(1 << 30),
+            "{vram_only} vs {}",
+            split(1 << 30)
+        );
+        assert!(
+            split(1 << 30) < split(4 << 30),
+            "the host window bounds the rest"
+        );
+
+        let unsized_split = ec_with_windows(vec![vram_window(None), host_window(1 << 40)]);
+        assert_eq!(
+            super::kv_device_bytes(&unsized_split, 7 << 30),
+            0,
+            "an unsized device part under a host window is the room the fit leaves"
+        );
+        assert!(
+            fit(&unsized_split) > fit(&ec_with_windows(vec![vram_window(None)])),
+            "and the host window extends the fit past the device alone"
+        );
+    }
+
+    /// A window plan too small for the window is refused at open naming the section and its
+    /// sizes; a roomy one, a device part that is not sized, and a sized `vram` window the window
+    /// fits in are not.
+    #[test]
+    fn a_window_plan_that_cannot_hold_a_window_is_refused() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let refuse = |ec: &EngineConfig, want: Option<usize>| {
-            super::refuse_vram_tier(
+            super::refuse_window(
                 &cfg,
                 ec,
                 GEMMA3_12B_WEIGHTS,
@@ -7339,51 +7564,60 @@ mod seam_helper_tests {
                 1,
             )
         };
-        assert!(refuse(&ec_with_tiers(vec![host_tier(1 << 40)]), None).is_ok());
+        assert!(refuse(&ec_with_windows(vec![host_window(1 << 40)]), None).is_ok());
 
-        let err = refuse(&ec_with_tiers(vec![host_tier(1 << 20)]), None)
+        let err = refuse(&ec_with_windows(vec![host_window(1 << 20)]), None)
             .expect_err("a megabyte holds no window")
             .to_string();
-        assert!(err.contains("kv.tiers[0] (host)"), "{err}");
-        assert!(err.contains("holds 1048576 bytes"), "{err}");
+        assert!(err.contains("[[kv.window]]"), "{err}");
+        assert!(err.contains("1048576 bytes of host window"), "{err}");
         assert!(
             err.contains(&format!("{}-token window", super::MIN_SESSION_CTX)),
             "{err}"
         );
 
-        let split = ec_with_tiers(vec![vram_tier(1 << 20), host_tier(1 << 20)]);
+        let split = ec_with_windows(vec![vram_window(Some(1 << 20)), host_window(1 << 20)]);
         let err = refuse(&split, Some(4096))
             .expect_err("too small")
             .to_string();
         assert!(
-            err.contains("kv.tiers[1] (host)") && err.contains("2097152 with the device"),
+            err.contains("1048576 bytes of vram window and 1048576 bytes of host window"),
             "{err}"
         );
         assert!(refuse(
-            &ec_with_tiers(vec![vram_tier(1 << 40), host_tier(1 << 20)]),
+            &ec_with_windows(vec![vram_window(Some(1 << 40)), host_window(1 << 20)]),
             None
         )
         .is_ok());
+        assert!(
+            refuse(
+                &ec_with_windows(vec![vram_window(None), host_window(1 << 20)]),
+                None
+            )
+            .is_ok(),
+            "an unsized vram window leaves the device part to the fit"
+        );
+
+        // A vram window alone has no host to spill into, so it holds only its own size.
+        let alone = ec_with_windows(vec![vram_window(Some(1 << 20))]);
+        let err = refuse(&alone, None).expect_err("too small").to_string();
+        assert!(err.contains("0 bytes of host window"), "{err}");
+        assert!(refuse(&ec_with_windows(vec![vram_window(Some(1 << 40))]), None).is_ok());
 
         // An explicit window far past device + host is refused by name, before any weight loads.
-        let both = ec_with_tiers(vec![vram_tier(1 << 30), host_tier(1 << 30)]);
+        let both = ec_with_windows(vec![vram_window(Some(1 << 30)), host_window(1 << 30)]);
         let err = refuse(&both, Some(1 << 24))
-            .expect_err("a window past both tiers")
+            .expect_err("a window past both parts")
             .to_string();
-        assert!(err.contains("kv.tiers[1] (host)"), "{err}");
-
-        let mut legacy = EngineConfig::default();
-        legacy.kv.overflow = true;
-        legacy.kv.overflow_vram_mb = Some(0);
-        assert!(refuse(&legacy, None).is_ok());
+        assert!(err.contains("[[kv.window]]"), "{err}");
     }
 
-    /// A `host` tier bounds the page pool at its size, with or without a `kv.pool_mb`; a bigger one
-    /// leaves the windows' own cap, and a malformed list is an error here too.
+    /// A `host` window bounds the page pool at its size; a bigger one leaves the windows' own cap,
+    /// `[kv.pages]` adds on top, and a malformed section is an error here too.
     #[test]
-    fn a_host_tier_bounds_the_pool_and_the_vram_guard_stands_down() {
+    fn a_host_window_bounds_the_pool_and_the_vram_guard_stands_down() {
         let window = 12 << 20;
-        let host = ec_with_tiers(vec![host_tier(5 << 20)]);
+        let host = ec_with_windows(vec![host_window(5 << 20)]);
         assert_eq!(
             super::kv_pool_cap_bytes(&host, window, 0).unwrap(),
             Some(5 << 20)
@@ -7391,49 +7625,78 @@ mod seam_helper_tests {
         assert_eq!(
             super::kv_pool_cap_bytes(&host, window, 1 << 20).unwrap(),
             Some(4 << 20),
-            "what the slots allocate beside the pool comes off the tier"
+            "what the slots allocate beside the pool comes off the window"
         );
-        let roomy = ec_with_tiers(vec![host_tier(64 << 20)]);
+        let roomy = ec_with_windows(vec![host_window(64 << 20)]);
         assert_eq!(
             super::kv_pool_cap_bytes(&roomy, window, 0).unwrap(),
             Some(window)
         );
         let mut pooled = roomy.clone();
-        pooled.kv.pool_mb = Some(8);
+        pooled.kv.pages = infr_core::config::KvPages {
+            declared: true,
+            size: Some(infr_core::SizeSpec::Bytes(8 << 20)),
+        };
         assert_eq!(
             super::kv_pool_cap_bytes(&pooled, window, 0).unwrap(),
-            Some(8 << 20)
+            Some(window + (8 << 20)),
+            "the retained pages ride above the windows"
         );
-        assert!(super::kv_pool_cap_bytes(&ec_with_tiers(vec![host_tier(0)]), window, 0).is_err());
+        assert!(
+            super::kv_pool_cap_bytes(&ec_with_windows(vec![host_window(0)]), window, 0).is_err()
+        );
 
         let sizes = [(1usize << 30, 1usize << 30)];
         assert!(super::kv_guarded_bytes(&sizes, Some(1 << 40), &EngineConfig::default()).is_some());
         assert_eq!(super::kv_guarded_bytes(&sizes, Some(1 << 40), &host), None);
+        assert_eq!(
+            super::kv_guarded_bytes(
+                &sizes,
+                Some(1 << 40),
+                &ec_with_windows(vec![vram_window(None)])
+            ),
+            super::kv_guarded_bytes(&sizes, Some(1 << 40), &EngineConfig::default()),
+            "an unsized vram window is the default placement"
+        );
     }
 
     /// Buffers land whole: one that misses the device part's remainder goes entirely to host, so
-    /// two 4 MiB buffers do not fit a 6 MiB device part and a 2 MiB host tier though 8 MiB is 8 MiB.
+    /// two 4 MiB buffers do not fit a 6 MiB device part and a 2 MiB host window though 8 MiB is
+    /// 8 MiB.
     #[test]
     fn a_buffer_that_misses_the_device_remainder_goes_whole_to_host() {
-        let plan = |device: u64, host: u64| infr_core::config::KvSpill {
+        let plan = |device: u64, host: u64| infr_core::config::WindowPlan {
             device_cap: Some(device << 20),
             host_cap: Some(host << 20),
         };
         let mib = |sizes: &[u64]| sizes.iter().map(|s| s << 20).collect::<Vec<_>>();
-        assert!(!super::kv_placement_fits(&plan(6, 2), mib(&[4, 4])));
-        assert!(super::kv_placement_fits(&plan(6, 4), mib(&[4, 4])));
-        assert!(super::kv_placement_fits(&plan(6, 2), mib(&[4, 2, 2])));
-        assert!(!super::kv_placement_fits(&plan(6, 2), mib(&[2, 4, 4])));
-        assert!(super::kv_placement_fits(&plan(0, 8), mib(&[4, 4])));
-        let open = infr_core::config::KvSpill {
-            device_cap: Some(0),
+        let fits = |plan: &infr_core::config::WindowPlan, sizes: &[u64]| {
+            super::kv_placement_fits(plan, u64::MAX, mib(sizes))
+        };
+        assert!(!fits(&plan(6, 2), &[4, 4]));
+        assert!(fits(&plan(6, 4), &[4, 4]));
+        assert!(fits(&plan(6, 2), &[4, 2, 2]));
+        assert!(!fits(&plan(6, 2), &[2, 4, 4]));
+        assert!(fits(&plan(0, 8), &[4, 4]));
+        // No host window: nothing can move there.
+        let device_only = infr_core::config::WindowPlan {
+            device_cap: Some(6 << 20),
             host_cap: None,
         };
-        assert!(super::kv_placement_fits(&open, mib(&[1 << 20])));
+        assert!(fits(&device_only, &[4, 2]));
+        assert!(!fits(&device_only, &[4, 4]));
+        // An unsized device part holds what the device has left, and the host window the rest.
+        let fill = infr_core::config::WindowPlan {
+            device_cap: None,
+            host_cap: Some(2 << 20),
+        };
+        assert!(super::kv_placement_fits(&fill, 6 << 20, mib(&[4, 2, 2])));
+        assert!(!super::kv_placement_fits(&fill, 6 << 20, mib(&[4, 4])));
+        assert!(super::kv_placement_fits(&fill, 8 << 20, mib(&[4, 4])));
     }
 
     /// The fit advertises a window only when the allocator can place its buffers: whatever the
-    /// device part and host tier, the buffers at the fitted context place under the plan.
+    /// device part and host window, the buffers at the fitted context place under the plan.
     #[test]
     fn the_fit_only_advertises_windows_that_place() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
@@ -7445,20 +7708,20 @@ mod seam_helper_tests {
             (3 << 29, 5 << 28),
             (1 << 28, 3 << 30),
         ] {
-            let tiers = match device {
-                0 => vec![host_tier(host)],
-                d => vec![vram_tier(d), host_tier(host)],
+            let windows = match device {
+                0 => vec![host_window(host)],
+                d => vec![vram_window(Some(d)), host_window(host)],
             };
-            let ec = ec_with_tiers(tiers);
+            let ec = ec_with_windows(windows);
             let ctx =
                 super::kv_fit_ctx_for(&cfg, &ec, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), f16.0, f16.1)
                     .expect("has KV");
             assert!(ctx > 0, "{device} + {host}");
-            let spill = super::kv_spill(&ec).expect("a host tier plans a spill");
+            let plan = super::kv_window(&ec);
             let ring = super::placement_ring(&cfg, &ec, f16.0, f16.1);
             let places = super::ubatch_candidates(&ec).into_iter().any(|ub| {
                 let buffers = super::kv_window_buffers(&cfg, &ec, ctx, ring, ub, f16, 1);
-                super::kv_placement_fits(&spill, buffers)
+                super::kv_placement_fits(&plan, u64::MAX, buffers)
             });
             assert!(places, "{ctx} tokens do not place in {device} + {host}");
         }
@@ -7536,7 +7799,7 @@ mod seam_helper_tests {
     }
 
     /// A paged session whose pool could not be built allocates linear caches, so its re-clamp has
-    /// to price those: with a `host` tier and several slots the paged window is larger than any
+    /// to price those: with a `host` window and several slots the paged window is larger than any
     /// the linear caches place, and the linear one always places.
     #[test]
     fn the_pool_failure_fallback_clamps_to_a_window_that_places_linearly() {
@@ -7545,10 +7808,10 @@ mod seam_helper_tests {
         let f16 = (DType::F16, DType::F16);
         let (want, slots) = (32768, 4);
         let room = RoomOnly(Some(1 << 40));
-        let mut paged = ec_with_tiers(vec![host_tier(2 << 30)]);
+        let mut paged = ec_with_windows(vec![host_window(2 << 30)]);
         paged.kv.paged = Some(true);
         let linear = super::linear_kv_config(&paged);
-        let spill = super::kv_spill(&linear).expect("a host tier plans a spill");
+        let plan = super::kv_window(&linear);
         let clamp = |ec: &EngineConfig| {
             super::reclamp_ctx_to_live_room(&room, &cfg, ec, want, f16.0, f16.1, slots)
                 .expect("reclamp")
@@ -7557,7 +7820,7 @@ mod seam_helper_tests {
             let ring = super::placement_ring(&cfg, &linear, f16.0, f16.1);
             let ub = super::ubatch_rows(&linear);
             let buffers = super::kv_window_buffers(&cfg, &linear, ctx, ring, ub, f16, slots);
-            super::kv_placement_fits(&spill, buffers)
+            super::kv_placement_fits(&plan, u64::MAX, buffers)
         };
         let (paged_ctx, linear_ctx) = (clamp(&paged), clamp(&linear));
         assert!(
@@ -7573,8 +7836,8 @@ mod seam_helper_tests {
             "{paged_ctx} places linearly: nothing to fix"
         );
 
-        // A tier that holds no linear window is an error the open can report, not a window.
-        let mut tiny = ec_with_tiers(vec![host_tier(1 << 20)]);
+        // A window that holds no linear window is an error the open can report, not a window.
+        let mut tiny = ec_with_windows(vec![host_window(1 << 20)]);
         tiny.kv.paged = Some(true);
         let err = super::reclamp_ctx_to_live_room(
             &room,
@@ -7589,17 +7852,17 @@ mod seam_helper_tests {
         assert!(err.to_string().contains("does not fit"), "{err}");
     }
 
-    /// A host tier sized to an exact number of pool pages has to leave room for what each slot
+    /// A host window sized to an exact number of pool pages has to leave room for what each slot
     /// allocates beside the pool (its page table and private layers): the pool's cap already
-    /// places, where a cap that ignored them overruns the tier.
+    /// places, where a cap that ignored them overruns the window.
     #[test]
     fn the_pool_cap_leaves_headroom_for_the_slots_own_buffers() {
         let cfg = gemma3_12b();
         let f16 = (DType::F16, DType::F16);
         let (ctx, ring, ubatch, slots) = (2048, true, 256, 2);
         let page_bytes = super::kv_page_bytes(&cfg, f16.0, f16.1);
-        let ec = ec_with_tiers(vec![host_tier(40 * page_bytes)]);
-        let spill = super::kv_spill(&ec).expect("a host tier plans a spill");
+        let ec = ec_with_windows(vec![host_window(40 * page_bytes)]);
+        let plan = super::kv_window(&ec);
         let slot_bytes = super::kv_paged_slot_bytes(&cfg, ctx, ring, ubatch, f16, slots);
         assert!(slot_bytes > 0, "the slots allocate beside the pool");
 
@@ -7609,8 +7872,9 @@ mod seam_helper_tests {
                 .unwrap();
             super::pool_pages_for_cap(cap, page_bytes).unwrap()
         };
-        let placing =
-            |pages| super::kv_pool_pages_placing(&cfg, &ec, ctx, ring, ubatch, f16, slots, pages);
+        let placing = |pages| {
+            super::kv_pool_pages_placing(&cfg, &ec, ctx, ring, ubatch, f16, slots, u64::MAX, pages)
+        };
         let with_room = pages_for(slot_bytes);
         assert!(with_room < 40);
         assert_eq!(
@@ -7625,11 +7889,15 @@ mod seam_helper_tests {
                 .chain(slot.repeat(slots))
                 .collect::<Vec<_>>()
         };
-        assert!(super::kv_placement_fits(&spill, session(with_room)));
+        assert!(super::kv_placement_fits(
+            &plan,
+            u64::MAX,
+            session(with_room)
+        ));
         let without = pages_for(0);
         assert_eq!(without, 40);
         assert!(
-            !super::kv_placement_fits(&spill, session(without)),
+            !super::kv_placement_fits(&plan, u64::MAX, session(without)),
             "no headroom overruns"
         );
         assert!(
@@ -7638,10 +7906,25 @@ mod seam_helper_tests {
         );
     }
 
-    /// The best format the session could pick is what gets priced: a tier an auto-q8 cache still
-    /// serves is not refused, and one it does not serve is.
+    /// A pool that placed fewer pages than the window asked for maps less than the window, and
+    /// the session has to advertise that: page 0 is the empty sequence's zero page, and every
+    /// page past it is one a slot can map.
     #[test]
-    fn the_auto_q8_rung_is_priced_before_the_tier_is_blamed() {
+    fn a_pool_serves_one_slot_what_its_placed_pages_hold() {
+        use infr_vulkan::paged::PAGE_ROWS;
+        assert_eq!(super::pool_slot_ctx(1 + 8), 8 * PAGE_ROWS);
+        assert_eq!(super::pool_slot_ctx(2), PAGE_ROWS);
+        assert_eq!(
+            super::pool_slot_ctx(1),
+            0,
+            "the zero page alone maps no window"
+        );
+    }
+
+    /// The best format the session could pick is what gets priced: a reserve an auto-q8 cache
+    /// still serves is not refused, and one it does not serve is.
+    #[test]
+    fn the_auto_q8_rung_is_priced_before_the_reserve_is_blamed() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let weights = GEMMA3_12B_WEIGHTS;
@@ -7651,7 +7934,7 @@ mod seam_helper_tests {
         let fit = |tier: u64, fmt: (DType, DType)| {
             super::kv_fit_ctx_in_budget(
                 &cfg,
-                &ec_with_tiers(vec![vram_tier(tier)]),
+                &ec_with_pages(tier),
                 budget,
                 moe,
                 &cands,
@@ -7671,119 +7954,132 @@ mod seam_helper_tests {
             fit(tier, Q8) >= super::MIN_SESSION_CTX,
             "premise: q8 still serves what f16 no longer does"
         );
-        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let ec = ec_with_pages(tier);
         let refuse = |fmts: &[(DType, DType)]| {
-            super::refuse_vram_tier(&cfg, &ec, weights, &vram, fmts, None, 1)
+            super::refuse_window(&cfg, &ec, weights, &vram, fmts, None, 1)
         };
         assert!(refuse(&[F16]).is_err(), "f16 alone is starved by the tier");
         assert!(refuse(&[F16, Q8]).is_ok(), "the q8 rung serves the window");
     }
 
     /// An explicit `--ctx` is compared against that window, not the minimum: refused only when
-    /// the tier alone is what pulls the fit under it.
+    /// the reserve alone is what pulls the fit under it.
     #[test]
-    fn an_explicit_ctx_is_priced_against_the_tier() {
+    fn an_explicit_ctx_is_priced_against_the_pages_reserve() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let weights = GEMMA3_12B_WEIGHTS;
         let vram = xtx(XTX_FREE);
         let tier = 2u64 << 30;
-        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let ec = ec_with_pages(tier);
         let fit = |ec: &EngineConfig| {
             super::kv_fit_ctx_for(&cfg, ec, weights, &vram, F16.0, F16.1).expect("has KV")
         };
         let (without, with) = (fit(&EngineConfig::default()), fit(&ec));
-        assert!(with < without, "premise: the tier shrinks the fit");
+        assert!(with < without, "premise: the reserve shrinks the fit");
         let refuse =
-            |want: usize| super::refuse_vram_tier(&cfg, &ec, weights, &vram, &[F16], Some(want), 1);
-        assert!(refuse(with).is_ok(), "a window the tier leaves is fine");
-        let err = refuse(with + 1).expect_err("one token past what the tier leaves");
-        assert!(err.to_string().contains("kv.tiers[0] (vram)"), "{err}");
+            |want: usize| super::refuse_window(&cfg, &ec, weights, &vram, &[F16], Some(want), 1);
+        assert!(refuse(with).is_ok(), "a window the reserve leaves is fine");
+        let err = refuse(with + 1).expect_err("one token past what the reserve leaves");
+        assert!(err.to_string().contains("[kv.pages]"), "{err}");
         assert!(refuse(without).is_err());
         assert!(
             refuse(without + 1).is_ok(),
-            "a window that fails without the tier too is the ordinary refuse rung's"
+            "a window that fails without the reserve too is the ordinary refuse rung's"
         );
     }
 
-    /// The pool cap is the windows' bytes plus the tier: `kv.pool_mb` replaces the default windows
-    /// figure, a tier adds to either, and no tier leaves today's rule alone.
+    /// The pool cap is the windows' bytes plus the retained pages: an absent plan and no reserve
+    /// leave today's rule alone, `[kv.pages]` adds on top of the windows and never replaces them,
+    /// and a sized `vram` window caps the windows' share.
     #[test]
-    fn the_pool_cap_adds_the_vram_tier_beside_the_windows() {
+    fn the_pool_cap_adds_the_pages_reserve_beside_the_windows() {
         let windows = 100 << 20;
         let mut ec = EngineConfig::default();
         assert_eq!(super::kv_pool_cap_bytes(&ec, windows, 0).unwrap(), None);
-        ec.kv.pool_mb = Some(64);
+        let pages = 5 << 20;
+        ec = ec_with_pages(pages);
         assert_eq!(
             super::kv_pool_cap_bytes(&ec, windows, 0).unwrap(),
-            Some(64 << 20)
+            Some(windows + pages),
+            "the reserve is on top of the windows, never in place of them"
         );
-        ec.kv.tiers = vec![vram_tier(5 << 20)];
+        ec.kv.window = vec![vram_window(Some(64 << 20))];
         assert_eq!(
             super::kv_pool_cap_bytes(&ec, windows, 0).unwrap(),
-            Some((64 << 20) + (5 << 20)),
-            "the tier is on top of pool_mb"
+            Some((64 << 20) + pages),
+            "a sized vram window holds the windows' share to its size"
         );
-        ec.kv.pool_mb = None;
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, windows, 4 << 20).unwrap(),
+            Some((60 << 20) + pages),
+            "the slots' own buffers come off the window plan first"
+        );
+        ec.kv.window = vec![vram_window(None)];
         assert_eq!(
             super::kv_pool_cap_bytes(&ec, windows, 0).unwrap(),
-            Some(windows + (5 << 20)),
-            "…and on top of the default windows, never in place of them"
+            Some(windows + pages),
+            "an unsized vram window fills the device, it does not cap at zero"
         );
-        ec.kv.tiers = vec![vram_tier(0)];
+        ec.kv.pages.size = Some(infr_core::SizeSpec::Bytes(0));
         assert!(super::kv_pool_cap_bytes(&ec, windows, 0).is_err());
     }
 
-    /// With no `vram` entry nothing is reserved: the pool cap is `kv.pool_mb` or unset, there is no
-    /// retention cap, and the device room is untouched. A storage entry that LEADS the list is the
-    /// slot's backing, so it states a host cap and the pool's cap becomes the store's bound rather
-    /// than "unset" — the windows' bytes when the store is larger than they are.
+    /// With no `[kv.pages]` nothing is reserved: no pool cap, no retention cap, and the device room
+    /// is untouched, also beside a block store. A store-backed window states a host cap, so the
+    /// pool's cap becomes the store's bound rather than "unset" — the windows' bytes when the
+    /// store is larger than they are.
     #[test]
-    fn the_implicit_tier_changes_no_allocation() {
-        let mut ec = EngineConfig::default();
-        assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
-        assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
-        assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
+    fn no_pages_reserve_changes_no_allocation() {
+        let ec = EngineConfig::default();
+        assert_eq!(super::device_pages_bytes(&ec).unwrap(), 0);
+        assert_eq!(super::retained_pages(&ec, 1 << 20), None);
+        assert_eq!(super::net_of_pages(&ec, 12_345), 12_345);
         assert_eq!(super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(), None);
-        ec.kv.pool_mb = Some(64);
-        assert_eq!(
-            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
-            Some(64 << 20)
-        );
 
-        let storage = infr_core::config::KvTier {
+        let mut stored = EngineConfig::default();
+        stored.kv.block = vec![infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redb),
             ..Default::default()
-        };
-        let mut ec = ec_with_tiers(vec![storage]);
-        assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
-        assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
-        assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
+        }];
+        assert_eq!(super::net_of_pages(&stored, 12_345), 12_345);
         assert_eq!(
-            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
+            super::kv_pool_cap_bytes(&stored, 100 << 20, 0).unwrap(),
+            None,
+            "a block store beside the windows bounds nothing"
+        );
+        let backed = ec_store_backed();
+        assert_eq!(super::net_of_pages(&backed, 12_345), 12_345);
+        assert_eq!(
+            super::kv_pool_cap_bytes(&backed, 100 << 20, 0).unwrap(),
             Some(100 << 20),
-            "without `kv.pool_mb` the store's cap resolves to the windows' bytes"
+            "the store-backed window's cap resolves to the windows' bytes"
         );
-        ec.kv.pool_mb = Some(64);
-        assert_eq!(
-            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
-            Some(64 << 20),
-            "`kv.pool_mb` still sets the cap under a leading store"
-        );
+
+        // The reserve counts in whole pages, and a host window takes it off the device.
+        let reserved = ec_with_pages(5 << 20);
+        assert_eq!(super::retained_pages(&reserved, 1 << 20), Some(5));
+        assert_eq!(super::net_of_pages(&reserved, 8 << 20), 3 << 20);
+        let mut hosted = reserved.clone();
+        hosted.kv.window = vec![host_window(64 << 20)];
+        assert_eq!(super::net_of_pages(&hosted, 8 << 20), 8 << 20);
     }
 
-    /// The tier comes off the residency predicate, the streaming budget and the MoE expert budget
-    /// exactly as it comes off the fit: one byte either side of the ceiling net of the tier.
+    /// The pages reserve comes off the residency predicate, the streaming budget and the MoE
+    /// expert budget exactly as it comes off the fit: one byte either side of the ceiling net of
+    /// the reserve.
     #[test]
-    fn the_vram_tier_comes_off_placement_as_it_comes_off_the_fit() {
-        if !default_chunk_is_discrete("the_vram_tier_comes_off_placement_as_it_comes_off_the_fit") {
+    fn the_pages_reserve_comes_off_placement_as_it_comes_off_the_fit() {
+        if !default_chunk_is_discrete(
+            "the_pages_reserve_comes_off_placement_as_it_comes_off_the_fit",
+        ) {
             return;
         }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let vram = xtx(XTX_FREE);
         let cfg = gemma3_12b();
         let tier = 1u64 << 30;
-        let ec = ec_with_tiers(vec![vram_tier(tier)]);
+        let ec = ec_with_pages(tier);
         let (ctx, ub) = (32768usize, 256usize);
         let kv_and_act = super::dense_resident_need(
             &cfg,
@@ -7802,11 +8098,11 @@ mod seam_helper_tests {
         assert!(fits(&ec, exact));
         assert!(
             !fits(&ec, exact + 1),
-            "a byte into the tier's reservation is not resident"
+            "a byte into the reserve is not resident"
         );
         assert!(
             fits(&EngineConfig::default(), exact + 1),
-            "…which only the tier-less ceiling would have accepted"
+            "…which only the reserve-less ceiling would have accepted"
         );
         let stream = |ec: &EngineConfig, w: u64| {
             super::dense_stream_budget_at(&cfg, ec, w, &vram, ctx, ub, F16.0, F16.1)
@@ -7838,7 +8134,7 @@ mod seam_helper_tests {
         assert_eq!(
             super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit + 1, F16.0, F16.1),
             None,
-            "one token past the tier-net fit must miss at every rung"
+            "one token past the reserve-net fit must miss at every rung"
         );
     }
 
@@ -7936,6 +8232,11 @@ mod seam_helper_tests {
         // No budget to report: the caller's window survives untouched.
         assert_eq!(call(&RoomOnly(None), &ec), want);
 
+        // …and a configured window does not change that: a backend with one memory cannot place
+        // KV by device/host, so no cap is enforced here (the open warns once, naming them).
+        let windows = ec_with_windows(vec![vram_window(Some(1 << 20)), host_window(1 << 20)]);
+        assert_eq!(call(&RoomOnly(None), &windows), want);
+
         // Roomy: the fit is past `want`, so the window is kept rather than raised.
         let roomy = super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, k, v)
             + super::dense_act_reserve_at(&cfg, want, 1024)
@@ -8025,10 +8326,9 @@ mod seam_helper_tests {
         let tiny = vec![(mib - 1, mib - 1); 1024];
         call(&tiny, Some(1), &ec).expect("unguarded buffers must not count");
 
-        // KV overflow spills what does not fit; a disabled guard refuses nothing.
-        let mut overflow = EngineConfig::default();
-        overflow.kv.overflow = true;
-        call(&sizes, Some(1), &overflow).expect("INFR_KV_OVERFLOW must not refuse");
+        // A window plan places what does not fit in host memory; a disabled guard refuses nothing.
+        let hosted = ec_with_windows(vec![host_window(1 << 40)]);
+        call(&sizes, Some(1), &hosted).expect("a host window must not refuse");
         let mut unguarded = EngineConfig::default();
         unguarded.kernels.vulkan.no_vram_guard = true;
         call(&sizes, Some(1), &unguarded).expect("INFR_NO_VRAM_GUARD must not refuse");

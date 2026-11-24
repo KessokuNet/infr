@@ -143,11 +143,14 @@ pub(crate) struct SlotPool {
     tick: u64,
 }
 
-/// `kv.paged`: put the session's KV in one page pool at the first fork, so this slot and every
-/// later one start from the parent's SHARED prefix pages instead of a copy. The pool holds one
-/// block per slot the session may fork — the same device bytes `max_slots` linear slots cost — and
-/// a pool it cannot build (VRAM, or a model with no pageable layer) degrades to linear slots with a
-/// warning rather than failing the request.
+/// Paging is the default: put the session's KV in one page pool at the first fork, so this slot
+/// and every later one start from the parent's SHARED prefix pages instead of a copy. The pool
+/// holds one block per slot the session may fork — the same device bytes `max_slots` linear slots
+/// cost — and a pool it cannot build (VRAM, or a model with no pageable layer) degrades to linear
+/// slots with a log line rather than failing the request: a warning when the config asked for
+/// paging by name, an info line when paging was only the default. Only a session with several
+/// slots to share pages builds one (`session_pages`); a lone slot stays linear at debug, since a
+/// pool there is `max_slots` windows of memory with nothing to share it with.
 fn start_paging(
     src: &mut crate::seam::SeamKv,
     be: &dyn infr_core::backend::Backend,
@@ -155,16 +158,33 @@ fn start_paging(
     ec: &crate::EngineConfig,
     max_slots: usize,
 ) {
-    if ec.kv.paged != Some(true) || src.is_paged() {
+    if !ec.kv.paging().is_on() || src.is_paged() {
         return;
     }
     let caps = be.capabilities();
     if !caps.kv_paging {
-        tracing::warn!(
-            "kv.paged: backend {} reads KV by position and has no page-table path; slots stay \
-             linear",
-            caps.name,
+        crate::seam::log_paging_off(
+            ec,
+            format_args!(
+                "backend {} reads KV by position and has no page-table path; slots stay linear",
+                caps.name
+            ),
         );
+        return;
+    }
+    // A pool exists to be shared: with one slot to fill it would hold `blocks` windows of pages
+    // for a session that never forks (`1 + blocks * pps` below), none of which the linear
+    // allocation it replaces had priced. The same condition the fit uses (`session_pages`).
+    if max_slots <= 1 {
+        tracing::debug!(
+            max_slots,
+            "kv.paged: the session has one slot to fill and nothing to share a page pool with; KV \
+             stays linear"
+        );
+        return;
+    }
+    if let Some(why) = crate::seam::no_poolable_layer(cfg) {
+        crate::seam::log_paging_off(ec, format_args!("{why}; slots stay linear"));
         return;
     }
     let (k_fmt, v_fmt) = src.kv_fmts();
@@ -173,7 +193,10 @@ fn start_paging(
     let built = crate::seam::KvPool::new(be, cfg, src.max_ctx(), k_fmt, v_fmt, 1 + blocks * pps)
         .and_then(|pool| src.attach_paged(be, cfg, &pool));
     if let Err(e) = built {
-        tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
+        crate::seam::log_paging_off(
+            ec,
+            format_args!("could not page this session's KV ({e}); slots stay linear"),
+        );
     }
 }
 
@@ -732,7 +755,7 @@ impl SeamModel {
         // placement scope, as in `vulkan_session_default_on`.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let refused = self.check_vram_tier(&vk, Some(max_ctx), 1).and_then(|()| {
+        let refused = self.check_window(&vk, Some(max_ctx), 1).and_then(|()| {
             self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
             self.refuse_explicit_ctx(&vk, max_ctx, 1)
         });
@@ -770,7 +793,7 @@ impl SeamModel {
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = self
-            .check_vram_tier(&vk, None, 1)
+            .check_window(&vk, None, 1)
             .and_then(|()| self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train)));
         drop(scope);
         let max_ctx = max_ctx?;
@@ -807,7 +830,7 @@ impl SeamModel {
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
         let fit = self
-            .check_vram_tier(&vk, None, 1)
+            .check_window(&vk, None, 1)
             .map(|()| self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train));
         drop(scope);
         let fit = fit?;
@@ -831,13 +854,15 @@ impl SeamModel {
     ///  2. **f16 misses, q8_0 reaches `want`** → pin auto-q8 and `tracing::warn!`. Only a FULL
     ///     rescue pins q8; a partial one keeps the predictable f16 cache, because auto-q8 exists
     ///     to avoid losing capability, not to trade decode speed for a still-clamped window.
-    ///  3. **`INFR_KV_OVERFLOW`** → keep `want` with the cache in system RAM.
-    ///  4. **Nothing serves even [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → `Err`. The
+    ///  3. **Nothing serves even [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → `Err`. The
     ///     weights leave no room for a usable cache on this device, so refusing with the numbers
     ///     beats a session that errors at its first activation alloc.
-    ///  5. Otherwise **clamp and log**, exactly as before.
+    ///  4. Otherwise **clamp and log**, exactly as before.
     ///
-    /// Rung 4 is deliberately narrow. It fires on "no usable context at all", NOT on "the trained
+    /// A `host` window is priced exactly by the fit, so it needs no rung of its own: the window
+    /// the fit returns already counts the host bytes.
+    ///
+    /// Rung 3 is deliberately narrow. It fires on "no usable context at all", NOT on "the trained
     /// window is bigger than this card" — a 262144-token trained window on a 24 GiB card is
     /// completely ordinary (Qwen3-30B-A3B) and must keep clamping to a working ~50k, not refuse.
     /// A context the USER asked for explicitly (`--ctx N` / `INFR_CTX=N`) never reaches this
@@ -873,21 +898,6 @@ impl SeamModel {
             );
             return Ok(want);
         }
-        // Placement ladder's LAST rung (SWA ring → auto-q8 → THIS): if the context still does
-        // not fit VRAM and the user opted into KV overflow, keep the requested window and let
-        // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
-        // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
-        // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
-        // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
-        // `Config` the backend was built with) — one value, so the clamp ladder and the
-        // allocator cannot disagree about whether the spill is armed.
-        if crate::seam::kv_spill_rescues(&self.ecfg) {
-            tracing::warn!(
-                "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
-                 INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
-            );
-            return Ok(want);
-        }
         // f16 cannot reach even the floor but q8 can: pin q8 and clamp to THAT. A partial rescue
         // normally keeps f16 (see the ladder doc), but the choice here is not "slower cache vs
         // smaller window" — it is "slower cache vs no session at all".
@@ -913,7 +923,7 @@ impl SeamModel {
         // format, else the format they did set) cannot serve even a minimally-useful window.
         let best = fit.max(fit_q8.unwrap_or(0));
         if best < crate::seam::MIN_SESSION_CTX {
-            let tier = crate::seam::vram_tier_bytes(&self.ecfg)?;
+            let tier = crate::seam::device_pages_bytes(&self.ecfg)?;
             let free = vram
                 .available
                 .saturating_sub(fp.total())
@@ -921,10 +931,7 @@ impl SeamModel {
             let tier_note = if tier == 0 {
                 String::new()
             } else {
-                format!(
-                    " - {:.2} GiB kv.tiers[0] (vram)",
-                    tier as f64 / (1u64 << 30) as f64
-                )
+                format!(" - {:.2} GiB [kv.pages]", tier as f64 / (1u64 << 30) as f64)
             };
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
@@ -944,8 +951,8 @@ impl SeamModel {
                  KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
                  free after weights  : {:.2} GiB ({:.2} GiB {} - {:.2} GiB weights{})\n\
                  Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
-                 (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
-                 in system RAM, or a smaller quant of the model.",
+                 (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), a `host` `[[kv.window]]` to place the \
+                 cache in system RAM, or a smaller quant of the model.",
                 match fit_q8 {
                     Some(f) => format!("{f} tokens"),
                     None => "not available (an explicit INFR_KV_TYPE_K/V wins)".to_string(),
@@ -968,11 +975,11 @@ impl SeamModel {
         Ok(fit)
     }
 
-    /// The one gate every open path runs before it sizes a window: a `vram` tier that alone takes
-    /// the window away (`want` tokens, else one minimum window, in `copies` caches) is refused
-    /// naming the tier, pricing the best KV format the session could pick. A malformed tier is an
-    /// error here too.
-    fn check_vram_tier(
+    /// The one gate every open path runs before it sizes a window: a window configuration that
+    /// alone takes the window away (`want` tokens, else one minimum window, in `copies` caches) is
+    /// refused naming the section, pricing the best KV format the session could pick. A malformed
+    /// section is an error here too.
+    fn check_window(
         &self,
         vk: &infr_vulkan::VulkanBackend,
         want: Option<usize>,
@@ -982,7 +989,7 @@ impl SeamModel {
         if self.may_auto_q8() {
             fmts.push(self.kv_fit_fmts(true));
         }
-        crate::seam::refuse_vram_tier(
+        crate::seam::refuse_window(
             &self.cfg,
             &self.ecfg,
             self.footprint().total(),
@@ -1461,21 +1468,23 @@ impl SeamModel {
     ) -> Result<usize> {
         let n_slots = n_slots.max(1);
         // A paged session prices ONE window: the pool is shared, so N slots do not each own a copy.
-        let copies = if self.ecfg.kv.paged == Some(true) {
-            1
-        } else {
-            n_slots
-        };
+        let paged = crate::seam::session_pages(
+            &self.cfg,
+            &self.ecfg,
+            &infr_core::backend::Backend::capabilities(vk),
+            n_slots,
+        );
+        let copies = if paged { 1 } else { n_slots };
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
         // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = self.session_ctx((c as usize).max(1));
-            self.check_vram_tier(vk, Some(ctx), copies)?;
+            self.check_window(vk, Some(ctx), copies)?;
             self.auto_q8_for_explicit_ctx(vk, ctx, copies);
             self.refuse_explicit_ctx(vk, ctx, copies)?;
             return Ok(ctx);
         }
-        self.check_vram_tier(vk, None, copies)?;
+        self.check_window(vk, None, copies)?;
         let trained = self.session_ctx(self.cfg.n_ctx_train);
         if n_slots == 1 && want.is_none() {
             return self.clamp_default_ctx(vk, trained);
@@ -1489,7 +1498,7 @@ impl SeamModel {
         };
         // A paged session's window is the pool's capacity, not one slot's slice of it: a slot owns
         // pages only while it uses them, so the advertised window can be the whole KV fit.
-        if self.ecfg.kv.paged == Some(true) && !crate::seam::kv_spill_rescues(&self.ecfg) {
+        if paged {
             let ctx = trained.min(budget);
             tracing::info!(
                 ctx,

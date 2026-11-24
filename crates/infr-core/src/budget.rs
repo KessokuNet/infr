@@ -14,9 +14,8 @@
 //! - [`kv_fmt_bytes`] — the EXACT allocation size of a KV buffer of `elems` elements, and
 //!   [`kv_bytes_per_elem`] — the same thing as a fractional per-element rate, which is what the
 //!   context-fit ESTIMATES divide by. The two must agree; a test pins them against each other.
-//! - [`flag_from`] / [`mib_bytes`] / [`reserve_bytes`] — the grammars and accessors the spill
-//!   knobs share (`empty`/`0` = off; a MiB count → bytes; the 12%-of-VRAM-floored-at-2-GiB
-//!   reserve). The VALUES come from the backend's [`Config`](crate::config::Config); nothing here
+//! - [`flag_from`] / [`reserve_bytes`] — the grammar and accessor the KV knobs share (`empty`/`0`
+//!   = off; the 12%-of-VRAM-floored-at-2-GiB reserve). The VALUES come from the backend's [`Config`](crate::config::Config); nothing here
 //!   reads the environment (R3).
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
 //!   bookkeeping and its banner. The counters and the message SKELETON are shared; every noun and
@@ -37,6 +36,7 @@
 
 use crate::decode_spec::block_layout;
 use crate::tensor::DType;
+use crate::SizeSpec;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── KV format sizing ─────────────────────────────────────────────────────────
@@ -113,8 +113,8 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
 
 // ── grammars + accessors shared by the spill knobs ───────────────────────────
 
-/// The boolean-flag grammar every overflow knob uses, over an explicit value: `Some(v)` with `v`
-/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`.)
+/// The boolean-flag grammar the `kv.paged` knob uses, over an explicit value: `Some(v)` with `v`
+/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_PAGED`.)
 /// NOT the same as the `is_ok()` presence grammar, where an empty
 /// value is ON — `config::env`'s `flag` reader calls this so the difference survives the
 /// migration; the read sites take the resolved `bool` off their backend's `Config`.
@@ -122,34 +122,22 @@ pub fn flag_from(raw: Option<&str>) -> bool {
     raw.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// A MiB-valued knob's CONFIG field in bytes. (`Some(0)` stays `Some(0)` — the diagnostic caps use
-/// it to mean "nothing resident", which is NOT the same as "no cap".)
-///
-/// The multiply SATURATES. The input is a `u64` MiB count straight off a config file or
-/// `INFR_KV_OVERFLOW_VRAM_MB`, and anything above ~17.6 trillion MiB overflows the byte product —
-/// a value a user can type and `parse::<u64>()` happily accepts. Wrapping is the dangerous
-/// direction here, not panicking: in release the product wraps to a SMALL number, so "cap
-/// placement at an absurdly high value" silently becomes "cap at a few bytes", which forces the
-/// entire class to host and looks like a mysteriously slow run rather than a bad knob. Saturating
-/// at `u64::MAX` keeps the only sane reading of a huge cap — effectively no cap — and it can never
-/// be reached by real bytes, so the gate behaves exactly as "uncapped" downstream.
-pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
-    mib.map(|mb| mb.saturating_mul(1024 * 1024))
-}
-
 /// VRAM headroom a VRAM-first spill keeps free below the live free-byte figure, so the consumers
 /// that allocate AFTER the spilled class (per-forward activation scratch, dequant caches, BLAS
 /// workspace, a paged-MoE arena) still have room. Default 12% of total VRAM floored at 2 GiB —
-/// enough for a several-hundred-row prefill on a large-vocab model — overridden by the knob's
-/// config field (`kv.overflow_reserve_mb`, in MiB).
+/// enough for a several-hundred-row prefill on a large-vocab model.
+///
+/// The override has no config spelling yet: the VRAM guard keeps its own fixed headroom, and no
+/// knob reaches either number.
 ///
 /// Over-reserving costs residency; under-reserving OOMs mid-forward in an allocator that is
 /// infallible by contract, so the floor is deliberate.
-pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
-    if let Some(bytes) = mib_bytes(override_mib) {
-        return bytes;
+pub fn reserve_bytes(total_vram: u64, reserve: Option<SizeSpec>) -> u64 {
+    match reserve {
+        Some(SizeSpec::Bytes(bytes)) => bytes,
+        Some(SizeSpec::Percent(share)) => (total_vram as f64 * share) as u64,
+        None => (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024),
     }
-    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -314,7 +302,7 @@ impl SpillTally {
     /// reproducible on a model that would otherwise fit entirely. The cap gates PLACEMENT only,
     /// never the real VRAM guard.
     ///
-    /// The running total + `bytes` SATURATES, for the same reason [`mib_bytes`] does: a wrapped
+    /// The running total + `bytes` SATURATES: a wrapped
     /// sum is a SMALL sum, and a small sum passes a cap it should have failed — the tally would
     /// keep admitting buffers into VRAM after the cap was blown. Saturating turns the degenerate
     /// input into a refusal (spill to host), which is the safe side of this gate. `u64::MAX` bytes
@@ -335,7 +323,7 @@ impl SpillTally {
 /// The per-class nouns of the placement banner — everything [`spill_report_line`] cannot know.
 #[derive(Debug, Clone, Copy)]
 pub struct SpillNouns<'a> {
-    /// Env var that enabled the spill, printed as the line's tag (`INFR_KV_OVERFLOW`).
+    /// The config section that enabled the placement, printed as the line's tag (`kv.window`).
     pub env: &'a str,
     /// Plural noun for the counted buffers (`"KV buffers"`, `"weight banks"`).
     pub noun: &'a str,
@@ -519,67 +507,22 @@ mod tests {
     }
 
     /// The same grammar as the CONFIG layer resolves it: `config::env`'s `flag` reader is
-    /// `flag_from`, so a `Config` built from these spellings carries exactly the booleans above —
-    /// which is what the spill sites now read.
+    /// `flag_from`, so a `Config` built from these spellings carries exactly the booleans above.
     #[test]
-    fn kv_overflow_config_field_follows_the_flag_grammar() {
+    fn kv_paged_config_field_follows_the_flag_grammar() {
         use crate::config::Config;
         for (raw, want) in [("", false), ("0", false), ("1", true), ("true", true)] {
-            let key = "INFR_KV_OVERFLOW";
+            let key = "INFR_KV_PAGED";
             let layer =
                 crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
             let cfg = Config::load_from_layers(&[layer]);
-            assert_eq!(cfg.kv.overflow, want, "{key}={raw:?}");
+            assert_eq!(cfg.kv.paged, Some(want), "{key}={raw:?}");
         }
-        // Unset ⇒ the shipped default, off.
-        assert!(!Config::default().kv.overflow);
+        // Unset ⇒ the default, which paging reads as on.
+        assert_eq!(Config::default().kv.paged, None);
     }
 
-    /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement) — over explicit
-    /// values, no environment.
-    ///
-    /// This used to run over a `&str` façade (`mib_from`), which existed only so this sweep could
-    /// avoid the process environment — something [`mib_bytes`] already allows. The STRING half of
-    /// the grammar (trim, reject a float / a negative / an empty value) belongs to
-    /// `config::env`'s `opt_mib` now and is pinned there; what is left here is the arithmetic.
-    #[test]
-    fn mib_grammar() {
-        assert_eq!(mib_bytes(None), None);
-        for (mib, want) in [
-            (0u64, Some(0u64)),
-            (1, Some(1024 * 1024)),
-            (512, Some(512 * 1024 * 1024)),
-        ] {
-            assert_eq!(mib_bytes(Some(mib)), want, "mib={mib}");
-        }
-    }
-
-    /// The MiB CAPS as the read sites now take them: a `Config` field in MiB, [`mib_bytes`] to
-    /// bytes. `Some(0)` (whole-host placement) must survive as `Some(0)`, not collapse to "no cap".
-    #[test]
-    fn mib_caps_come_off_the_config_in_mib() {
-        use crate::config::Config;
-        assert_eq!(mib_bytes(None), None);
-        assert_eq!(mib_bytes(Some(0)), Some(0));
-        assert_eq!(mib_bytes(Some(512)), Some(512 * 1024 * 1024));
-        // Unset ⇒ no cap on either class; set ⇒ the MiB count, byte-converted at the site.
-        assert_eq!(Config::default().kv.overflow_vram_mb, None);
-        let layer = crate::config::env::parse(&|k| match k {
-            "INFR_KV_OVERFLOW_VRAM_MB" => Some("  512  ".to_string()),
-            _ => None,
-        })
-        .expect("env layer");
-        let cfg = Config::load_from_layers(&[layer]);
-        assert_eq!(mib_bytes(cfg.kv.overflow_vram_mb), Some(512 * 1024 * 1024));
-    }
-
-    /// 12% of total, floored at 2 GiB, override in MiB — verbatim from the inline copy
-    /// (`kv_overflow_vram_reserve`), over explicit values so the case sweep needs no environment.
-    ///
-    /// This used to run over a `&str` façade (`reserve_from`) purely to keep the environment out of
-    /// the sweep, which [`reserve_bytes`] already does. An unparseable override is `None` by the
-    /// time it reaches here — `config::env` decides that — and `None` is the first case below, so
-    /// the deleted `Some("abc")` row is the same assertion spelled twice.
+    /// 12% of total, floored at 2 GiB, the override in bytes or as a share of total VRAM.
     #[test]
     fn reserve_bytes_matches_the_inline_formula() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -590,62 +533,21 @@ mod tests {
         assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
         assert_eq!(reserve_bytes(0, None), 2 * GIB);
         // The override wins outright, including below the floor and at zero.
-        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
-        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
-    }
-
-    /// The same policy driven off the CONFIG field (MiB) — the plumbing, where the test above is
-    /// the formula.
-    #[test]
-    fn reserve_bytes_takes_the_override_from_the_config() {
-        use crate::config::Config;
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
-        assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
-        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
-        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
-        // Unset in the shipped config ⇒ the formula.
-        let d = Config::default();
-        assert_eq!(d.kv.overflow_reserve_mb, None);
-        let layer = crate::config::env::parse(&|k| {
-            (k == "INFR_KV_OVERFLOW_RESERVE_MB").then(|| "128".to_string())
-        })
-        .expect("env layer");
-        let cfg = Config::load_from_layers(&[layer]);
+        let bytes = |b| Some(SizeSpec::Bytes(b));
+        assert_eq!(reserve_bytes(24 * GIB, bytes(128 << 20)), 128 << 20);
+        assert_eq!(reserve_bytes(24 * GIB, bytes(0)), 0);
         assert_eq!(
-            reserve_bytes(24 * GIB, cfg.kv.overflow_reserve_mb),
-            128 * 1024 * 1024
+            reserve_bytes(24 * GIB, Some(SizeSpec::Percent(0.5))),
+            12 * GIB
         );
     }
 
-    /// A MiB count large enough to overflow the byte product must SATURATE, not wrap.
-    ///
-    /// `u64` MiB values this big are typeable and `parse::<u64>()`-able (a fat-fingered
-    /// `INFR_KV_OVERFLOW_VRAM_MB`, a config file with a placeholder), and the wrapped result is
-    /// actively harmful: `2^44` MiB wraps to exactly `0`, i.e. the LOUDEST possible cap turns into
-    /// "nothing may stay resident" and the whole class goes to host. In debug the same expression
-    /// panics instead. Both are worse than clamping to "effectively no cap".
+    /// A saturated cap behaves as "no cap" at the gate it feeds: no real byte count reaches it.
     #[test]
-    fn mib_bytes_saturates_instead_of_wrapping() {
-        const MIB: u64 = 1024 * 1024;
-        // The last MiB count that still fits, and the first that does not.
-        let last_exact = u64::MAX / MIB; // 17_592_186_044_415
-        assert_eq!(mib_bytes(Some(last_exact)), Some(last_exact * MIB));
-        assert_eq!(mib_bytes(Some(last_exact + 1)), Some(u64::MAX));
-        // `2^44` MiB is the pathological one: `2^44 * 2^20 == 2^64`, which WRAPS to 0.
-        assert_eq!(mib_bytes(Some(1 << 44)), Some(u64::MAX));
-        assert_eq!(mib_bytes(Some(u64::MAX)), Some(u64::MAX));
-        // A saturated cap behaves as "no cap" at the gate it feeds — no real byte count reaches it.
+    fn a_huge_cap_admits_every_real_byte_count() {
         let t = SpillTally::default();
         t.record_vram(1 << 40);
-        assert!(t.admits(mib_bytes(Some(u64::MAX)), 1 << 40));
-        // And the ordinary values are untouched by the change.
-        assert_eq!(mib_bytes(None), None);
-        assert_eq!(mib_bytes(Some(0)), Some(0));
-        assert_eq!(mib_bytes(Some(512)), Some(512 * MIB));
-        // `reserve_bytes` reads the same helper, so its override saturates too rather than
-        // wrapping to a tiny (or zero) reserve, which would under-reserve and OOM mid-forward.
-        assert_eq!(reserve_bytes(24 * 1024 * MIB, Some(u64::MAX)), u64::MAX);
+        assert!(t.admits(Some(u64::MAX), 1 << 40));
     }
 
     /// The cumulative cap admits up to and including the cap, and `Some(0)` admits nothing —
@@ -739,7 +641,7 @@ mod tests {
         assert!(!t.admits(Some(u64::MAX - 1), u64::MAX));
         // An uncapped tally never consults the sum at all, so it still admits anything.
         assert!(t.admits(None, u64::MAX));
-        // A cap of exactly `u64::MAX` (what a saturated `mib_bytes` produces) still admits, since
+        // A cap of exactly `u64::MAX` (a saturated size) still admits, since
         // the saturated sum compares equal to it.
         assert!(t.admits(Some(u64::MAX), u64::MAX));
         // Right at the boundary with no saturation involved: the honest arithmetic is unchanged.
@@ -775,7 +677,7 @@ mod tests {
             }
         }
         const VK_KV: SpillNouns = SpillNouns {
-            env: "INFR_KV_OVERFLOW",
+            env: "kv.window",
             noun: "KV buffers",
             resident_note: "no PCIe KV reads.",
             spill_note: "SYSTEM RAM — attention reads those K/V over PCIe by device address \
@@ -798,7 +700,7 @@ mod tests {
         };
         assert_eq!(
             spill_report_line(all_resident, &VK_KV, vk_fmt).unwrap(),
-            "[infr] INFR_KV_OVERFLOW: all 56 KV buffers (3.00 GiB) fit in VRAM — none spilled; \
+            "[infr] kv.window: all 56 KV buffers (3.00 GiB) fit in VRAM — none spilled; \
              no PCIe KV reads."
         );
 
@@ -811,7 +713,7 @@ mod tests {
         };
         assert_eq!(
             spill_report_line(split, &VK_KV, vk_fmt).unwrap(),
-            "[infr] INFR_KV_OVERFLOW: 40 of 56 KV buffers (3.00 GiB resident) in VRAM, the \
+            "[infr] kv.window: 40 of 56 KV buffers (3.00 GiB resident) in VRAM, the \
              remaining 16 (1.00 GiB) in SYSTEM RAM — attention reads those K/V over PCIe by \
              device address (PCIe-bound on the spilled layers). Spilled KV bytes are exempt from \
              the VRAM budget guard."

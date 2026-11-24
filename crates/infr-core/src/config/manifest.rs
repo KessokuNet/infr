@@ -61,8 +61,6 @@ pub enum Grammar {
     Path,
     /// The shared size/count grammar (`crate::parse_size`).
     Size,
-    /// A MiB count.
-    Mib,
     /// A KV format name (`budget::parse_kv_dtype`).
     Dtype,
     /// A multi-GPU device list (`Vulkan0,Vulkan1,…`).
@@ -154,10 +152,6 @@ knobs! {
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
-    "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
-    "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
-    "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
-    "INFR_KV_POOL_MB"           => "kv.pool_mb",            Mib,         Ignored, "1024", migrated;
     "INFR_KV_PAGED"             => "kv.paged",              Flag,        Ignored, "1",    migrated;
 
     // ── paging ───────────────────────────────────────────────────────────────
@@ -411,10 +405,18 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
 /// - `INFR_CPU_MATH_TIER` — DEAD, never released: `kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`)
 ///   replaced it. The only reference left is `config::tests::removed_math_tier_env_is_not_read`,
 ///   which holds it unread. Do not add it to `Config`.
+/// - `INFR_KV_OVERFLOW`, `INFR_KV_OVERFLOW_VRAM_MB`, `INFR_KV_OVERFLOW_RESERVE_MB`,
+///   `INFR_KV_POOL_MB` — REMOVED for `[[kv.window]]` and `[kv.pages]`. The env layer
+///   refuses them with an error naming the replacement (`kv::REMOVED_KV_ENV`). Do not add them
+///   to `Config`.
 pub const NOT_KNOBS: &[&str] = &[
     "INFR_TP",
     "INFR_EP",
     "INFR_CPU",
     "INFR_METAL",
     "INFR_CPU_MATH_TIER",
+    "INFR_KV_OVERFLOW",
+    "INFR_KV_OVERFLOW_VRAM_MB",
+    "INFR_KV_OVERFLOW_RESERVE_MB",
+    "INFR_KV_POOL_MB",
 ];

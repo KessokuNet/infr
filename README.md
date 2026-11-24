@@ -25,17 +25,17 @@ that is not specific to older GPUs is meant to go upstream.
 
 **Both directions of KV paging**, neither of which upstream has:
 
-- **The `[[kv.tiers]]` cache (`INFR_KV_PAGED`'s sibling) — reverse PagedAttention.** A prompt's
+- **The `[[kv.block]]` cache (`kv.paged`'s sibling) — reverse PagedAttention.** A prompt's
   K/V rows are captured in 128-token blocks, chained by a hash of
-  `(parent id, tokens)`, and kept in the configured stores, fastest first (a
-  leading `backend = "vram"` entry reserves device memory for retained pages).
+  `(parent id, tokens)`, and kept in the configured stores, fastest first
+  (`[kv.pages]` reserves device memory for retained pages).
   Every entry names its `backend`. The next
   request walks the chain from token 0 as far as its prompt agrees, then uploads
   the matched run in one contiguous copy instead of re-prefilling it. Gemma 4 E4B
   on the RX 580: a 1068-token prompt took 3677 ms cold, 319 ms on a repeat,
   705 ms for a different 1090-token tail — the shared 1053 tokens stored once,
   111.8 MB for both conversations.
-- **`kv.paged` (`INFR_KV_PAGED`) — forward PagedAttention.** A session's slots
+- **`kv.paged` (`INFR_KV_PAGED`, on by default) — forward PagedAttention.** A session's slots
   share one pool of 512-row pages; a fork points at its parent's complete pages
   and copies a page before writing it. It costs the device bytes the linear slots
   already cost (one block per slot the session may fork) and is built at the
@@ -44,8 +44,8 @@ that is not specific to older GPUs is meant to go upstream.
   per KV tile.
 
 The two compose — the pool shares pages between live slots, the store survives
-slot recycling. The DRAM KV spillover (`kv.overflow`, `kv.overflow_vram_mb`,
-`kv.overflow_reserve_mb`) is upstream's. Mechanism, limits and measurements:
+slot recycling. Where the live rows sit (VRAM, or system RAM past a size) is
+`[[kv.window]]`. Mechanism, limits and measurements:
 [`docs/perf/kv-prefix.md`](docs/perf/kv-prefix.md).
 
 **Older GPUs** ([`docs/legacy-gpus.md`](docs/legacy-gpus.md)) — wave64-only GCN

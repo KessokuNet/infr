@@ -1600,26 +1600,71 @@ pub(crate) fn generate_dense_backend_bound(
                 ubatch,
                 fmts,
                 slot_copies,
+                room.unwrap_or(u64::MAX),
                 *pages,
             );
+            tracing::debug!(
+                windows,
+                slot_bytes,
+                page_bytes,
+                pages = *pages,
+                "kv.paged: sized the page pool"
+            );
+        }
+        if let Some(pages) = pool_pages {
+            // Placement is a cap, not a promise: the pool can end up with fewer pages than the
+            // window needs, and then a slot cannot map `want_ctx`. Serve what the pool really
+            // maps instead of advertising a window its pages cannot reach. Pages are shared, so
+            // this is the whole pool, not a share of it per slot: parking is what lets several
+            // conversations take turns inside one conversation's worth of pages.
+            let per_slot = crate::seam::pool_slot_ctx(pages);
+            if per_slot < want_ctx {
+                if per_slot < crate::seam::MIN_SESSION_CTX {
+                    // Under the floor a slot is useless, and a pool built anyway would fail every
+                    // request that filled it: price the linear caches instead.
+                    crate::seam::log_paging_off(
+                        ec,
+                        format_args!(
+                            "the {pages}-page pool that places maps only {per_slot} tokens, under \
+                             the {}-token floor a session needs; slots stay linear",
+                            crate::seam::MIN_SESSION_CTX
+                        ),
+                    );
+                    pool_pages = None;
+                } else {
+                    tracing::info!(
+                        pool_ctx = per_slot,
+                        want_ctx,
+                        pages,
+                        "kv.paged: the {pages}-page pool that places maps {per_slot} tokens, so the \
+                         session window is capped there"
+                    );
+                    want_ctx = per_slot;
+                }
+            }
         }
         let pool = match pool_pages.filter(|_| caps.kv_paging) {
             Some(pages) => match crate::seam::KvPool::new(be, c, want_ctx, k_fmt, v_fmt, pages) {
                 Ok(pool) => {
-                    tracing::info!(
-                        "kv.paged: {} of {} layers in a {}-page pool of {} rows",
+                    let (pooled, n_layer) = (
                         (0..c.n_layer)
                             .filter(|&l| crate::seam::paged_layer(c, l))
                             .count(),
                         c.n_layer,
-                        pool.pages(),
-                        pool.slot_rows(),
+                    );
+                    let (pages, rows) = (pool.pages(), pool.slot_rows());
+                    tracing::info!(
+                        pages,
+                        rows,
+                        "kv.paged: {pooled} of {n_layer} layers in a {pages}-page pool of \
+                         {rows} rows"
                     );
                     Some(pool)
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "kv.paged: could not page this session's KV ({e}); slots stay linear"
+                    crate::seam::log_paging_off(
+                        ec,
+                        format_args!("could not page this session's KV ({e}); slots stay linear"),
                     );
                     None
                 }
@@ -1721,8 +1766,8 @@ pub(crate) fn generate_dense_backend_bound(
             ));
         }
         let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
-        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
-        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
+        // VRAM-first window placement: now that every per-layer/per-side KV buffer is placed, let
+        // the backend log the resident-vs-spilled split once. No-op without a window plan.
         be.kv_overflow_report();
 
         // ── per-step IO buffers ────────────────────────────────────────────────────────
@@ -1860,7 +1905,7 @@ pub(crate) fn generate_dense_backend_bound(
     );
     // A store-led list (see `crate::seam::Mirror`): after every forward that advances the
     // window, the slot's rows go out to the store and come back. A no-op without a mirror, which
-    // is every placement but a storage tier leading `[[kv.tiers]]`. One macro rather than a
+    // is every placement but a store-backed window. One macro rather than a
     // helper because the locals it reads are the destructured slot fields, borrowed mutably
     // further down the loop; it expands INSIDE each site's existing GPU-baton scope.
     macro_rules! mirror_step {
@@ -9317,18 +9362,17 @@ mod tests {
         }
     }
 
-    /// A `host` tier asks the backend for the same KV buffers a `vram` tier does, all of which fit
-    /// inside the tier's `size`, and the unchanged kernels produce the same tokens and the same
-    /// cache rows. The CPU cache is host memory already, so this pins the sizing and the rows; that
-    /// no device KV is allocated is the Vulkan counter test's to show.
+    /// A `host` window asks the backend for the same KV buffers a `vram` window does, all of which
+    /// fit inside the window's `size`, and the unchanged kernels produce the same tokens and the
+    /// same cache rows. The CPU cache is host memory already, so this pins the sizing and the rows;
+    /// that no device KV is allocated is the Vulkan counter test's to show.
     #[test]
-    fn a_host_tier_runs_the_same_tokens_and_rows_as_a_vram_tier() {
+    fn a_host_window_runs_the_same_tokens_and_rows_as_a_vram_window() {
         const TIER: u64 = 64 << 20;
         let (g, cfg) = open_synthetic("kv-host-tier", &llama_gguf("llama", None));
-        let tier = |backend| infr_core::config::KvTier {
+        let tier = |backend| infr_core::config::WindowEntry {
             backend: Some(backend),
             size: Some(infr_core::SizeSpec::Bytes(TIER)),
-            ..Default::default()
         };
         let run = |backend| {
             let be = KvSpy {
@@ -9336,7 +9380,7 @@ mod tests {
                 kv_bytes: 0.into(),
             };
             let mut ec = EngineConfig::default();
-            ec.kv.tiers = vec![tier(backend)];
+            ec.kv.window = vec![tier(backend)];
             let embd = std::sync::OnceLock::new();
             let mut slot = None;
             let (ids, _) = super::generate_dense_backend(
@@ -9385,15 +9429,17 @@ mod tests {
         assert!(0 < host_bytes && host_bytes as u64 <= TIER);
     }
 
-    /// A redb tier that leads `kv.tiers`, and the in-memory store its window is mirrored into.
+    /// A redb store that backs the live window, and the in-memory store its window is mirrored
+    /// into.
     fn leading_redb() -> EngineConfig {
         let mut ec = EngineConfig::default();
         ec.sampling.ignore_eos = true;
-        ec.kv.tiers = vec![infr_core::config::KvTier {
+        ec.kv.block = vec![infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redb),
             size: Some(infr_core::SizeSpec::Bytes(1 << 20)),
             ..Default::default()
         }];
+        ec.kv.store_backed = true;
         ec
     }
 
@@ -9410,9 +9456,9 @@ mod tests {
     /// elements, K and V.
     const LLAMA_ROW_BYTES: u64 = 2 * 2 * 16 * 2;
 
-    /// A storage tier leading `kv.tiers` is authoritative for the live window: every forward that
-    /// advances it writes the rows to the store and reads them back into the slot, and the tokens
-    /// are the ones a `vram` tier produces. The counters are the proof the steps happened at all —
+    /// A store-backed window is authoritative for the live rows: every forward that advances it
+    /// writes the rows to the store and reads them back into the slot, and the tokens are the ones
+    /// a `vram` window produces. The counters are the proof the steps happened at all —
     /// a mirrored run whose mirror never fired would also be bit-identical.
     #[test]
     fn a_leading_storage_tier_mirrors_every_step_and_keeps_the_tokens() {

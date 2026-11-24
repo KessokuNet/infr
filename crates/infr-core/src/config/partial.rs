@@ -204,49 +204,148 @@ impl<T: ConfigValue> ConfigValue for Option<T> {
     }
 }
 
-impl ConfigValue for Vec<super::KvTier> {
-    /// `--set`'s shorthand: backend names, comma separated, each with no options. A config file
-    /// spells the same list as `[[kv.tiers]]` tables, which arrive here as `<i>.<field>` paths.
-    fn parse_set(raw: &str) -> Result<Self, String> {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|backend| {
-                Ok(super::KvTier {
-                    backend: Some(backend.parse()?),
-                    ..super::KvTier::default()
-                })
-            })
-            .collect()
-    }
+/// An entry of a `[[section]]` list: built from a bare backend name (`--set`'s shorthand) and
+/// filled field by field from `<i>.<field>` paths (a config file's tables).
+trait ListEntry: Default {
+    fn from_backend(backend: super::KvBackend) -> Self;
+    fn backend(&self) -> Option<super::KvBackend>;
+    fn set_field(&mut self, field: &str, raw: &str) -> Result<(), SetPathError>;
+}
 
-    fn to_display(&self) -> String {
-        self.iter()
-            .map(|t| t.backend.map(|b| b.to_string()).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    /// `kv.tiers.<i>.<field>`: the entry's index is the first path segment.
-    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
-        let (index, field) = rest.split_once('.').ok_or(SetPathError::Unknown)?;
-        let index: usize = index.parse().map_err(|_| SetPathError::Unknown)?;
-        let list = slot.get_or_insert_with(Vec::new);
-        if list.len() <= index {
-            list.resize_with(index + 1, super::KvTier::default);
+impl ListEntry for super::WindowEntry {
+    fn from_backend(backend: super::KvBackend) -> Self {
+        Self {
+            backend: Some(backend),
+            size: None,
         }
-        let tier = &mut list[index];
+    }
+    fn backend(&self) -> Option<super::KvBackend> {
+        self.backend
+    }
+    fn set_field(&mut self, field: &str, raw: &str) -> Result<(), SetPathError> {
         match field {
-            "backend" => tier.backend = Some(raw.parse().map_err(SetPathError::Value)?),
-            "size" => {
-                tier.size = Some(SizeSpec::parse_set(raw).map_err(SetPathError::Value)?);
+            "backend" => self.backend = Some(raw.parse().map_err(SetPathError::Value)?),
+            "size" => self.size = Some(SizeSpec::parse_set(raw).map_err(SetPathError::Value)?),
+            "path" | "url" => {
+                return Err(SetPathError::Value(format!(
+                    "a `[[kv.window]]` entry holds live rows in memory, so it takes no `{field}`; \
+                     a store with one belongs under `[[kv.block]]`"
+                )))
             }
-            "path" => {
-                tier.path = Some(PathBuf::parse_set(raw).map_err(SetPathError::Value)?);
-            }
-            "url" => tier.url = Some(raw.to_string()),
             _ => return Err(SetPathError::Unknown),
         }
+        Ok(())
+    }
+}
+
+impl ListEntry for super::KvBlock {
+    fn from_backend(backend: super::KvBackend) -> Self {
+        Self {
+            backend: Some(backend),
+            ..Self::default()
+        }
+    }
+    fn backend(&self) -> Option<super::KvBackend> {
+        self.backend
+    }
+    fn set_field(&mut self, field: &str, raw: &str) -> Result<(), SetPathError> {
+        match field {
+            "backend" => self.backend = Some(raw.parse().map_err(SetPathError::Value)?),
+            "size" => self.size = Some(SizeSpec::parse_set(raw).map_err(SetPathError::Value)?),
+            "path" => self.path = Some(PathBuf::parse_set(raw).map_err(SetPathError::Value)?),
+            "url" => self.url = Some(raw.to_string()),
+            _ => return Err(SetPathError::Unknown),
+        }
+        Ok(())
+    }
+}
+
+/// `--set`'s shorthand for a list: backend names, comma separated, each with no options.
+fn list_parse_set<T: ListEntry>(raw: &str) -> Result<Vec<T>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|backend| Ok(T::from_backend(backend.parse()?)))
+        .collect()
+}
+
+fn list_to_display<T: ListEntry>(list: &[T]) -> String {
+    list.iter()
+        .map(|e| e.backend().map(|b| b.to_string()).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `<section>.<i>.<field>`: the entry's index is the first path segment.
+fn list_set_below<T: ListEntry>(
+    slot: &mut Option<Vec<T>>,
+    rest: &str,
+    raw: &str,
+) -> Result<(), SetPathError> {
+    let (index, field) = rest.split_once('.').ok_or(SetPathError::Unknown)?;
+    let index: usize = index.parse().map_err(|_| SetPathError::Unknown)?;
+    let list = slot.get_or_insert_with(Vec::new);
+    if list.len() <= index {
+        list.resize_with(index + 1, T::default);
+    }
+    list[index].set_field(field, raw)
+}
+
+impl ConfigValue for Vec<super::WindowEntry> {
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        list_parse_set(raw)
+    }
+    fn to_display(&self) -> String {
+        list_to_display(self)
+    }
+    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
+        list_set_below(slot, rest, raw)
+    }
+}
+
+impl ConfigValue for Vec<super::KvBlock> {
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        list_parse_set(raw)
+    }
+    fn to_display(&self) -> String {
+        list_to_display(self)
+    }
+    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
+        list_set_below(slot, rest, raw)
+    }
+}
+
+impl ConfigValue for super::KvPages {
+    /// `--set kv.pages=on` declares paging with no reserve; any size (`2g`) also sets the reserve.
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "1" | "true" | "yes" | "on" => Ok(Self {
+                declared: true,
+                size: None,
+            }),
+            size => Ok(Self {
+                declared: true,
+                size: Some(SizeSpec::parse_set(size)?),
+            }),
+        }
+    }
+    fn to_display(&self) -> String {
+        match (self.declared, &self.size) {
+            (_, Some(size)) => size.to_display(),
+            (true, None) => "on".to_string(),
+            (false, None) => "off".to_string(),
+        }
+    }
+    /// `kv.pages.size`.
+    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
+        if rest != "size" {
+            return Err(SetPathError::Unknown);
+        }
+        let size = SizeSpec::parse_set(raw).map_err(SetPathError::Value)?;
+        *slot = Some(Self {
+            declared: true,
+            size: Some(size),
+        });
         Ok(())
     }
 }

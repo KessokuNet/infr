@@ -551,10 +551,10 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
-    /// `INFR_KV_OVERFLOW` path): how many `BufferUsage::KvCache` buffers landed in device-local VRAM
-    /// vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV allocation
-    /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
-    /// or with the flag off, print nothing).
+    /// `[[kv.window]]` placement): how many `BufferUsage::KvCache` buffers landed in device-local
+    /// VRAM vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV
+    /// allocation loop, so the user sees the resident/spilled split. Default no-op (backends without
+    /// host spill, or with no window plan, print nothing).
     fn kv_overflow_report(&self) {}
     /// Running tally of where this backend placed `BufferUsage::KvCache` buffers under a host
     /// spill plan (device-local vs host memory), `None` for a backend that keeps no such tally.

@@ -461,8 +461,8 @@ pub(crate) const FORMATS_META_ID: u64 = u64::MAX;
 /// A second side-metadata id, kept out of the extent namespace.
 pub(crate) const RESERVED_META_ID: u64 = u64::MAX - 1;
 
-/// Slot 0's id for the extent holding its LIVE window when a storage tier leads `[[kv.tiers]]`
-/// (see `crate::seam::LiveWindow`): slot `i` uses `LIVE_WINDOW_BASE - i`. Reserved like the two
+/// Slot 0's id for the extent holding its LIVE window when the window is store-backed (see
+/// `crate::seam::LiveWindow`): slot `i` uses `LIVE_WINDOW_BASE - i`. Reserved like the two
 /// ids above, but a real extent: [`BLOCK_ID_FLOOR`] keeps content-addressed block ids below this
 /// band, so the prefix index and the mirror share one store separated only by id space.
 pub(crate) const LIVE_WINDOW_BASE: u64 = u64::MAX - 2;

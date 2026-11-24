@@ -39,14 +39,20 @@ use crate::{DType, SizeSpec};
 pub mod cli;
 pub mod env;
 pub mod file;
+mod kv;
 pub mod manifest;
 pub mod partial;
 pub mod tune;
 
 #[cfg(test)]
+mod kv_tests;
+#[cfg(test)]
 mod tests;
 
 pub use cli::ConfigOverrides;
+pub use kv::{
+    KvBackend, KvBlock, KvLayout, KvPages, Paging, WindowEntry, WindowPlan, KV_REDB_DEFAULT_BYTES,
+};
 pub use partial::{ConfigValue, SetPathError};
 pub use tune::{TuneEntry, TuneLevel, TuneMap};
 
@@ -127,7 +133,8 @@ cfg_struct! {
 }
 
 cfg_struct! {
-    /// KV cache format, slots and host-overflow.
+    /// KV cache format, slots, and the three placement sections: `[[kv.window]]` (live rows),
+    /// `[kv.pages]` (retained pages) and `[[kv.block]]` (prefix store). See [`KvLayout`].
     KvCfg / PartialKvCfg {
         /// `INFR_KV_TYPE_K`: requested K-cache dtype. The runner's backend/alignment GATES stay at
         /// the call site (a gated-out request silently falls back to f16) — R5.
@@ -150,23 +157,24 @@ cfg_struct! {
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.
         coopmat_bda: bool = false,
-        /// `INFR_KV_OVERFLOW`: spill KV to host RAM. `budget::flag_from` grammar — `""` and `"0"`
-        /// are OFF here, unlike every `is_ok()` knob.
-        overflow: bool = false,
-        /// `INFR_KV_OVERFLOW_VRAM_MB`, in MiB (the byte conversion is the accessor's).
-        overflow_vram_mb: Option<u64> = None,
-        /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12% of VRAM, 2 GiB)`.
-        overflow_reserve_mb: Option<u64> = None,
-        /// `INFR_KV_POOL_MB`: device-RAM budget for the `kv.paged` page pool, in MiB. `None` =
-        /// auto, which sizes the pool at `slots` full windows (today's linear allocation).
-        pool_mb: Option<u64> = None,
-        /// `[[kv.tiers]]`: where the cross-conversation prefix cache keeps its blocks, fastest
-        /// first. Empty = the cache is off. Each entry is a [`KvTier`].
-        tiers: Vec<KvTier> = Vec::new(),
+        /// `[[kv.window]]`: the memory the live rows sit in, `vram` first. Empty = one implicit
+        /// `vram` window filling the device room the fit leaves. Each entry is a [`WindowEntry`].
+        window: Vec<WindowEntry> = Vec::new(),
+        /// `[kv.pages]`: the retention reserve for parked page maps, above the windows.
+        pages: KvPages = KvPages::default(),
+        /// `[[kv.block]]`: where the cross-conversation prefix cache keeps its 128-token extents,
+        /// fastest first. Empty = no prefix store. Each entry is a [`KvBlock`].
+        block: Vec<KvBlock> = Vec::new(),
+        /// The programmatic-only switch the store-backed measurement harness sets: the first
+        /// `[[kv.block]]` store becomes the authoritative copy of each slot's live window. Has NO
+        /// env key, like [`CpuCfg::reference`], and the file and `--set` refuse it.
+        store_backed: bool = false,
         /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
-        /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
-        /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a
-        /// single-conversation run never allocates one.
+        /// copy-on-write for a shared prefix. `None` = the default, which is on wherever it can do
+        /// something (several slots, a page-capable backend, a poolable layer); `false` opts out.
+        /// Read it through [`KvCfg::paging`], never by matching the option. The pool is built at
+        /// the session's first fork (see `docs/perf/kv-prefix.md`), so a single-conversation run
+        /// never allocates one.
         paged: Option<bool> = None,
     }
 }
@@ -705,344 +713,6 @@ cfg_struct! {
 /// This replaces `INFR_METAL_PROFILE`, which was three exact string literals masquerading as an
 /// integer level (`=1` on, `=2` flush, `=3` counters — so `=20` meant "on, level unrecognized",
 /// not "≥ 2"). Named modes cannot be misread that way.
-/// One entry of `[[kv.tiers]]`: a place the cross-conversation prefix cache keeps blocks.
-///
-/// The list is the chain: entry 0 is the fastest, an eviction from it falls to entry 1, and so on;
-/// a read that misses entry 0 falls through and promotes back up. Every entry but the last must be
-/// able to evict (a size is what makes it evict), which `redis` entries cannot: the server owns
-/// that policy.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct KvTier {
-    /// Where this entry keeps blocks: see [`KvBackend`]. `None` only while a config is being
-    /// assembled; every entry has to name one, and a config that loads without one is an error.
-    pub backend: Option<KvBackend>,
-    /// Bytes this entry keeps before evicting (or demoting, when an entry follows it).
-    pub size: Option<SizeSpec>,
-    /// `redb`: the database file. Unset keeps the database in memory.
-    pub path: Option<std::path::PathBuf>,
-    /// `redis`: the server URL (`redis://`, `rediss://`, `valkey://`).
-    pub url: Option<String>,
-}
-
-impl KvTier {
-    /// The bytes this entry keeps, or `None` for an entry with no budget.
-    pub fn bytes(&self) -> Option<u64> {
-        match self.size {
-            Some(SizeSpec::Bytes(b)) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Whether this entry is the addressable device-memory tier rather than a storage backend.
-    pub fn is_vram(&self) -> bool {
-        self.backend == Some(KvBackend::Vram)
-    }
-
-    /// Whether this entry is the addressable host-memory tier.
-    pub fn is_host(&self) -> bool {
-        self.backend == Some(KvBackend::Host)
-    }
-
-    /// Whether this entry is a storage backend (`redb`, `redis`) rather than addressable memory.
-    pub fn is_storage(&self) -> bool {
-        matches!(self.backend, Some(KvBackend::Redb | KvBackend::Redis))
-    }
-
-    /// Whether this entry holds live slots' rows (`vram`, `host`) rather than storing blocks.
-    pub fn is_addressable(&self) -> bool {
-        self.is_vram() || self.is_host()
-    }
-
-    /// The backend's name for logs and messages.
-    fn backend_name(&self) -> String {
-        self.backend
-            .map_or_else(|| "?".to_string(), |b| b.to_string())
-    }
-
-    /// A one-line description for logs, with any credentials stripped from a `url`.
-    pub fn describe(&self) -> String {
-        if self.is_addressable() {
-            return match self.bytes() {
-                Some(b) => format!("{} ({b} bytes)", self.backend_name()),
-                None => self.backend_name(),
-            };
-        }
-        let where_ = self
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .or_else(|| self.url.as_deref().map(redact_url))
-            .unwrap_or_else(|| "memory".to_string());
-        match self.bytes() {
-            Some(b) => format!("{} {where_} ({b} bytes)", self.backend_name()),
-            None => format!("{} {where_}", self.backend_name()),
-        }
-    }
-}
-
-/// What a `[[kv.tiers]]` entry is backed by. `vram` and `host` are addressable (live slots'
-/// memory: `vram` first, `host` first or right after it); `redb` and `redis` are storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvBackend {
-    /// Device memory.
-    Vram,
-    /// Host memory the kernels address directly.
-    Host,
-    /// Local: a file, or memory when `path` is unset.
-    Redb,
-    /// A shared server (`valkey` is accepted as a spelling).
-    Redis,
-}
-
-impl std::str::FromStr for KvBackend {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "vram" => Ok(Self::Vram),
-            "host" => Ok(Self::Host),
-            "redb" => Ok(Self::Redb),
-            "redis" | "valkey" => Ok(Self::Redis),
-            other => Err(format!(
-                "unknown kv tier backend {other:?} (vram, host, redb, redis)"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for KvBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Vram => "vram",
-            Self::Host => "host",
-            Self::Redb => "redb",
-            Self::Redis => "redis",
-        })
-    }
-}
-
-/// The byte sizes of the addressable entries of `tiers`, `(vram, host)`, `None` for one the list
-/// does not name. `vram` is valid only first; `host` first or directly after a leading `vram`.
-/// Each takes a byte `size` above zero and no `path` or `url`; anything else is an error naming
-/// the entry.
-fn kv_addressable_bytes(tiers: &[KvTier]) -> Result<(Option<u64>, Option<u64>), String> {
-    check_kv_tier_backends(tiers).map_err(|(i, why)| format!("kv.tiers[{i}]: {why}"))?;
-    let (mut vram, mut host) = (None, None);
-    for (i, tier) in tiers.iter().enumerate().filter(|(_, t)| t.is_addressable()) {
-        let (kind, memory) = if tier.is_vram() {
-            ("vram", "device")
-        } else {
-            ("host", "host")
-        };
-        let name = format!("kv.tiers[{i}] ({kind})");
-        if tier.is_vram() && i != 0 {
-            return Err(format!(
-                "{name}: the vram tier holds live slots and must be the first entry"
-            ));
-        }
-        if tier.is_host() && i != 0 && !(i == 1 && tiers[0].is_vram()) {
-            return Err(format!(
-                "{name}: the host tier holds live slots and must be the first entry, or directly \
-                 after a leading vram entry"
-            ));
-        }
-        if tier.path.is_some() || tier.url.is_some() {
-            return Err(format!(
-                "{name}: a {kind} tier is {memory} memory and takes no `path` or `url`"
-            ));
-        }
-        let bytes = match tier.size {
-            Some(SizeSpec::Bytes(b)) if b > 0 => b,
-            Some(SizeSpec::Bytes(_)) => {
-                return Err(format!("{name}: `size` has to be more than zero"));
-            }
-            Some(SizeSpec::Percent(_)) => {
-                return Err(format!("{name}: `size` is bytes, not a share of something"));
-            }
-            None => return Err(format!("{name}: a {kind} tier needs a byte `size`")),
-        };
-        if tier.is_vram() {
-            vram = Some(bytes);
-        } else {
-            host = Some(bytes);
-        }
-    }
-    Ok((vram, host))
-}
-
-/// Validate a storage entry that leads the list and return the bytes of window it can back: the
-/// `redb` `size` (1 GiB when unset), unbounded for `redis`, whose server owns its budget. A `redb`
-/// entry takes no `url` and a byte `size` above zero; a `redis` one needs a `url` and takes no
-/// `path`.
-fn check_leading_store(tier: &KvTier) -> Result<u64, String> {
-    let name = format!("kv.tiers[0] ({})", tier.backend_name());
-    if tier.backend == Some(KvBackend::Redis) {
-        if tier.path.is_some() {
-            return Err(format!(
-                "{name}: a redis tier is named by `url`, and `path` belongs to a redb tier"
-            ));
-        }
-        if tier.url.is_none() {
-            return Err(format!("{name}: a redis tier needs a `url`"));
-        }
-        // A leading tier's size is the cap the slot's staging rows are placed under, and a redis
-        // tier has no such budget: the server owns its memory, and `u64::MAX` is what tells the
-        // host placement not to cap. Accepting a number here would silently ignore it.
-        if tier.size.is_some() {
-            return Err(format!(
-                "{name}: a redis tier's budget belongs to the server, so a leading redis tier takes no `size`"
-            ));
-        }
-        return Ok(u64::MAX);
-    }
-    if tier.url.is_some() {
-        return Err(format!(
-            "{name}: a redb tier keeps its blocks in `path`, and `url` belongs to a redis tier"
-        ));
-    }
-    match tier.size {
-        None => Ok(KV_REDB_DEFAULT_BYTES),
-        Some(SizeSpec::Bytes(b)) if b > 0 => Ok(b),
-        Some(SizeSpec::Bytes(_)) => Err(format!("{name}: `size` has to be more than zero")),
-        Some(SizeSpec::Percent(_)) => {
-            Err(format!("{name}: `size` is bytes, not a share of something"))
-        }
-    }
-}
-
-/// The byte size of the `vram` tier in `tiers`, `None` when the list names none. `vram` is valid
-/// only first, with a byte `size` above zero and no `path` or `url`; anything else is an error
-/// naming the entry.
-pub fn kv_vram_tier_bytes(tiers: &[KvTier]) -> Result<Option<u64>, String> {
-    kv_addressable_bytes(tiers).map(|(vram, _)| vram)
-}
-
-/// The byte size of the `host` tier in `tiers`, `None` when the list names none.
-pub fn kv_host_tier_bytes(tiers: &[KvTier]) -> Result<Option<u64>, String> {
-    kv_addressable_bytes(tiers).map(|(_, host)| host)
-}
-
-/// Bytes a `redb` tier keeps when its entry names no `size`.
-pub const KV_REDB_DEFAULT_BYTES: u64 = 1 << 30;
-
-/// Where a live slot's KV rows sit, resolved from `[[kv.tiers]]` and the legacy `kv.overflow` keys.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KvResidency {
-    /// Set when a storage backend leads the list: the slot's rows are host-resident and the live
-    /// window is synchronised with that store every step. An experiment, never a recommendation.
-    pub store_backed: bool,
-    /// Device bytes a `vram` tier reserves beside the live windows for retained idle pages; `0`
-    /// with no such tier, and with a `host` entry (where `vram` is the device part of the windows).
-    pub vram_reserve: u64,
-    /// Set when live rows may sit in host memory.
-    pub spill: Option<KvSpill>,
-}
-
-/// How live KV rows split between device and host memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KvSpill {
-    /// Device bytes the live rows may take before the rest goes to host; `None` = whatever fits.
-    pub device_cap: Option<u64>,
-    /// Host bytes the live rows may take; `None` = unbounded.
-    pub host_cap: Option<u64>,
-}
-
-impl KvSpill {
-    /// Whether the plan states the device part, so the context fit counts only that part and not
-    /// the whole cache. The legacy `kv.overflow` flag leaves the host side open, and its fit keeps
-    /// pricing the full cache in VRAM with the spill as the last rung of the clamp ladder.
-    pub const fn prices_device_kv(&self) -> bool {
-        self.host_cap.is_some()
-    }
-
-    /// Total bytes of live rows the plan holds, `None` when the host side is unbounded.
-    pub fn capacity(&self) -> Option<u64> {
-        self.host_cap
-            .map(|h| h.saturating_add(self.device_cap.unwrap_or(0)))
-    }
-}
-
-impl KvCfg {
-    /// The live rows' residency. A `host` entry in `[[kv.tiers]]` decides it, a leading `vram`
-    /// entry before it being the device part; without one, `kv.overflow` and `kv.overflow_vram_mb`
-    /// are the legacy spelling of a `vram` tier of that size followed by an unbounded `host` one.
-    pub fn residency(&self) -> Result<KvResidency, String> {
-        let (vram, host) = kv_addressable_bytes(&self.tiers)?;
-        if let Some(first) = self.tiers.first().filter(|t| t.is_storage()) {
-            if first.backend == Some(KvBackend::Redis)
-                && self.tiers[1..].iter().any(KvTier::is_storage)
-            {
-                return Err(
-                    "kv.tiers[0] (redis): a leading redis tier cannot have another store below \
-                     it, because the server owns its budget and so it cannot be the bounded half \
-                     of a chain; declare the `redb` entry first"
-                        .to_string(),
-                );
-            }
-            let window = check_leading_store(first)?;
-            return Ok(KvResidency {
-                store_backed: true,
-                vram_reserve: 0,
-                spill: Some(KvSpill {
-                    device_cap: Some(0),
-                    host_cap: Some(window),
-                }),
-            });
-        }
-        Ok(match host {
-            Some(host_cap) => KvResidency {
-                store_backed: false,
-                vram_reserve: 0,
-                spill: Some(KvSpill {
-                    device_cap: Some(vram.unwrap_or(0)),
-                    host_cap: Some(host_cap),
-                }),
-            },
-            None => KvResidency {
-                store_backed: false,
-                vram_reserve: vram.unwrap_or(0),
-                spill: self.overflow.then(|| KvSpill {
-                    device_cap: crate::budget::mib_bytes(self.overflow_vram_mb),
-                    host_cap: None,
-                }),
-            },
-        })
-    }
-}
-
-/// Every `[[kv.tiers]]` entry has to name its `backend`: an entry with only a `path` or a `size`
-/// is refused rather than guessed to be `redb`. Returns the first offender's index and why.
-pub fn check_kv_tier_backends(tiers: &[KvTier]) -> Result<(), (usize, String)> {
-    match tiers.iter().position(|t| t.backend.is_none()) {
-        Some(i) => Err((
-            i,
-            "`backend` is required (vram, host, redb or redis)".to_string(),
-        )),
-        None => Ok(()),
-    }
-}
-
-/// [`check_kv_tier_backends`] over a layer's list, as the load error naming the entry's path.
-fn check_layer_tiers(tiers: Option<&Vec<KvTier>>) -> Result<(), ConfigError> {
-    tiers.map_or(Ok(()), |t| {
-        check_kv_tier_backends(t).map_err(|(i, message)| ConfigError::Value {
-            path: format!("kv.tiers.{i}.backend"),
-            message,
-        })
-    })
-}
-
-/// `scheme://user:secret@host` as `scheme://host`: a URL in a log line keeps its shape and loses
-/// its credentials.
-fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => match rest.rsplit_once('@') {
-            Some((_, host)) => format!("{scheme}://{host}"),
-            None => url.to_string(),
-        },
-        None => url.to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetalDeviceTime {
     /// No device timing: the profile reports host encode wall only. (Still a finding — a large
@@ -1404,11 +1074,13 @@ impl Config {
         let env_layer = ConfigLayer::env()?;
         let cli_layer = ConfigLayer::cli(overrides)?;
         let cfg = Config::load_from_layers(&[file_layer.clone(), env_layer, cli_layer]);
-        check_layer_tiers(Some(&cfg.kv.tiers))?;
-        cfg.kv.residency().map_err(|message| ConfigError::Value {
-            path: "kv.tiers".to_string(),
-            message,
-        })?;
+        cfg.kv.check()?;
+        if cfg.kv.paging() == Paging::OffForTurbo {
+            tracing::warn!(
+                "kv: a TurboQuant KV format is named, which has no page-aware store, so the run \
+                 stays linear; set `kv.paged = false` to silence this"
+            );
+        }
         // The file MAY set the diagnostic knobs, but it has to say so — otherwise
         // "why is my server printing timings" is unanswerable from the command line.
         if let Some(path) = &file_path {

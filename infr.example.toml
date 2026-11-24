@@ -116,55 +116,67 @@ slots = 4
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 
-# Where the cross-conversation KV prefix cache keeps a prompt's K/V rows after the
-# slot that produced them is recycled (reverse PagedAttention; unrelated to the
-# `paged` page pool below). One entry per store, fastest first: a block that does
-# not fit a tier is demoted to the next one, and a read falls through and promotes
-# it back. Every entry except the last needs a `size`; it evicts when it is full.
-#   backend = "vram"   first entry only: `size` bytes of device memory held beside the
-#                      live windows for retained idle pages (slots divide what is
-#                      left; a tier leaving less than one window is refused).
-#   backend = "host"   first entry, or right after a leading vram entry: `size` bytes
-#                      of system RAM the kernels read the live KV from (the vram
-#                      entry before it is then the device-resident part).
-#   backend = "redb"   `size` required; `path` keeps it in a file (survives a
-#                      restart), unset keeps the same database in memory (faster).
-#   backend = "redis"  `url` required (`redis://`, `rediss://`, `valkey://`); the
-#                      server's maxmemory is its budget, so it goes last.
-# A storage entry may also LEAD the list, and then it is the slot's backing rather
-# than a demotion target: the slot's buffers go host-side and the live window is
-# written to that store and read back after every step that advances it (a redb
-# tier then needs a `size` holding one window; a leading redis tier takes none).
-# An experiment, not a recommendation -- the cost is in docs/perf/kv-prefix.md.
-# Every entry must name its `backend`; a missing or unknown one fails the load.
-# Off by default: the store holds prompt-derived data.
-#
-# [[kv.tiers]]
-# backend = "vram"
-# size = "2g"
-#
-# [[kv.tiers]]
-# backend = "redb"
-# size = "1g"
-# path = "/var/cache/infr/kv-prefix.redb"
-#
-# [[kv.tiers]]
-# backend = "redis"
-# url = "redis://127.0.0.1:6379/2"
-
 # Decode-time inline KV write, and the coopmat/BDA KV path.
 inline_decode = false
 coopmat_bda = false
 
-# DEPRECATED (use a `host` entry in [[kv.tiers]]): spill the KV cache to host RAM
-# when VRAM runs out (VRAM-first). Note the grammar of the env twin:
-# INFR_KV_OVERFLOW="" and ="0" are OFF.
-overflow = false
-# DEPRECATED (a `vram` entry before the `host` one): VRAM ceiling for the KV cache,
-# in MiB. Default: unset = the fit calculation.
-# overflow_vram_mb = 512
-# Headroom left for everything else, in MiB. Default: max(12% of VRAM, 2 GiB).
-# overflow_reserve_mb = 2048
+# Forward PagedAttention: the slots of a multi-slot session share one pool of
+# 512-row pages, with copy-on-write for a shared prefix. ON BY DEFAULT wherever it can
+# do something (several slots, a backend with a page-table path, a poolable layer);
+# `false` opts out. Naming a TurboQuant type_k/type_v turns it off for the run, and
+# asking for paging (`true` or [kv.pages]) beside one is a load error.
+# INFR_KV_PAGED is the env twin. Default: unset = on.
+# paged = false
+
+# Device headroom kept under the VRAM guard is a fixed constant, not a key.
+
+# The KV cache lives in three sections, named by how long their data lasts. They are
+# independent: no window is one implicit vram window, no pages means the pool is just
+# the windows, no blocks means no prefix store. The array tables go last in [kv].
+#
+# [[kv.window]] -- the live rows of running conversations (short). The order is the
+# placement ladder: vram first, then host, at most one of each. Attention reads every
+# row each step, so only memory the kernels address can hold one; a storage backend
+# here is a load error that points at [[kv.block]].
+#   backend = "vram"  `size` optional: omitted fills the device room the fit leaves.
+#   backend = "host"  `size` required: system RAM read over PCIe, for a model that
+#                     leaves no room for a window. Alone it is host-first.
+#
+# [[kv.window]]
+# backend = "vram"
+# size = "4g"
+#
+# [[kv.window]]
+# backend = "host"
+# size = "16g"
+#
+# [kv.pages] -- retention reserve for the page maps of parked conversations, above the
+# windows (medium). `size` optional: absent, the pool is just the windows. Writing the
+# section declares paging; `paged = false` beside it is a load error.
+#
+# [kv.pages]
+# size = "2g"
+#
+# [[kv.block]] -- the cross-conversation prefix store (long): where a prompt's
+# 128-token K/V extents stay after its slot is recycled (reverse PagedAttention). The
+# order is the demotion chain, fastest first: an extent that does not fit a store is
+# demoted to the next one, and a read falls through and promotes it back. A block
+# store is read once per request to skip prefill; it is never a window. Off by
+# default: the store holds prompt-derived data.
+#   backend = "redb"   `path` keeps it in a file (survives a restart), unset keeps the
+#                      same database in memory (faster); `size` defaults to 1g.
+#   backend = "redis"  `url` required (`redis://`, `rediss://`, `valkey://`); no
+#                      `path`, no `size`: the server's maxmemory is its budget, so it
+#                      goes last.
+#
+# [[kv.block]]
+# backend = "redb"
+# size = "20g"
+# path = "/var/cache/infr/kv.redb"
+#
+# [[kv.block]]
+# backend = "redis"
+# url = "redis://cache.internal:6379/0"
 
 # ── paging (MoE expert cache + dense layer streaming) ────────────────────────
 
