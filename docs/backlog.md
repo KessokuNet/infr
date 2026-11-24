@@ -8695,6 +8695,25 @@ before the chunk, which the block-boundary recurrent snapshot already captures.
 Scope: single node. No RDMA, no cluster, no second GPU — those stay out until there is hardware to
 measure them on.
 
+### B243 — nothing in the tree builds a KV-sharing (gemma4) model (2026-11-24)
+
+**Tag:** llama · seam · loader · tests · **Plan:** none
+
+`Config::has_own_kv` has been load-bearing since the E2B variant landed: a layer from
+`n_layer_kv_from_start` on has no `attn_k`/`attn_v`/`attn_k_norm` tensor and attends an earlier
+layer's cache instead. No test in the tree builds that shape. The weight loader asked for
+`blk.24.attn_k.weight` on such a layer and only ever failed against a real file —
+`unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL`, whose 42 layers declare 18 shared ones. The E2B golden
+sets no `shared_kv_layers`, so every fixture the suite has runs with `own_kv` always true, and the
+seam build and the `wpush` handle order went untested for sharing until the loader was gated in
+`5057fa31`.
+
+The test that can fail: a `gemma4_gguf(shared)` builder beside `qwen35_gguf` in
+`crates/infr-llama/src/seam/runner.rs`'s test module — `gemma4.attention.shared_kv_layers` set and
+per-layer tensor lists that omit k/v on the shared layers — asserting that `Config::from_gguf` plus
+the seam build succeed and that a shared layer's attention reads the source layer's cache. The same
+builder is where `n_embd_per_layer` (PLE) coverage belongs, which today is E2B-file-gated too.
+
 ### B243 — no fixture covers a KV-sharing model (2026-11-24)
 
 **Tag:** llama · seam · loader · tests · **Plan:** none

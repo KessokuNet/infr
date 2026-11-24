@@ -43,7 +43,42 @@ GPUs that have it.
 ## Measured (RX 580 8 GB, RADV)
 
 `infr compare --sweep` against llama.cpp `785322d` (its Vulkan backend), same GGUF,
-same card, both re-run back to back on 2026-11-05. Tokens/s, `-r 3`.
+same card, both re-run back to back. Tokens/s, `-r 3`.
+
+### 2026-11-24
+
+The same sweep three times over, no `infr serve` resident, median of the three. Every
+cell moved by under 1% between runs except llama.cpp's four-token prefill on LFM3
+(214-251 t/s), so the ratios are not sampling noise.
+
+| Model | metric | infr | llama.cpp | ratio |
+|---|---|---|---|---|
+| Qwen2.5-Coder-3B Q4_K_M | pp512 | 635 | 540 | 1.18x |
+| | tg128 | 79 | 78 | 1.01x |
+| | tg64 @ d4096 | 59 | 68 | **0.87x** |
+| | pp4 @ d4096 | 82 | 136 | **0.60x** |
+| Gemma 4 E4B QAT UD-Q4_K_XL | pp512 | 454 | 415 | 1.09x |
+| | tg128 | 50 | 53 | 0.94x |
+| | tg64 @ d4096 | 46 | 46 | 1.00x |
+| | pp4 @ d4096 | 68 | 114 | **0.60x** |
+| LFM3-1.7B Q6_K | pp512 | 1068 | 937 | 1.14x |
+| | tg128 | 114 | 105 | 1.08x |
+| | tg64 @ d4096 | 105 | 101 | 1.04x |
+| | pp4 @ d4096 | 147 | 248 | **0.59x** |
+
+Prefill is up 19% on both models that appear in the 2026-11-05 table as well
+(535 → 635 and 382 → 454), and decode holds parity or better. What has not moved is
+the four-token turn at depth: `pp4@d4096` is still about 0.6x of llama.cpp on every
+model measured, and it is now the only measured deficit against the reference. That
+is the follow-up message shape — a long transcript plus a short new instruction — so
+it is also the one that matters most to chat clients. `tg64@d4096` on the 3B lost
+5 t/s against the November run while llama.cpp gained 6; the two tools cache and
+batch the incremental prefill differently there and the direction flipped.
+
+LFM3 is new here: it is the model the live `infr serve` install answers with, and the
+114 t/s decode matches the server's own journal (109-114 t/s on the same card).
+
+### 2026-11-05
 
 | Model | metric | infr | llama.cpp | ratio |
 |---|---|---|---|---|
@@ -56,9 +91,9 @@ same card, both re-run back to back on 2026-11-05. Tokens/s, `-r 3`.
 | | tg64 @ d4096 | 45 | 44 | 1.02x |
 | | pp4 @ d4096 | 69 | 113 | **0.61x** |
 
-Every metric is at parity or ahead except one: `pp4@d4096`, a four-token turn at 4k
-depth — the follow-up-message case. llama.cpp is 1.6-1.8x faster there, and that is
-the one measured deficit against the reference implementation.
+The E4B row does not load on the 2026-11-24 build without the seam fix in
+`5057fa31`: that file declares `gemma4.attention.shared_kv_layers`, and the loader
+asked for an `attn_k` the shared layers do not have.
 
 Earlier campaign (same card, before the `kq_fma` tier and the seam work; no date was
 recorded at the time, so read the llama.cpp columns as historical):
