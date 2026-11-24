@@ -48,8 +48,9 @@ same card, both re-run back to back. Tokens/s, `-r 3`.
 ### 2026-11-24
 
 The same sweep three times over, no `infr serve` resident, median of the three. Every
-cell moved by under 1% between runs except llama.cpp's four-token prefill on LFM3
-(214-251 t/s), so the ratios are not sampling noise.
+`infr` cell moved by under 3% between runs (the 3B's `tg128`, 77-79 t/s, was the
+widest) except llama.cpp's four-token prefill on LFM3 (214-251 t/s), so the ratios
+are not sampling noise.
 
 | Model | metric | infr | llama.cpp | ratio |
 |---|---|---|---|---|
