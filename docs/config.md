@@ -782,9 +782,12 @@ metrics probes; periodic polling can keep the server awake. With no socket
 supervisor, idle exit stops the server until you start it again. See
 [systemd socket activation](systemd.md) for automatic wake-up on Linux.
 
-The throughput line is **activity-only**: an interval in which nothing happened
-emits nothing, so an idle server leaves a clean log and there is no heartbeat to
-mistake for load. Its `prefill_tps`/`decode_tps` are the whole server's tokens
+The throughput line reports **work only**: an interval in which no token moved
+and no request finished emits nothing, so an idle server leaves a clean log and
+there is no heartbeat to mistake for load. A request that is merely in flight
+does not count — a long prefill folds its prompt tokens at completion, so it
+logs nothing here until it lands and the seam's own `prefill progress` line
+covers the wait. Its `prefill_tps`/`decode_tps` are the whole server's tokens
 divided by the WALL time of that one interval — not cumulative, and not the same
 number as the per-request `prefill_tps`/`decode_tps` on the `request done` line,
 which are that one request's own speeds (`prompt_tokens / TTFT` and

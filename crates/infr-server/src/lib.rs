@@ -1691,17 +1691,16 @@ struct StatsWindow {
 }
 
 impl StatsWindow {
-    /// Was there anything to report? An interval in which the server did nothing at all emits NO
-    /// line — the periodic report is activity-only, deliberately not a heartbeat, so an idle server
-    /// leaves a clean log. A request that is mid-generation counts as activity (`active > 0`) even
-    /// when it has produced no token yet, so a long single request still reports every interval it
-    /// spans.
+    /// Was there anything to report? An interval in which the server did no WORK emits NO line —
+    /// the periodic report is deliberately not a heartbeat, so an idle server leaves a clean log.
+    ///
+    /// `active` and `queued` alone do not count. A request that is only in flight has nothing to
+    /// say yet: prompt tokens are folded at completion, so a long prefill would otherwise emit a
+    /// line of pure zeros every interval — the model's own `prefill progress` line covers that
+    /// wait — and a generation that decoded no token in the interval has no throughput to report
+    /// either. A queued request is by definition blocked, not doing work.
     fn has_activity(&self) -> bool {
-        self.prompt_tokens > 0
-            || self.gen_tokens > 0
-            || self.completed > 0
-            || self.active > 0
-            || self.queued > 0
+        self.prompt_tokens > 0 || self.gen_tokens > 0 || self.completed > 0
     }
 
     /// Prompt tokens ingested per WALL second of the interval.
@@ -5970,31 +5969,35 @@ mod tests {
         );
     }
 
-    /// Activity-only, and what counts as activity. A request that is mid-generation has produced no
-    /// completed tokens yet, but the server is plainly busy — so `active`/`queued` alone must be
-    /// enough to emit a line, or a single long generation would log nothing until it ended. An
-    /// interval with none of it emits nothing: there is no idle heartbeat, by decision.
+    /// Activity means WORK, not a request merely being present. A prefill folds its prompt tokens
+    /// only at completion, so a single long prefill must log nothing but the model's own `prefill
+    /// progress` line — a `serve stats` line of all zeros adds no information. Decoded tokens and
+    /// finished requests are the two things that do.
     #[test]
-    fn in_flight_requests_are_activity_and_an_empty_interval_is_not() {
+    fn only_work_is_activity_and_an_empty_interval_is_not() {
         let stats = Arc::new(ServeStats::default());
         let w = Duration::from_secs(1);
         assert!(!stats.drain(w).has_activity(), "idle must be silent");
 
         let generating = ActiveGuard::new(stats.clone());
         assert!(
-            stats.drain(w).has_activity(),
-            "a generation in flight is activity even before it yields a token"
+            !stats.drain(w).has_activity(),
+            "a prefill in flight has produced nothing to report yet"
         );
+        let waiting = QueuedGuard::new(stats.clone());
+        assert!(
+            !stats.drain(w).has_activity(),
+            "a request queued for a slot is blocked, not work"
+        );
+        drop(waiting);
         drop(generating);
         assert!(!stats.drain(w).has_activity());
 
-        let waiting = QueuedGuard::new(stats.clone());
+        stats.bump_gen(1);
         assert!(
             stats.drain(w).has_activity(),
-            "a request queued for a slot is activity"
+            "a decoded token is work even with no request finished"
         );
-        drop(waiting);
-        assert!(!stats.drain(w).has_activity());
     }
 
     /// The gauges are RAII, so the interesting case is the abnormal exit: a guard dropped while

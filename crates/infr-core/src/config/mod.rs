@@ -1238,9 +1238,11 @@ cfg_struct! {
         ///
         /// ON by default, unlike `request_timeout_secs`, because it changes nothing a client can
         /// observe — it is a log line, not a policy — and a server with no throughput signal is the
-        /// state this knob exists to end. It is ACTIVITY-ONLY: an interval in which nothing
-        /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
-        /// reaching for when the log itself is expensive.
+        /// state this knob exists to end. It reports WORK ONLY: an interval in which no token
+        /// moved and no request finished emits nothing, so an idle server's log stays clean and a
+        /// long prefill (whose prompt tokens are folded only at completion) leaves the line to the
+        /// seam's own `prefill progress` output. The knob is only worth reaching for when the log
+        /// itself is expensive.
         stats_interval_secs: u64 = 5,
         /// `INFR_MMPROJ`: the vision projector (`mmproj-*.gguf`) for image input. Unset = the first
         /// `mmproj*.gguf` beside the model file, if any.

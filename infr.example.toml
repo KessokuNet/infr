@@ -352,8 +352,9 @@ request_timeout_secs = 0
 idle_timeout_secs = 0
 
 # How often the server logs its throughput line, in seconds. 0 switches the line
-# off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits
-# nothing, so an idle server leaves a clean log.
+# off. The line reports WORK ONLY: an interval in which no token moved and no
+# request finished emits nothing, so an idle server — or one still prefilling a
+# long prompt, whose tokens are folded at completion — leaves a clean log.
 stats_interval_secs = 5
 
 # Host names a request's `Host` header may carry. Unset, only a keyless TCP
