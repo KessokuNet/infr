@@ -69,7 +69,7 @@ use gpu_allocator::MemoryLocation;
 
 use infr_core::{
     backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
-    budget::{spill_report_line, SpillNouns, SpillTally},
+    budget::{spill_report_line, KvClaim, KvMemory, SpillNouns, SpillTally},
     config::Config,
     error::Result,
     graph::Graph,
@@ -708,6 +708,26 @@ enum Backing {
     External { memory: vk::DeviceMemory },
 }
 
+/// The memory a KV buffer allocated through `make_buf_ex` actually landed in: a unified-memory
+/// part may answer a device request from its host-visible overflow heap.
+fn kv_memory(backing: &Backing) -> KvMemory {
+    match backing {
+        Backing::Vram { spilled: true, .. } => KvMemory::Host,
+        _ => KvMemory::Device,
+    }
+}
+
+/// Hand `claim` to `buf`, which releases it on drop, and count the placement.
+fn keep_kv(mut buf: VkBuffer, claim: KvClaim<'_>) -> VkBuffer {
+    let (memory, bytes) = claim.keep();
+    match memory {
+        KvMemory::Device => buf.shared.kv_spill.record_vram(bytes),
+        KvMemory::Host => buf.shared.kv_spill.record_host(bytes),
+    }
+    buf.kv_live = Some((memory, bytes));
+    buf
+}
+
 struct VkBuffer {
     shared: Arc<VulkanShared>,
     buffer: vk::Buffer,
@@ -738,6 +758,9 @@ struct VkBuffer {
     /// staging, readback), which the activation high-water mark deliberately does not count.
     /// Set by `make_alloc`, released by this buffer's `Drop`.
     act_bytes: u64,
+    /// This buffer's claim on a KV tier's live occupancy ([`SpillTally::claim`]), set when a KV
+    /// placement plan allocated it and released by this buffer's `Drop`.
+    kv_live: Option<(KvMemory, u64)>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -779,6 +802,10 @@ impl Drop for VkBuffer {
         // than free it under the GPU (see `gpu_wait`).
         if self.shared.poisoned() {
             return;
+        }
+        // Only a buffer that really frees its memory returns its tier bytes.
+        if let Some((memory, bytes)) = self.kv_live {
+            self.shared.kv_spill.release(memory, bytes);
         }
         unsafe {
             match &mut self.backing {
@@ -906,7 +933,8 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
     })
 }
 
-/// Opt-in: place the KV cache VRAM-FIRST, spilling to system RAM only what does not fit. Each
+/// Opt-in (`kv.overflow`, or a `host` entry in `[[kv.tiers]]`): place the KV cache VRAM-FIRST,
+/// spilling to system RAM only what does not fit. Each
 /// per-layer/per-side KV buffer is tried in device-local VRAM (budget-guarded); once the VRAM
 /// budget is reached, that buffer — and, since the budget only shrinks as later buffers land, every
 /// subsequent one — is placed in host RAM and read by attention over PCIe via its device address
@@ -918,9 +946,19 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
 /// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
 ///
 /// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
-/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer.
-fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
-    cfg.kv.overflow
+/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer. A
+/// malformed tier list is an error, so a backend built from one fails its first KV allocation
+/// instead of silently keeping the cache in VRAM; the banner readers treat it as no plan.
+///
+/// `KvSpill::device_cap` caps the LIVE KV bytes placed device-local before the rest goes to host
+/// (`kv.overflow_vram_mb`, or the `vram` entry before a `host` one); unset = spill only when VRAM
+/// is genuinely full, `0` = whole-host. It gates KV placement alone, never the real VRAM guard,
+/// and keeps a partial-spill mix reproducible on a model that would otherwise fit.
+fn kv_spill_plan(cfg: &infr_core::config::Config) -> Result<Option<infr_core::config::KvSpill>> {
+    cfg.kv
+        .residency()
+        .map(|r| r.spill)
+        .map_err(|e| be(format!("kv tiers: {e}")))
 }
 
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
@@ -934,25 +972,6 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
     spill_note: "SYSTEM RAM — attention reads those K/V over PCIe by device address (PCIe-bound \
                  on the spilled layers). Spilled KV bytes are exempt from the VRAM budget guard.",
 };
-
-/// Diagnostic cap (in MiB) on CUMULATIVE KV bytes the VRAM-first spill will place in device-local
-/// VRAM before spilling the rest to host: `INFR_KV_OVERFLOW_VRAM_MB`. Unset ⇒ no cap (spill only
-/// when VRAM is genuinely full). `0` ⇒ nothing resident (whole-host, the slice-1 case). Its ONLY
-/// purpose is to make the partial-spill mix and the whole-host case reproducible on models that
-/// would otherwise fit entirely — for tests and apples-to-apples benchmarking. Gates KV placement
-/// alone, never the real VRAM guard. Ignored when `INFR_KV_OVERFLOW` is off.
-///
-/// Carried on the `Config` in MiB (`kv.overflow_vram_mb`); the byte conversion is this accessor's.
-///
-/// KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so the
-/// reasoning lives here rather than behind a citation). One read site, and a YAGNI sweep flagged it
-/// as measurement scaffolding. It stays for the same reason as `debug.poison_uninit`: it costs
-/// nothing when unset, and it is what makes a partial-spill placement reproducible on hardware
-/// where the model would otherwise fit — i.e. what lets a placement bug be re-created on a machine
-/// that is not the one that hit it. The feature it serves is opt-in either way.
-fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
-    infr_core::budget::mib_bytes(cfg.kv.overflow_vram_mb)
-}
 
 /// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
 /// ([`VulkanBackend::check_vram_budget`]) and the non-erroring probe
@@ -3904,11 +3923,58 @@ impl VulkanBackend {
             sub_offset: 0,
             own_addr,
             act_bytes: 0,
+            kv_live: None,
         })
     }
 
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         self.make_buf_ex(size, location, label, false, false)
+    }
+
+    /// Place one KV buffer by `plan`: device-local while it fits the device part and the VRAM guard,
+    /// else host. Each memory's bytes are claimed BEFORE the allocation (atomically, so racing
+    /// allocations cannot jointly pass a limit), the claim follows the buffer until it drops, and a
+    /// failed allocation returns it.
+    ///
+    /// The VRAM probe agrees with the guard to the byte, but the rounding slop at the exact budget
+    /// edge can still fail the allocation, so a device failure spills to host rather than erroring:
+    /// the point of a host plan is to degrade, never to hard-fail. The device part gates KV
+    /// placement alone, never the real guard, which keeps protecting weights and activations.
+    fn alloc_kv_planned(&self, bytes: usize, plan: infr_core::config::KvSpill) -> Result<VkBuffer> {
+        let tally = &self.shared.kv_spill;
+        let size = bytes as u64;
+        if let Ok(claim) = tally.claim(KvMemory::Device, size, plan.device_cap) {
+            if self.vram_budget_fits(size) {
+                if let Ok(buf) =
+                    self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
+                {
+                    if kv_memory(&buf.backing) == KvMemory::Device {
+                        return Ok(keep_kv(buf, claim));
+                    }
+                    // A unified-memory part answered from its host heap: that is the host tier's.
+                    drop(claim);
+                    let claim = self.claim_kv_host(size, plan.host_cap)?;
+                    return Ok(keep_kv(buf, claim));
+                }
+            }
+        }
+        let claim = self.claim_kv_host(size, plan.host_cap)?;
+        let buf = self.alloc_kv_host(bytes)?;
+        Ok(keep_kv(buf, claim))
+    }
+
+    /// Claim `size` bytes of the host tier, refusing past its `size`.
+    fn claim_kv_host(&self, size: u64, host_cap: Option<u64>) -> Result<KvClaim<'_>> {
+        self.shared
+            .kv_spill
+            .claim(KvMemory::Host, size, host_cap)
+            .map_err(|held| {
+                be(format!(
+                    "the host kv tier (size {} bytes) cannot take another {size} bytes of KV \
+                     cache: {held} bytes are already placed in it",
+                    host_cap.unwrap_or(u64::MAX)
+                ))
+            })
     }
 
     /// Allocate one KV-cache buffer in SYSTEM RAM (host-visible, non-device-local heap) WITH a
@@ -3927,7 +3993,7 @@ impl VulkanBackend {
     fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
         let ty =
             self.shared.host_overflow_type.ok_or_else(|| {
-                be("INFR_KV_OVERFLOW set but this device exposes no host-visible non-device-local \
+                be("host KV placement (kv.overflow or a host kv tier) is set but this device exposes no host-visible non-device-local \
                 memory type to place the KV cache in — unset it to run in VRAM".to_string())
             })?;
         // KV buffers are addressed by device address (issue #74), so this buffer needs the
@@ -3947,7 +4013,7 @@ impl VulkanBackend {
         if requirements.memory_type_bits & (1 << ty) == 0 {
             unsafe { self.shared.device.destroy_buffer(buffer, None) };
             return Err(be(
-                "INFR_KV_OVERFLOW: the host-visible overflow memory type is not compatible with a \
+                "host KV placement: the host-visible overflow memory type is not compatible with a \
                  KV storage buffer on this device"
                     .to_string(),
             ));
@@ -4021,6 +4087,7 @@ impl VulkanBackend {
                     // `sub_offset` — no own address needed here.
                     own_addr: None,
                     act_bytes: 0,
+                    kv_live: None,
                 });
             }
         }
@@ -4065,6 +4132,7 @@ impl VulkanBackend {
             sub_offset: 0,
             own_addr: None,
             act_bytes: 0,
+            kv_live: None,
         })
     }
 
@@ -4257,6 +4325,7 @@ impl VulkanBackend {
             sub_offset: 0,
             own_addr,
             act_bytes: 0,
+            kv_live: None,
         })
     }
 
@@ -4359,34 +4428,8 @@ impl VulkanBackend {
             // `alloc_kv_host`). This bounds PCIe cost to the overflow tail instead of paying it on the
             // whole cache; whole-host (slice-1 behavior) is now just the case where nothing fits.
             // Off by default ⇒ unchanged device-local VRAM KV.
-            if kv_overflow_enabled(&self.cfg) {
-                // Probe agrees with the guard to the byte (both key off `vram_budget_fits`), so a
-                // `true` here means the VRAM alloc's own guard will pass. Guard against the rounding
-                // slop between the requested `bytes` and the allocation's aligned size at the exact
-                // budget edge by treating a VRAM alloc failure as "spill it" rather than propagating —
-                // the whole point of overflow mode is to degrade to host, never to hard-error.
-                //
-                // `INFR_KV_OVERFLOW_VRAM_MB` (diagnostic) additionally caps CUMULATIVE KV-in-VRAM
-                // bytes: it forces a partial (or, at 0, whole-host) spill on a model that would
-                // otherwise fit entirely, so the mix path is exercisable on small models and the
-                // whole-host case is reproducible apples-to-apples for benchmarking. It gates ONLY
-                // this KV placement — never the real guard (`vram_budget_fits`/`check_vram_budget`),
-                // which keeps protecting weights + activations against true VRAM.
-                let cap_ok = self
-                    .shared
-                    .kv_spill
-                    .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
-                if cap_ok && self.vram_budget_fits(bytes as u64) {
-                    if let Ok(buf) =
-                        self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
-                    {
-                        self.shared.kv_spill.record_vram(bytes as u64);
-                        return Ok(buf);
-                    }
-                }
-                let buf = self.alloc_kv_host(bytes)?;
-                self.shared.kv_spill.record_host(bytes as u64);
-                return Ok(buf);
+            if let Some(plan) = kv_spill_plan(&self.cfg)? {
+                return self.alloc_kv_planned(bytes, plan);
             }
             return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
         }
@@ -4986,12 +5029,16 @@ impl Backend for VulkanBackend {
     /// partial split is visible. All-resident (nothing spilled) and all-spilled (slice-1 whole-host)
     /// are both reported. Nothing printed with the flag off or when no KV was allocated.
     fn kv_overflow_report(&self) {
-        if !kv_overflow_enabled(&self.cfg) {
+        if !matches!(kv_spill_plan(&self.cfg), Ok(Some(_))) {
             return;
         }
         if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
             tracing::info!("{line}");
         }
+    }
+
+    fn kv_placement(&self) -> Option<infr_core::budget::SpillCounts> {
+        matches!(kv_spill_plan(&self.cfg), Ok(Some(_))).then(|| self.shared.kv_spill.counts())
     }
 
     /// The dyn-`Backend` spelling of [`alloc_room`](Self::alloc_room) — always `Some` here, because
@@ -6808,5 +6855,27 @@ mod ssm_tests {
             "conv state err {}",
             maxerr(&st, &s_gpu)
         );
+    }
+}
+
+#[cfg(test)]
+mod kv_memory_tests {
+    use super::*;
+
+    /// A unified-memory part answers a device request from its host heap with `spilled: true`; that
+    /// buffer is host memory and must be charged to the host tier, not the device one.
+    #[test]
+    fn a_unified_memory_overflow_buffer_counts_as_host() {
+        let vram = |spilled| Backing::Vram {
+            memory: vk::DeviceMemory::null(),
+            ptr: std::ptr::null_mut(),
+            spilled,
+        };
+        assert_eq!(kv_memory(&vram(true)), KvMemory::Host);
+        assert_eq!(kv_memory(&vram(false)), KvMemory::Device);
+        let external = Backing::External {
+            memory: vk::DeviceMemory::null(),
+        };
+        assert_eq!(kv_memory(&external), KvMemory::Device);
     }
 }

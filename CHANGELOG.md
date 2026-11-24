@@ -92,6 +92,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   refused naming it. Every entry must now name its `backend`; a missing or
   unknown one is an error when the config loads, where an entry with only a
   `path` or `size` used to become a `redb` tier.
+  `backend = "host"` is the host-memory twin: the live slot's KV buffers are
+  allocated in system RAM and addressed directly by the unchanged kernels, sized
+  from the tier's byte `size` instead of the device budget, so the context fit
+  stops pricing KV in VRAM (activations still count). It is valid first, or
+  right after a leading `vram` entry, whose `size` is then the device-resident
+  part with the host entry taking the rest; the paged pool allocates its pages
+  host-side under it, and a window the tier cannot hold is refused at open.
+  `kv.overflow` and `kv.overflow_vram_mb` (`INFR_KV_OVERFLOW`,
+  `INFR_KV_OVERFLOW_VRAM_MB`) are deprecated spellings of a `vram` entry of that
+  size followed by an unbounded `host` entry; they behave as before, and a
+  `host` entry in the list takes precedence over them. `kv.overflow_vram_mb` now
+  caps live device KV bytes rather than lifetime bytes (identical until KV
+  buffers are freed and reallocated).
 
 - **A request that outgrows the page pool parks an idle conversation instead of
   failing.** `infr serve` with `kv.paged` and a pool too small for every slot now

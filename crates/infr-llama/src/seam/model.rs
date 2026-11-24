@@ -881,7 +881,7 @@ impl SeamModel {
         // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
         // `Config` the backend was built with) — one value, so the clamp ladder and the
         // allocator cannot disagree about whether the spill is armed.
-        if vk.cfg().kv.overflow {
+        if crate::seam::kv_spill_rescues(&self.ecfg) {
             tracing::warn!(
                 "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
                  INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
@@ -1489,7 +1489,7 @@ impl SeamModel {
         };
         // A paged session's window is the pool's capacity, not one slot's slice of it: a slot owns
         // pages only while it uses them, so the advertised window can be the whole KV fit.
-        if self.ecfg.kv.paged == Some(true) && !self.ecfg.kv.overflow {
+        if self.ecfg.kv.paged == Some(true) && !crate::seam::kv_spill_rescues(&self.ecfg) {
             let ctx = trained.min(budget);
             tracing::info!(
                 ctx,

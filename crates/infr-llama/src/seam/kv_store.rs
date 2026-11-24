@@ -907,9 +907,9 @@ pub(crate) fn redact(url: &str) -> String {
 
 /// The store `kv.tiers` declares: one backend per entry, fastest first, folded so an eviction from
 /// one entry demotes into the next and a read promotes back up. `None` when the cache is off. A
-/// tier that cannot be opened costs only that tier: log and keep the rest. A leading `vram` entry
-/// is the live slots' memory, not a store, so the chain starts below it; a malformed one is an
-/// error.
+/// tier that cannot be opened costs only that tier: log and keep the rest. Leading `vram` and
+/// `host` entries are the live slots' memory, not stores, so the chain starts below them; a
+/// malformed one is an error.
 pub(crate) fn prefix_store_for(
     kv: &crate::EngineConfig,
     key: u64,
@@ -949,10 +949,12 @@ pub(crate) fn prefix_store_for(
     Ok(chain)
 }
 
-/// Index of the first storage entry: `1` when the list leads with a valid `vram` tier, else `0`.
+/// Index of the first storage entry: past every leading addressable (`vram`, `host`) entry, which
+/// the validation keeps to the front of the list.
 fn storage_tiers_start(tiers: &[infr_core::config::KvTier]) -> anyhow::Result<usize> {
     let vram = infr_core::config::kv_vram_tier_bytes(tiers).map_err(|e| anyhow!(e))?;
-    Ok(usize::from(vram.is_some()))
+    let host = infr_core::config::kv_host_tier_bytes(tiers).map_err(|e| anyhow!(e))?;
+    Ok(usize::from(vram.is_some()) + usize::from(host.is_some()))
 }
 
 /// A tier that can demote (it has a budget) or one that cannot (the server owns its eviction).
@@ -966,7 +968,7 @@ const DEFAULT_TIER_BYTES: u64 = 1 << 30;
 
 fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opened> {
     let Some(backend) = tier.backend else {
-        return Err(anyhow!("`backend` is required (vram, redb or redis)"));
+        return Err(anyhow!("`backend` is required (vram, host, redb or redis)"));
     };
     match backend {
         KvBackend::Redb => {
@@ -1011,8 +1013,8 @@ fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opene
                 .map(|store| Opened::Plain(Box::new(store)))
                 .map_err(|e| anyhow!("{}: {e}", redact(url)))
         }
-        KvBackend::Vram => Err(anyhow!(
-            "a vram tier is device memory, not a store; the chain starts below it"
+        KvBackend::Vram | KvBackend::Host => Err(anyhow!(
+            "a {backend} tier holds live slots, not blocks; the chain starts below it"
         )),
     }
 }
@@ -1532,6 +1534,41 @@ mod tests {
         assert!(open_tier(&tier_of(KvBackend::Vram, Some(1)), 7).is_err());
     }
 
+    /// Leading `vram` and `host` entries are the live slots' memory, so the storage chain starts
+    /// after them, and a list holding only those keeps the cache resident-only.
+    #[test]
+    fn leading_vram_and_host_tiers_are_not_stores() {
+        let vram = tier_of(KvBackend::Vram, Some(1 << 20));
+        let host = tier_of(KvBackend::Host, Some(1 << 20));
+        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
+        for (tiers, skipped, has_store) in [
+            (vec![host.clone()], 1, false),
+            (vec![vram.clone(), host.clone()], 2, false),
+            (vec![host.clone(), redb.clone()], 1, true),
+            (vec![vram, host, redb], 2, true),
+        ] {
+            let ec = engine_with(tiers);
+            assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), skipped);
+            assert_eq!(prefix_store_for(&ec, 7).unwrap().is_some(), has_store);
+        }
+    }
+
+    /// A host entry below a storage tier, or a malformed one, is an error naming the entry.
+    #[test]
+    fn a_misplaced_or_malformed_host_tier_is_an_error() {
+        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
+        let late = engine_with(vec![redb, tier_of(KvBackend::Host, Some(1 << 20))]);
+        let Err(err) = prefix_store_for(&late, 7) else {
+            panic!("host after a storage tier must be refused")
+        };
+        assert!(err.to_string().contains("kv.tiers[1] (host)"), "{err}");
+        for size in [None, Some(0)] {
+            let bad = engine_with(vec![tier_of(KvBackend::Host, size)]);
+            assert!(prefix_store_for(&bad, 7).is_err(), "{size:?}");
+        }
+        assert!(open_tier(&tier_of(KvBackend::Host, Some(1)), 7).is_err());
+    }
+
     /// A block rewritten while an older copy sits below it must not leave that copy behind: the
     /// next start would load the stale rows, snapshot flag and all.
     #[test]
@@ -1878,7 +1915,7 @@ mod tests {
         )]);
         // The zero page rides on top of the windows, as `paged_pages_for` counts it.
         let windows = (1 + window_pages) as u64 * page_bytes;
-        let cap = crate::seam::kv_pool_cap_bytes(&ec, windows)
+        let cap = crate::seam::kv_pool_cap_bytes(&ec, windows, 0)
             .unwrap()
             .unwrap();
         let pages = crate::seam::pool_pages_for_cap(cap, page_bytes).unwrap();
@@ -1896,6 +1933,56 @@ mod tests {
         assert_eq!(pool.free_pages(), tier_pages);
         assert_eq!(pool.free_pages() as u64 * page_bytes, ec_tier(&ec));
         drop(slot);
+    }
+
+    /// A whole `host` tier bounds the page pool at its size, and a store chain built under it
+    /// parks and resumes conversations like any other: the retained pages resume with no upload,
+    /// and a conversation the pool had to give back restores from the storage tier below.
+    #[test]
+    fn a_whole_host_tier_parks_and_resumes_through_its_chain() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let page_bytes = crate::seam::kv_page_bytes(&cfg, DType::F16, DType::F16);
+        let host_pages = 7usize;
+        let fmts = (DType::F16, DType::F16);
+        let slot_bytes = crate::seam::kv_paged_slot_bytes(&cfg, 1024, false, 1, fmts, 1);
+        let ec = engine_with(vec![
+            tier_of(
+                KvBackend::Host,
+                Some(host_pages as u64 * page_bytes + slot_bytes),
+            ),
+            tier_of(KvBackend::Redb, Some(1 << 20)),
+        ]);
+        let windows = 12 * page_bytes;
+        let cap = crate::seam::kv_pool_cap_bytes(&ec, windows, slot_bytes)
+            .unwrap()
+            .unwrap();
+        let pages = crate::seam::pool_pages_for_cap(cap, page_bytes).unwrap();
+        assert_eq!(
+            pages, host_pages,
+            "the tier, not the windows, bounds the pool"
+        );
+        assert_eq!(crate::seam::vram_tier_pages(&ec, page_bytes), None);
+
+        let pool =
+            crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, pages).unwrap();
+        let store = prefix_store_for(&ec, 7)
+            .unwrap()
+            .expect("redb below the host tier");
+        let mut s = BlockCache::new(store, true);
+        s.set_resident_cap(Some(4));
+        for seed in [3, 4, 5] {
+            park_conversation(&be, &cfg, &pool, &mut s, seed);
+        }
+        assert_eq!(
+            s.resident_spills, 1,
+            "two conversations fit the retained cap"
+        );
+        let _spilled = resume_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert_eq!(s.restores, 1, "the oldest came back from the store");
+        let _kept = resume_conversation(&be, &cfg, &pool, &mut s, 5);
+        assert_eq!(s.restores, 1, "the retained one uploaded nothing");
+        assert_eq!(s.resident_hits, 1);
     }
 
     fn ec_tier(ec: &crate::EngineConfig) -> u64 {
@@ -1982,7 +2069,7 @@ mod tests {
         be: &dyn Backend,
         cfg: &Config,
         pool: &Arc<crate::seam::KvPool>,
-        s: &mut Cache,
+        s: &mut BlockCache<impl KvStore>,
         seed: u32,
     ) {
         let mut kv = paged_slot(be, cfg, pool, 1024);
@@ -1995,7 +2082,7 @@ mod tests {
         be: &dyn Backend,
         cfg: &Config,
         pool: &Arc<crate::seam::KvPool>,
-        s: &mut Cache,
+        s: &mut BlockCache<impl KvStore>,
         seed: u32,
     ) -> SeamKv {
         let mut dst = SeamKv::for_test(be, cfg, 1024, false, 56, DType::F16).unwrap();

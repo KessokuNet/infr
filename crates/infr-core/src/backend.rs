@@ -556,6 +556,11 @@ pub trait Backend: Send + Sync {
     /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
     /// or with the flag off, print nothing).
     fn kv_overflow_report(&self) {}
+    /// Running tally of where this backend placed `BufferUsage::KvCache` buffers under a host
+    /// spill plan (device-local vs host memory), `None` for a backend that keeps no such tally.
+    fn kv_placement(&self) -> Option<crate::budget::SpillCounts> {
+        None
+    }
     /// Bytes a new device-local allocation may still take RIGHT NOW, as this backend's own
     /// allocation guard sees it — the live answer to "what is left?", including everything a
     /// pre-load estimate cannot know: allocator block tails, retained upload staging, the driver's

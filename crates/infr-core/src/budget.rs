@@ -159,12 +159,52 @@ pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
 ///
 /// All-zero (the `Default`) means the flag was off or nothing of that class was allocated — both
 /// print nothing.
+///
+/// Beside those lifetime totals it keeps LIVE occupancy per memory ([`SpillTally::claim`]): bytes
+/// reserved before an allocation and released when the buffer goes, which is what a tier's `size`
+/// limits.
 #[derive(Debug, Default)]
 pub struct SpillTally {
     vram_bufs: AtomicU64,
     vram_bytes: AtomicU64,
     host_bufs: AtomicU64,
     host_bytes: AtomicU64,
+    live_vram_bytes: AtomicU64,
+    live_host_bytes: AtomicU64,
+}
+
+/// The memory a KV buffer's bytes occupy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvMemory {
+    /// Device-local memory.
+    Device,
+    /// Host memory the kernels address directly.
+    Host,
+}
+
+/// Bytes reserved in one memory by [`SpillTally::claim`], released on drop unless [`keep`](Self::keep)
+/// hands them to the buffer that now holds them.
+#[derive(Debug)]
+#[must_use = "an unused claim releases its bytes at once"]
+pub struct KvClaim<'a> {
+    tally: &'a SpillTally,
+    memory: KvMemory,
+    bytes: u64,
+}
+
+impl KvClaim<'_> {
+    /// Keep the bytes held; the caller releases them with [`SpillTally::release`].
+    pub fn keep(self) -> (KvMemory, u64) {
+        let held = (self.memory, self.bytes);
+        std::mem::forget(self);
+        held
+    }
+}
+
+impl Drop for KvClaim<'_> {
+    fn drop(&mut self) {
+        self.tally.release(self.memory, self.bytes);
+    }
 }
 
 /// A [`SpillTally`] read at one instant — plain values, so the banner formats from a consistent
@@ -175,6 +215,10 @@ pub struct SpillCounts {
     pub vram_bytes: u64,
     pub host_bufs: u64,
     pub host_bytes: u64,
+    /// Bytes of KV buffers alive in device memory now.
+    pub live_vram_bytes: u64,
+    /// Bytes of KV buffers alive in host memory now.
+    pub live_host_bytes: u64,
 }
 
 impl SpillCounts {
@@ -204,7 +248,63 @@ impl SpillTally {
             vram_bytes: self.vram_bytes.load(Ordering::Relaxed),
             host_bufs: self.host_bufs.load(Ordering::Relaxed),
             host_bytes: self.host_bytes.load(Ordering::Relaxed),
+            live_vram_bytes: self.live_vram_bytes.load(Ordering::Relaxed),
+            live_host_bytes: self.live_host_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    fn live(&self, memory: KvMemory) -> &AtomicU64 {
+        match memory {
+            KvMemory::Device => &self.live_vram_bytes,
+            KvMemory::Host => &self.live_host_bytes,
+        }
+    }
+
+    /// Reserve `bytes` of live occupancy in `memory` BEFORE allocating them, atomically against
+    /// every other claim, so racing allocations cannot both pass a limit one of them would break.
+    /// `cap` is `None` for no limit. A refusal returns the bytes held at that moment and reserves
+    /// nothing; the reservation is returned when the claim drops unless it is kept.
+    pub fn claim(
+        &self,
+        memory: KvMemory,
+        bytes: u64,
+        cap: Option<u64>,
+    ) -> Result<KvClaim<'_>, u64> {
+        let live = self.live(memory);
+        let mut held = live.load(Ordering::Acquire);
+        loop {
+            let next = held.saturating_add(bytes);
+            if cap.is_some_and(|cap| next > cap) {
+                return Err(held);
+            }
+            match live.compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Ok(KvClaim {
+                        tally: self,
+                        memory,
+                        bytes,
+                    });
+                }
+                Err(now) => held = now,
+            }
+        }
+    }
+
+    /// Return bytes a kept claim reserved, when the buffer that held them is gone.
+    pub fn release(&self, memory: KvMemory, bytes: u64) {
+        let clamped = self.release_clamped(memory, bytes);
+        debug_assert!(!clamped, "released more KV bytes than were held");
+    }
+
+    /// Subtract without wrapping; `true` when `bytes` exceeded what was held and the tally clamped to zero.
+    fn release_clamped(&self, memory: KvMemory, bytes: u64) -> bool {
+        let before = self
+            .live(memory)
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            })
+            .unwrap_or_else(|held| held);
+        before < bytes
     }
 
     /// The diagnostic CUMULATIVE-cap gate: may `bytes` more still be placed in VRAM?
@@ -577,9 +677,53 @@ mod tests {
                 vram_bytes: 100,
                 host_bufs: 1,
                 host_bytes: 1 << 40,
+                ..Default::default()
             }
         );
         assert_eq!(c.total_bufs(), 3);
+    }
+
+    /// A claim holds its bytes until released, a refusal holds nothing, and a claim dropped
+    /// unkept gives its bytes back, so a tier fills, frees and fills again.
+    #[test]
+    fn claims_gate_live_bytes_and_release_them() {
+        let t = SpillTally::default();
+        let first = t.claim(KvMemory::Host, 4, Some(8)).unwrap();
+        let (memory, bytes) = t.claim(KvMemory::Host, 4, Some(8)).unwrap().keep();
+        assert_eq!(t.counts().live_host_bytes, 8);
+        assert_eq!(t.claim(KvMemory::Host, 1, Some(8)).unwrap_err(), 8);
+        assert_eq!(t.counts().live_host_bytes, 8, "a refusal reserves nothing");
+        assert!(t.claim(KvMemory::Device, 100, Some(8)).is_err());
+        assert_eq!(t.counts().live_vram_bytes, 0, "the tiers count apart");
+
+        drop(first);
+        t.release(memory, bytes);
+        assert_eq!(t.counts().live_host_bytes, 0);
+        drop(
+            t.claim(KvMemory::Host, 8, Some(8))
+                .expect("freed bytes are reusable"),
+        );
+        assert_eq!(t.counts().live_host_bytes, 0);
+        assert!(t.claim(KvMemory::Host, u64::MAX, None).is_ok());
+    }
+
+    /// Threads racing for a tier never hold more than its size between them.
+    #[test]
+    fn concurrent_claims_never_pass_the_cap() {
+        let t = SpillTally::default();
+        let kept = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    if let Ok(claim) = t.claim(KvMemory::Device, 4, Some(8)) {
+                        claim.keep();
+                        kept.fetch_add(4, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(kept.into_inner(), 8);
+        assert_eq!(t.counts().live_vram_bytes, 8);
     }
 
     /// The cap gate's `resident + bytes` must SATURATE. A wrapped sum is a small sum, and a small
@@ -602,6 +746,17 @@ mod tests {
         let u = SpillTally::default();
         u.record_vram(u64::MAX - 10);
         assert!(u.admits(Some(u64::MAX), 10));
+    }
+
+    /// A release larger than the held bytes clamps to zero instead of wrapping past every cap.
+    #[test]
+    fn release_larger_than_held_clamps_to_zero() {
+        let t = SpillTally::default();
+        let claim = t.claim(KvMemory::Host, 10, Some(100)).unwrap();
+        let (memory, _) = claim.keep();
+        assert!(t.release_clamped(memory, 25));
+        assert_eq!(t.counts().live_host_bytes, 0);
+        assert!(t.claim(KvMemory::Host, 100, Some(100)).is_ok());
     }
 
     /// The banner, byte-for-byte against the pre-hoist `eprintln!` (Vulkan KV).
@@ -639,6 +794,7 @@ mod tests {
             vram_bytes: 3 << 30,
             host_bufs: 0,
             host_bytes: 0,
+            ..Default::default()
         };
         assert_eq!(
             spill_report_line(all_resident, &VK_KV, vk_fmt).unwrap(),
@@ -651,6 +807,7 @@ mod tests {
             vram_bytes: 3 << 30,
             host_bufs: 16,
             host_bytes: 1 << 30,
+            ..Default::default()
         };
         assert_eq!(
             spill_report_line(split, &VK_KV, vk_fmt).unwrap(),

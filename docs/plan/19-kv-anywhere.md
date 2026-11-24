@@ -1,7 +1,8 @@
 # Plan 19: KV cache as a store, anywhere
 
 Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 done (the `vram` tier: config and sizing,
-then its behaviour under pressure); P3–P4 scoped. 18 unified where idle blocks
+then its behaviour under pressure); P3 built and green on the CPU gate, Vulkan checks and
+measurements still owed to hardware; P4 scoped. 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
 the default rather than a hard-coded device buffer.
 
@@ -84,7 +85,9 @@ the window's bytes and what is left, not silently clamped; every open path runs 
 address directly (`alloc_kv_host`, `INFR_KV_OVERFLOW`'s existing path), which is the `-nkvo`
 analogue and the thing to reach for when a model leaves no room for a window. `kv.overflow` and
 `kv.overflow_vram_mb` become the legacy spelling of a `vram` tier with a `size` followed by a `host`
-tier, and keep working through a config migration.
+tier, and keep working through a config migration. A tier is a cap on logical bytes, and the
+allocator rounds each buffer up, so a host tier sized to the exact logical sum can still fail on
+that rounding: leave a few MiB.
 
 ## Phases
 
@@ -101,11 +104,36 @@ tier, and keep working through a config migration.
   store restore promotes back into a live slot with equal rows; an eviction leaves rows a live slot
   shares intact and the cap counts retained pages only; a vram tier that leaves less than one window
   is refused at open; and the implicit tier allocates what today's default path allocates.
-- **P3** (scoped) the `host` tier: `backend = "host"` as first entry, host-visible mapped buffers
-  with unchanged kernels, working with paging (today paging and `kv.overflow` are mutually
-  exclusive), and the legacy `overflow` keys migrating onto it. Gate: output bit-identical to a vram
-  tier; a whole host tier stores and resumes without a device allocation for KV. Measure: decode
-  tokens/s at 2k and 8k on the RX 580 and the integrated GPU, next to the table above.
+- **P3** (built; hardware checks owed) the `host` tier: `backend = "host"` as first entry, or after a
+  leading `vram` entry, host-visible mapped buffers with unchanged kernels, working with paging
+  (the old paging/`kv.overflow` exclusion was only the pool-window rule), and the legacy `overflow`
+  keys resolving onto it. Gate: output bit-identical to a vram tier; a whole host tier stores and
+  resumes without a device allocation for KV. Measure: decode tokens/s at 2k and 8k on the RX 580
+  and the integrated GPU, next to the table above.
+  - *Done, tested on CPU:* `KvBackend::Host` with entry-naming validation; `KvCfg::residency`
+    resolving the list and the legacy keys to one plan (`vram_reserve`, `KvSpill { device_cap,
+    host_cap }`); the fit counts only the device part and bounds the window by `vram + host`;
+    `refuse_host_tier` at open; the pool cap bounded by the tier; placement sweeps (dense
+    resident, streaming, MoE expert budget) price device KV only; the storage chain skips both
+    addressable entries; Vulkan places `KvCache` buffers by the plan, tallies them
+    (`Backend::kv_placement`) and refuses a buffer past the host `size`. The CPU gate shows equal
+    tokens, rows and KV bytes against a `vram` tier, a whole host tier parking and resuming
+    through its chain, and legacy-versus-list resolution.
+  - *Ran on the RX 580 (RADV):* `crates/infr-vulkan/tests/kv_host_tier.rs` (nine `#[ignore]`
+    tests: no device KV for a host-first tier, the `vram` + `host` split, the size refusal, legacy
+    placement equal to the list's, no tally without a plan, live occupancy released on drop and
+    on a failed init, whole-buffer placement past the device remainder, racing allocations held
+    to each tier's size). A tier's `size` limits LIVE bytes (claimed before the allocation,
+    released when the buffer drops); the lifetime tally only feeds the report line. The fit and
+    the open-time refusal walk the buffers in allocation order, and the pool cap leaves room
+    for each slot's page table and private layers.
+  - *Needs hardware:* a host-first `kv.paged` session on a real model
+    (pool pages host-side, the page-table buffers included); output bit-identical to a `vram` tier
+    on a GGUF; the 2k and 8k decode measurements.
+  - *Semantics to know:* a `vram` entry alone stays P2's retention reservation, but before a `host`
+    entry it is the device part of the live windows. The legacy flag keeps its old sizing (full
+    cache priced in VRAM, the spill as the clamp ladder's last rung, paged window per slot): only
+    an explicit `host` entry has a host size, so only it gets the exact fit.
 - **P4** (scoped) the remote-primary experiment: `[[kv.tiers]]` with `redis` (or `redb`) as the
   first entry, host-resident slot buffers, and the live window synchronised with that store each
   step — the configuration that proves placement is a property of the list rather than of the

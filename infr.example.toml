@@ -111,6 +111,9 @@ ring = true
 #   backend = "vram"   first entry only: `size` bytes of device memory held beside the
 #                      live windows for retained idle pages (slots divide what is
 #                      left; a tier leaving less than one window is refused).
+#   backend = "host"   first entry, or right after a leading vram entry: `size` bytes
+#                      of system RAM the kernels read the live KV from (the vram
+#                      entry before it is then the device-resident part).
 #   backend = "redb"   `size` required; `path` keeps it in a file (survives a
 #                      restart), unset keeps the same database in memory (faster).
 #   backend = "redis"  `url` required (`redis://`, `rediss://`, `valkey://`); the
@@ -135,10 +138,12 @@ ring = true
 inline_decode = false
 coopmat_bda = false
 
-# Spill the KV cache to host RAM when VRAM runs out (VRAM-first). Note the
-# grammar of the env twin: INFR_KV_OVERFLOW="" and ="0" are OFF.
+# DEPRECATED (use a `host` entry in [[kv.tiers]]): spill the KV cache to host RAM
+# when VRAM runs out (VRAM-first). Note the grammar of the env twin:
+# INFR_KV_OVERFLOW="" and ="0" are OFF.
 overflow = false
-# VRAM ceiling for the KV cache, in MiB. Default: unset = the fit calculation.
+# DEPRECATED (a `vram` entry before the `host` one): VRAM ceiling for the KV cache,
+# in MiB. Default: unset = the fit calculation.
 # overflow_vram_mb = 512
 # Headroom left for everything else, in MiB. Default: max(12% of VRAM, 2 GiB).
 # overflow_reserve_mb = 2048

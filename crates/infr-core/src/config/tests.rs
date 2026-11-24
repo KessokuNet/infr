@@ -1799,7 +1799,10 @@ fn a_kv_tier_without_a_backend_is_a_load_error() {
     let merged = Config::load_from_layers(&[partial]);
     assert_eq!(
         super::check_kv_tier_backends(&merged.kv.tiers),
-        Err((0, "`backend` is required (vram, redb or redis)".to_string()))
+        Err((
+            0,
+            "`backend` is required (vram, host, redb or redis)".to_string()
+        ))
     );
     assert!(super::kv_vram_tier_bytes(&merged.kv.tiers)
         .expect_err("consumers refuse it too")
@@ -1886,4 +1889,168 @@ fn a_malformed_vram_tier_is_refused_by_entry() {
         let err = super::kv_vram_tier_bytes(&tiers).expect_err(why);
         assert!(err.contains(entry) && err.contains(why), "{err}");
     }
+}
+
+fn host(size: Option<crate::SizeSpec>) -> super::KvTier {
+    super::KvTier {
+        backend: Some(super::KvBackend::Host),
+        size,
+        ..super::KvTier::default()
+    }
+}
+
+fn bytes(n: u64) -> Option<crate::SizeSpec> {
+    Some(crate::SizeSpec::Bytes(n))
+}
+
+/// A `host` entry parses from a config file and sizes the second addressable tier; the storage
+/// chain starts after it.
+#[test]
+fn a_host_tier_parses_and_reports_its_bytes() {
+    let (partial, _) = file::parse_str(
+        "[[kv.tiers]]\nbackend = \"vram\"\nsize = \"1g\"\n\n[[kv.tiers]]\nbackend = \"host\"\n\
+         size = \"4g\"\n\n[[kv.tiers]]\nbackend = \"redb\"\n",
+        Path::new("infr.toml"),
+    )
+    .expect("a host tier must load");
+    let tiers = Config::load_from_layers(&[partial]).kv.tiers;
+    assert!(tiers[1].is_host() && tiers[1].is_addressable() && !tiers[2].is_addressable());
+    assert_eq!(super::kv_vram_tier_bytes(&tiers), Ok(Some(1 << 30)));
+    assert_eq!(super::kv_host_tier_bytes(&tiers), Ok(Some(4 << 30)));
+    assert_eq!(tiers[1].describe(), format!("host ({} bytes)", 4u64 << 30));
+    assert_eq!(super::kv_host_tier_bytes(&[redb()]), Ok(None));
+}
+
+/// `host` is valid first or directly after a leading `vram`; every other way to write one is
+/// refused with the entry named.
+#[test]
+fn a_malformed_host_tier_is_refused_by_entry() {
+    use crate::SizeSpec::Percent;
+    let mb = bytes(1 << 20);
+    for ok in [
+        vec![host(mb)],
+        vec![vram(mb), host(mb)],
+        vec![host(mb), redb()],
+        vec![vram(mb), host(mb), redb()],
+    ] {
+        assert!(super::kv_host_tier_bytes(&ok).is_ok(), "{ok:?}");
+    }
+    let cases = [
+        (vec![redb(), host(mb)], "kv.tiers[1] (host)", "first entry"),
+        (
+            vec![vram(mb), redb(), host(mb)],
+            "kv.tiers[2] (host)",
+            "after a leading vram",
+        ),
+        (
+            vec![host(mb), vram(mb)],
+            "kv.tiers[1] (vram)",
+            "first entry",
+        ),
+        (
+            vec![host(mb), host(mb)],
+            "kv.tiers[1] (host)",
+            "first entry",
+        ),
+        (vec![host(None)], "kv.tiers[0] (host)", "needs a byte"),
+        (vec![host(bytes(0))], "kv.tiers[0] (host)", "more than zero"),
+        (
+            vec![vram(mb), host(Some(Percent(50.0)))],
+            "kv.tiers[1] (host)",
+            "not a share",
+        ),
+        (
+            vec![super::KvTier {
+                path: Some("/tmp/kv".into()),
+                ..host(mb)
+            }],
+            "kv.tiers[0] (host)",
+            "`path` or `url`",
+        ),
+        (
+            vec![super::KvTier {
+                url: Some("redis://x".into()),
+                ..host(mb)
+            }],
+            "kv.tiers[0] (host)",
+            "`path` or `url`",
+        ),
+    ];
+    for (tiers, entry, why) in cases {
+        let err = super::kv_host_tier_bytes(&tiers).expect_err(why);
+        assert!(err.contains(entry) && err.contains(why), "{err}");
+        let mut kv = Config::default().kv;
+        kv.tiers = tiers;
+        assert_eq!(kv.residency(), Err(err));
+    }
+}
+
+fn residency_of(tiers: Vec<super::KvTier>, overflow: Option<Option<u64>>) -> super::KvResidency {
+    let mut kv = Config::default().kv;
+    kv.tiers = tiers;
+    if let Some(cap_mb) = overflow {
+        kv.overflow = true;
+        kv.overflow_vram_mb = cap_mb;
+    }
+    kv.residency().expect("valid")
+}
+
+/// The legacy `kv.overflow` keys resolve to the same plan as the tier list that spells them: a
+/// capped overflow is a `vram` entry of that size before a `host` one, a whole-host cap of zero is
+/// a bare `host` entry, and an uncapped one leaves the device part open.
+#[test]
+fn the_legacy_overflow_keys_resolve_like_the_tier_list() {
+    use super::{KvResidency, KvSpill};
+    const MIB: u64 = 1 << 20;
+    let host_size = 64 << 30;
+
+    let legacy = residency_of(Vec::new(), Some(Some(512)));
+    let listed = residency_of(vec![vram(bytes(512 * MIB)), host(bytes(host_size))], None);
+    let device_part = |r: KvResidency| r.spill.map(|s| s.device_cap);
+    assert_eq!(device_part(legacy), Some(Some(512 * MIB)));
+    assert_eq!(device_part(legacy), device_part(listed));
+    assert_eq!(legacy.vram_reserve, listed.vram_reserve);
+
+    let legacy_whole = residency_of(Vec::new(), Some(Some(0)));
+    let listed_whole = residency_of(vec![host(bytes(host_size))], None);
+    assert_eq!(device_part(legacy_whole), Some(Some(0)));
+    assert_eq!(device_part(legacy_whole), device_part(listed_whole));
+
+    let uncapped = residency_of(Vec::new(), Some(None));
+    assert_eq!(
+        uncapped.spill,
+        Some(KvSpill {
+            device_cap: None,
+            host_cap: None
+        })
+    );
+    assert_eq!(residency_of(Vec::new(), None), KvResidency::default());
+}
+
+/// A `vram` entry alone stays a reservation beside the live windows, also under the legacy flag
+/// (which only adds the spill); before a `host` entry it is the device part instead, and a listed
+/// `host` entry outranks the legacy keys.
+#[test]
+fn a_vram_entry_reserves_alone_and_is_the_device_part_before_a_host_entry() {
+    use super::KvSpill;
+    let mb = bytes(1 << 20);
+    let alone = residency_of(vec![vram(mb)], None);
+    assert_eq!((alone.vram_reserve, alone.spill), (1 << 20, None));
+
+    let legacy = residency_of(vec![vram(mb)], Some(None));
+    assert_eq!(legacy.vram_reserve, 1 << 20);
+    assert_eq!(legacy.spill.and_then(|s| s.host_cap), None);
+
+    let split = residency_of(vec![vram(mb), host(bytes(4 << 20))], Some(Some(7)));
+    assert_eq!(split.vram_reserve, 0);
+    assert_eq!(
+        split.spill,
+        Some(KvSpill {
+            device_cap: Some(1 << 20),
+            host_cap: Some(4 << 20)
+        })
+    );
+    assert!(split.spill.unwrap().prices_device_kv());
+    assert_eq!(split.spill.unwrap().capacity(), Some(5 << 20));
+    assert!(!legacy.spill.unwrap().prices_device_kv());
 }

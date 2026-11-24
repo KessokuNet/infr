@@ -1584,11 +1584,24 @@ pub(crate) fn generate_dense_backend_bound(
         if let Some(pages) = pool_pages.as_mut() {
             let page_bytes = crate::seam::kv_page_bytes(c, k_fmt, v_fmt);
             let windows = (*pages as u64).saturating_mul(page_bytes);
-            if let Some(from_cap) = crate::seam::kv_pool_cap_bytes(ec, windows)?
+            let (ring, ubatch, fmts) = (kv_ring, crate::seam::ubatch_rows(ec), (k_fmt, v_fmt));
+            let slot_bytes =
+                crate::seam::kv_paged_slot_bytes(c, want_ctx, ring, ubatch, fmts, slot_copies);
+            if let Some(from_cap) = crate::seam::kv_pool_cap_bytes(ec, windows, slot_bytes)?
                 .and_then(|cap| crate::seam::pool_pages_for_cap(cap, page_bytes))
             {
                 *pages = from_cap;
             }
+            *pages = crate::seam::kv_pool_pages_placing(
+                c,
+                ec,
+                want_ctx,
+                ring,
+                ubatch,
+                fmts,
+                slot_copies,
+                *pages,
+            );
         }
         let pool = match pool_pages.filter(|_| caps.kv_paging) {
             Some(pages) => match crate::seam::KvPool::new(be, c, want_ctx, k_fmt, v_fmt, pages) {
@@ -1617,7 +1630,16 @@ pub(crate) fn generate_dense_backend_bound(
         // pool was sized to replace: re-clamp against that shape instead of keeping the paged
         // window.
         let want_ctx = if pool.is_none() && paged_blocks.is_some() {
-            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt, slot_copies)?
+            let linear = crate::seam::linear_kv_config(ec);
+            crate::seam::reclamp_ctx_to_live_room(
+                be,
+                c,
+                &linear,
+                want_ctx,
+                k_fmt,
+                v_fmt,
+                slot_copies,
+            )?
         } else {
             want_ctx
         };
@@ -9144,6 +9166,152 @@ mod tests {
         fn sync(&self) -> infr_core::error::Result<()> {
             self.cpu.sync()
         }
+    }
+
+    /// The CPU backend counting the bytes it is asked to place as KV cache.
+    struct KvSpy {
+        cpu: infr_cpu::CpuBackend,
+        kv_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KvSpy {
+        fn count(&self, bytes: usize, usage: infr_core::backend::BufferUsage) {
+            if usage == infr_core::backend::BufferUsage::KvCache {
+                self.kv_bytes
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl infr_core::backend::Backend for KvSpy {
+        fn name(&self) -> &str {
+            self.cpu.name()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            self.cpu.capabilities()
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.count(bytes, usage);
+            self.cpu.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.count(bytes, usage);
+            self.cpu.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.download(src, dst)
+        }
+        fn copy_buffer(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &dyn infr_core::backend::Buffer,
+            bytes: usize,
+        ) -> infr_core::error::Result<()> {
+            self.cpu.copy_buffer(src, dst, bytes)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.cpu.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.cpu.execute(plan, bindings)
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.cpu.sync()
+        }
+    }
+
+    /// A `host` tier asks the backend for the same KV buffers a `vram` tier does, all of which fit
+    /// inside the tier's `size`, and the unchanged kernels produce the same tokens and the same
+    /// cache rows. The CPU cache is host memory already, so this pins the sizing and the rows; that
+    /// no device KV is allocated is the Vulkan counter test's to show.
+    #[test]
+    fn a_host_tier_runs_the_same_tokens_and_rows_as_a_vram_tier() {
+        const TIER: u64 = 64 << 20;
+        let (g, cfg) = open_synthetic("kv-host-tier", &llama_gguf("llama", None));
+        let tier = |backend| infr_core::config::KvTier {
+            backend: Some(backend),
+            size: Some(infr_core::SizeSpec::Bytes(TIER)),
+            ..Default::default()
+        };
+        let run = |backend| {
+            let be = KvSpy {
+                cpu: infr_cpu::CpuBackend::new(),
+                kv_bytes: 0.into(),
+            };
+            let mut ec = EngineConfig::default();
+            ec.kv.tiers = vec![tier(backend)];
+            let embd = std::sync::OnceLock::new();
+            let mut slot = None;
+            let (ids, _) = super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be.cpu),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                &[1, 2, 3, 4, 5],
+                6,
+                |_| {},
+                &mut slot,
+                64,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // paged_blocks
+                1,    // slot_copies
+            )
+            .expect("synthetic generation");
+            let slot = slot.expect("slot initialized");
+            let rows: Vec<Vec<u8>> = slot
+                .kbufs
+                .iter()
+                .chain(&slot.vbufs)
+                .map(|b| {
+                    let mut bytes = vec![0u8; b.len_bytes()];
+                    infr_core::backend::Backend::download(&be, &**b, &mut bytes).expect("download");
+                    bytes
+                })
+                .collect();
+            (ids, rows, be.kv_bytes.into_inner())
+        };
+        let (vram_ids, vram_rows, vram_bytes) = run(infr_core::config::KvBackend::Vram);
+        let (host_ids, host_rows, host_bytes) = run(infr_core::config::KvBackend::Host);
+        assert_eq!(host_ids, vram_ids);
+        assert_eq!(host_rows, vram_rows);
+        assert!(vram_rows.iter().any(|r| r.iter().any(|&b| b != 0)));
+        assert_eq!(host_bytes, vram_bytes);
+        assert!(0 < host_bytes && host_bytes as u64 <= TIER);
     }
 
     /// The multi-device one-shot sizes its prefill chunk from the backend it runs on, not from the

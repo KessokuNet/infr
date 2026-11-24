@@ -230,8 +230,9 @@ On `serve` these are the server defaults — a per-request OpenAI
 
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
-host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
-spills KV to system RAM when VRAM runs out. `[[kv.tiers]]` turns on the
+host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`; the
+first two are deprecated in favor of a `host` tier below) that spills KV to
+system RAM when VRAM runs out. `[[kv.tiers]]` turns on the
 cross-conversation prefix store (reverse PagedAttention, see
 `docs/perf/kv-prefix.md`) and says where it keeps its blocks: the K/V rows of a
 prompt stay there after its slot is recycled, and a later request sharing that
@@ -260,7 +261,7 @@ anonymous memory, which is faster and gone with the process. A redb tier with
 no `size` keeps 1 GiB. A redis tier is shared, so several servers can point at
 it; its budget is the server's `maxmemory`, which is why it goes last.
 
-Every entry has to name its `backend` (`vram`, `redb`, `redis` or `valkey`): an
+Every entry has to name its `backend` (`vram`, `host`, `redb`, `redis` or `valkey`): an
 entry with only a `path` or a `size`, and any other name, is an error when the
 config loads rather than a guessed `redb` tier. A `vram` entry is device
 memory, valid only as the first entry, with a byte `size` and no `path` or
@@ -270,6 +271,40 @@ left after it, so the context window shrinks by its `size`, and a paged pool
 that size. A `vram` tier that leaves less than one window of KV (or less than an
 explicit `--ctx`) on a device that would otherwise serve it is refused at open,
 naming the tier. Without one, nothing changes.
+
+A `host` entry is the same idea in system RAM, for a model that leaves no
+room for a window: the live slot's KV buffers are host-allocated and the
+unchanged kernels read them over PCIe. It takes a byte `size` and no `path` or
+`url`, and is valid as the first entry or directly after a leading `vram`
+entry (vram window first, host spill second, storage after):
+
+```toml
+[[kv.tiers]]
+backend = "vram"            # optional: the device-resident part of the live KV
+size = "1g"
+
+[[kv.tiers]]
+backend = "host"            # the rest of the live KV, in system RAM
+size = "8g"
+```
+
+With a `host` entry the context fit counts only the device part (none, when it
+leads) against VRAM, the activation reserve still counts, and the window is
+bound by `vram + host` bytes; a tier that cannot hold one window (or an
+explicit `--ctx`) is refused at open, naming it, and a pool buffer past the
+tier's `size` fails its allocation. The `vram` entry before it is that device
+part, not a retention reservation. A `paged` pool allocates its pages
+host-side, bounded by the same bytes. Decode reads every row of the window each
+step, so expect PCIe bandwidth to set the pace (`docs/plan/19-kv-anywhere.md`).
+
+`overflow` and `overflow_vram_mb` are deprecated spellings of this: a `vram`
+entry of `overflow_vram_mb` followed by an unbounded `host` entry (a bare `host`
+entry when it is `0`). They keep today's behavior (the fit still prices the whole
+cache in VRAM and the spill is the clamp ladder's last rung), and a `host`
+entry in the list takes precedence over them. `INFR_KV_OVERFLOW` and
+`INFR_KV_OVERFLOW_VRAM_MB` remain their env twins. `overflow_vram_mb` now caps
+live device KV bytes rather than lifetime bytes (identical until KV buffers are
+freed and reallocated).
 
 Sizes take the shared size grammar (`1g`, `512m`). The config file is the only
 place a tier list is written, because the store holds prompt-derived data and
