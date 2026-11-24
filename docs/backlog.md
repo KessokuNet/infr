@@ -8747,3 +8747,31 @@ The assertions that can fail: a restore that errors after adopting a resident's 
 reset rather than claiming a prefix it lacks; an unreadable extent drops its index entry and the next
 walk stops there; a lying `contains` never yields a restore that reports more tokens than it
 uploaded. Put the wrapper beside `BudgetedStore` in `crates/infr-llama/src/seam/kv_tier.rs`.
+
+### B245 — a captured ring block cannot seed a ring at a lower boundary, so the store never hits on SWA models (2026-11-25)
+
+**Tag:** kv · store · swa · restore · **Plan:** 19
+
+On gemma-4-E4B (35 of 42 layers are 1024-row rings) the block store captures correctly — the
+journal shows `saved a prefix rows=5718 blocks=45`, and a restart loads `blocks=50` back out of
+Valkey — but **no restore ever lands**: every attempt logs `restore matched prompt=5671 matched=5632
+blocks=44` and then `the stored blocks miss the window layer=0 need=4608..5632`. Across a whole
+session there are zero `restored a stored prefix` lines.
+
+The arithmetic is the bug. The previous turn ended at `written_end = 5718`, so at capture time layer
+0's ring held rows `4694..5718` and that is all its blocks carry. The next prompt matches a prefix of
+5632 tokens, and seeding the ring at that block boundary needs rows `4608..5632` — the first 86 rows
+were recycled before the capture ran. The refusal is correct; storing block boundaries below the
+capture point is what is wrong, because a ring's rows are only meaningful at one position.
+
+Two candidate fixes, in order of cost. **Clamp the restore**: a ring layer can only be seeded at the
+boundary the rows cover, so restore `n` down to `min(matched, written_at_capture)` for such a model
+(the index entry would need the capture position, which the block metadata can carry) — that makes a
+continuing conversation (`prompt + reply`, matching the previous end) hit, and leaves shorter prompts
+a miss rather than a wasted upload. **Or capture per boundary**: keep the ring tail beside the block
+that ends at `written_end` and refuse to offer boundaries below it, which is the same rule stated in
+the store instead of the restore.
+
+The test that can fail: a synthetic SWA model with a small ring, capture at a `written_end` past a
+block boundary, then restore a prompt whose match ends below that `written_end` — assert the restore
+uploads nothing and reports a miss, and that restoring at the captured end uploads and resumes.
