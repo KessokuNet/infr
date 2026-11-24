@@ -1,7 +1,7 @@
 # Plan 19: KV cache as a store, anywhere
 
-Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 slice A done (the `vram` tier in config
-and sizing); the rest of P2 and P3–P4 scoped. 18 unified where idle blocks
+Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 done (the `vram` tier: config and sizing,
+then its behaviour under pressure); P3–P4 scoped. 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
 the default rather than a hard-coded device buffer.
 
@@ -69,8 +69,13 @@ its rows evicted underneath the kernels, so live windows are never in the tier's
 only retained idle pages. Its `size` is what `kv_fit_ctx` subtracts before dividing the remainder
 among slots, and the paged pool's total is the bytes the slots' windows need plus the tier's `size`,
 so a full window still leaves the tier's bytes for retention; the retained pages are capped at that
-size. A demote is `Backend::copy_buffer_at` between two device buffers, the primitive the recurrent
-snapshot and the continuation seed already use, so `KvRows` never appears in that path. A
+size. Retention itself copies nothing: the slot's page map moves into the resident entry. What a
+retention does write is the storage tier below: `retain` captures blocks that tier lacks before the
+pages can be evicted, so a cap eviction or a pool-pressure spill only drops the device copy, and a
+later restore promotes the rows from the store into a live slot. A device-to-device demote
+(`Backend::copy_buffer_at`, as the recurrent snapshot and the continuation seed use) exists only
+once two addressable tiers do (P3); with one `vram` tier over a host-backed store a demote
+necessarily crosses to host. A
 configuration whose tier alone removes the requested window (an explicit `--ctx`, else one minimum
 window, priced at the best KV format the session could pick) is refused at open with the tier size,
 the window's bytes and what is left, not silently clamped; every open path runs the same check.
@@ -88,12 +93,14 @@ tier, and keep working through a config migration.
   entry captured to the store before its pages go back. Gate met: a paged resume after a park
   performs no upload (asserted with counters), produces identical rows, and the GPU park test
   resumes with no store restore.
-- **P2** (scoped) the `vram` tier: `backend = "vram"` in `[[kv.tiers]]`, implicit as the default when
-  the list is absent, a budget covering pinned live windows plus idle extents with LRU eviction,
-  device→device transfers, and `kv_fit_ctx` priced from the tier `size`. Gate: demote and promote
-  never stage through the host, a vram tier still demotes into a `redb` tier, a vram tier that
-  leaves less than one window is refused at open, and the implicit tier allocates what today's default path
-  allocates.
+- **P2** (done) the `vram` tier: `backend = "vram"` in `[[kv.tiers]]`, implicit as the default when
+  the list is absent, a reservation beside the live windows (never in the LRU) holding retained idle
+  pages with LRU eviction, and `kv_fit_ctx` priced from the tier `size`. Gate, met: the resident-page
+  retention path performs no device-to-device copy, and its demote into a storage tier crosses to
+  host (the "never stage through the host" clause applies once two addressable tiers exist, P3); a vram tier demotes into a `redb` tier and a
+  store restore promotes back into a live slot with equal rows; an eviction leaves rows a live slot
+  shares intact and the cap counts retained pages only; a vram tier that leaves less than one window
+  is refused at open; and the implicit tier allocates what today's default path allocates.
 - **P3** (scoped) the `host` tier: `backend = "host"` as first entry, host-visible mapped buffers
   with unchanged kernels, working with paging (today paging and `kv.overflow` are mutually
   exclusive), and the legacy `overflow` keys migrating onto it. Gate: output bit-identical to a vram

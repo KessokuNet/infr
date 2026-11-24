@@ -8732,3 +8732,18 @@ builder beside `qwen35_gguf` in `seam/runner.rs`'s test module — `gemma4.atten
 set, per-layer tensor lists that omit k/v/k-norm on the shared layers — assert `Config::from_gguf` and
 the seam build succeed, and that a shared layer's attention reads the source layer's cache rows rather
 than its own. Worth folding `n_embd_per_layer` (the PLE gather) into the same builder.
+
+### B244 — the KV store's restore error paths have no fault-injecting store (2026-11-24)
+
+**Tag:** llama · seam · kv · tests · **Plan:** 19
+
+`BlockCache::restore` treats a damaged or missing extent as a cache miss, and the retained-page
+demote path trusts `contains` and `get` to agree, but the tests only use real stores that behave. A
+`KvStore` wrapper that injects faults would cover what they cannot: a short read (fewer rows than
+`get` was asked for), an error on the nth `get`, a `contains` that says yes where `get` says no, and
+a `put` or `set_meta` that fails mid-capture.
+
+The assertions that can fail: a restore that errors after adopting a resident's pages leaves the slot
+reset rather than claiming a prefix it lacks; an unreadable extent drops its index entry and the next
+walk stops there; a lying `contains` never yields a restore that reports more tokens than it
+uploaded. Put the wrapper beside `BudgetedStore` in `crates/infr-llama/src/seam/kv_tier.rs`.

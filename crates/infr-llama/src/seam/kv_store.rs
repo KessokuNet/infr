@@ -260,6 +260,8 @@ pub(crate) struct BlockCache<S: KvStore> {
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
     v_fmt: DType,
+    /// The formats the store's blob already records, so a capture rewrites it only on a change.
+    formats_saved: Option<(DType, DType)>,
     /// Parked page maps, held in the pool until a restore adopts them or pressure spills them.
     resident: Vec<Resident>,
     /// Most pages the residents may hold together: the `vram` tier's size. `None` leaves them
@@ -288,6 +290,7 @@ impl<S: KvStore> BlockCache<S> {
             enabled,
             k_fmt: DType::F16,
             v_fmt: DType::F16,
+            formats_saved: None,
             resident: Vec::new(),
             resident_cap: None,
             tick: 0,
@@ -321,6 +324,7 @@ impl<S: KvStore> BlockCache<S> {
         };
         self.k_fmt = k_fmt;
         self.v_fmt = v_fmt;
+        self.formats_saved = Some((k_fmt, v_fmt));
         let ids = match self.store.extents() {
             Ok(ids) => ids,
             Err(e) => {
@@ -621,20 +625,20 @@ impl<S: KvStore> BlockCache<S> {
             .max_by_key(|&(_, pages)| pages)
     }
 
-    /// Keep a parked slot's pages in the pool instead of copying them out: its map moves into a
+    /// Keep a parked slot's pages in the pool instead of copying them device to device: its map moves into a
     /// resident entry over the whole pages its tokens fill, and the slot is left with none.
     /// `false` when the slot cannot be retained — linear, a layer outside the pool (a window
     /// ring, a recurrent state, a compressed cache), or under one page of tokens — so the caller
     /// resets it as before.
-    pub(crate) fn retain(&mut self, cfg: &Config, kv: &mut SeamKv) -> bool {
-        let Some(p) = kv.paged.as_mut() else {
+    pub(crate) fn retain(&mut self, be: &dyn Backend, cfg: &Config, kv: &mut SeamKv) -> bool {
+        let Some(held) = kv.paged.as_ref().map(|p| p.map.len()) else {
             return false;
         };
         // A page holds every pooled layer's rows; a layer outside the pool would come back empty.
         if cfg.has_recurrent_state() || !(0..cfg.n_layer).all(|l| super::paged_layer(cfg, l)) {
             return false;
         }
-        let pages = (kv.cached.len().min(kv.max_ctx) / PAGE_ROWS).min(p.map.len());
+        let pages = (kv.cached.len().min(kv.max_ctx) / PAGE_ROWS).min(held);
         // Past the retention budget on its own, these pages would only evict themselves.
         if pages == 0 || self.resident_cap.is_some_and(|cap| pages > cap) {
             return false;
@@ -643,6 +647,11 @@ impl<S: KvStore> BlockCache<S> {
             self.clear();
             self.k_fmt = kv.k_fmt;
             self.v_fmt = kv.v_fmt;
+        }
+        // Demote before the pages can be freed: blocks the storage tier lacks are written down now,
+        // so an eviction or spill later only drops the device copy.
+        if let Err(e) = self.capture(be, cfg, kv, pages * PAGE_ROWS) {
+            tracing::warn!(error = %e, "kv store: capturing retained pages failed");
         }
         let tokens = kv.cached[..pages * PAGE_ROWS].to_vec();
         let mut blocks = Vec::with_capacity(pages * BLOCKS_PER_PAGE);
@@ -667,7 +676,7 @@ impl<S: KvStore> BlockCache<S> {
             }
             blocks.push(id);
         }
-        let mut map = p.take_map();
+        let mut map = kv.paged.as_mut().expect("checked above").take_map();
         map.truncate(pages);
         // A shorter resident on the same chain holds nothing this one does not.
         self.resident
@@ -793,8 +802,11 @@ impl<S: KvStore> BlockCache<S> {
             self.k_fmt = kv.k_fmt;
             self.v_fmt = kv.v_fmt;
         }
-        if let Some(blob) = encode_formats(self.k_fmt, self.v_fmt) {
-            self.store.set_meta(FORMATS_META_ID, &blob)?;
+        if self.formats_saved != Some((self.k_fmt, self.v_fmt)) {
+            if let Some(blob) = encode_formats(self.k_fmt, self.v_fmt) {
+                self.store.set_meta(FORMATS_META_ID, &blob)?;
+                self.formats_saved = Some((self.k_fmt, self.v_fmt));
+            }
         }
         let tokens = &kv.cached[..p];
         let mut id = 0u64;
@@ -1753,7 +1765,7 @@ mod tests {
         let mut s = cache();
         assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
         assert!(
-            s.retain(&cfg, &mut src),
+            s.retain(&be, &cfg, &mut src),
             "a paged slot with a whole page is kept"
         );
         src.reset();
@@ -1801,7 +1813,7 @@ mod tests {
         let mut s = Cache::new(RedbKv::open_memory(0, 1 << 20).unwrap(), false);
         let mut src = paged_slot(&be, &cfg, &pool, 1100);
         assert_eq!(s.capture(&be, &cfg, &src, 1100).unwrap(), 0);
-        assert!(s.retain(&cfg, &mut src));
+        assert!(s.retain(&be, &cfg, &mut src));
         src.reset();
         assert_eq!(pool.used_pages(), 2);
         assert_eq!(s.index.len(), 8, "two pages of four blocks each");
@@ -1833,7 +1845,7 @@ mod tests {
         let mut s = cache();
         let mut src = paged_slot(&be, &cfg, &pool, 600);
         s.capture(&be, &cfg, &src, 600).unwrap();
-        assert!(s.retain(&cfg, &mut src), "a whole page is kept");
+        assert!(s.retain(&be, &cfg, &mut src), "a whole page is kept");
         src.reset();
 
         let mut dst = SeamKv::for_test(&be, &cfg, 2048, false, 56, DType::F16).unwrap();
@@ -1900,7 +1912,7 @@ mod tests {
         let park = |s: &mut Cache, seed: u32| {
             let mut kv = paged_slot(&be, &cfg, &pool, 1024);
             kv.cached = tokens(seed, 1024);
-            assert!(s.retain(&cfg, &mut kv));
+            assert!(s.retain(&be, &cfg, &mut kv));
         };
 
         let mut open = cache();
@@ -1925,7 +1937,7 @@ mod tests {
         let mut big = paged_slot(&be, &cfg, &pool, 1024);
         big.cached = tokens(5, 1024);
         assert!(
-            !s.retain(&cfg, &mut big),
+            !s.retain(&be, &cfg, &mut big),
             "two pages cannot fit a one-page budget"
         );
         assert_eq!(
@@ -1957,11 +1969,145 @@ mod tests {
             .unwrap();
         b.cached = [trunk, tokens(9, 512)].concat();
 
-        assert!(s.retain(&cfg, &mut a));
-        assert!(s.retain(&cfg, &mut b));
+        assert!(s.retain(&be, &cfg, &mut a));
+        assert!(s.retain(&be, &cfg, &mut b));
         assert_eq!(s.resident.len(), 2, "neither branch was evicted");
         assert_eq!(s.resident_pages(), 3);
         assert_eq!(s.resident_spills, 0);
+    }
+
+    /// Park a two-page conversation `seed` into `s` through `retain` alone, which also writes the
+    /// storage tier; the production park path captures first and then retains.
+    fn park_conversation(
+        be: &dyn Backend,
+        cfg: &Config,
+        pool: &Arc<crate::seam::KvPool>,
+        s: &mut Cache,
+        seed: u32,
+    ) {
+        let mut kv = paged_slot(be, cfg, pool, 1024);
+        kv.cached = tokens(seed, 1024);
+        assert!(s.retain(be, cfg, &mut kv));
+    }
+
+    /// A fresh paged slot resumed onto conversation `seed`.
+    fn resume_conversation(
+        be: &dyn Backend,
+        cfg: &Config,
+        pool: &Arc<crate::seam::KvPool>,
+        s: &mut Cache,
+        seed: u32,
+    ) -> SeamKv {
+        let mut dst = SeamKv::for_test(be, cfg, 1024, false, 56, DType::F16).unwrap();
+        dst.attach_paged(be, cfg, pool).unwrap();
+        assert_eq!(
+            s.restore(be, cfg, &mut dst, &tokens(seed, 1024)).unwrap(),
+            1024
+        );
+        assert_eq!(dst.cached, tokens(seed, 1024));
+        assert_rows(be, cfg, &dst, 0..1024);
+        dst
+    }
+
+    /// A cap eviction demotes: the evicted conversation's blocks were written to the storage tier
+    /// before its pages went back, so it restores from there with equal rows, while the survivors
+    /// resume from their pages with no upload.
+    #[test]
+    fn a_cap_eviction_demotes_into_the_storage_tier() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
+        let mut s = cache();
+        s.set_resident_cap(Some(4));
+        for seed in [3, 4, 5] {
+            park_conversation(&be, &cfg, &pool, &mut s, seed);
+        }
+        assert_eq!((s.resident.len(), s.resident_pages()), (2, 4));
+        assert_eq!(s.resident_spills, 1);
+        assert_eq!(pool.used_pages(), 4, "the evicted pages went back");
+        let evicted = tokens(3, 1024);
+        assert!(s.resident.iter().all(|r| r.tokens != evicted));
+        let (n, ids) = s.matched(&evicted);
+        assert_eq!((n, ids.len()), (1024, 8), "the store holds the whole chain");
+        assert!(ids.iter().all(|id| s.index[id].stored));
+
+        let _from_store = resume_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert_eq!((s.restores, s.restored_tokens), (1, 1024));
+        assert_eq!(s.resident_hits, 0);
+
+        for (i, seed) in [4u32, 5].into_iter().enumerate() {
+            let _kept = resume_conversation(&be, &cfg, &pool, &mut s, seed);
+            assert_eq!(s.restores, 1, "seed {seed} uploaded nothing");
+            assert_eq!(s.restored_tokens, 1024);
+            assert_eq!(
+                (s.resident_hits, s.resident_tokens),
+                (i as u64 + 1, 1024 * (i as u64 + 1))
+            );
+        }
+    }
+
+    /// A restore that falls through to the store fills the live slot, and parking it again
+    /// re-enters the retained set: the next resume adopts its pages instead of reading the store.
+    #[test]
+    fn a_store_restore_lands_in_the_slot_and_can_be_retained_again() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
+        let mut s = cache();
+        s.set_resident_cap(Some(4));
+        for seed in [3, 4, 5] {
+            park_conversation(&be, &cfg, &pool, &mut s, seed);
+        }
+
+        let mut live = resume_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert_eq!((s.restores, s.resident_hits), (1, 0));
+        assert_eq!(live.paged.as_ref().unwrap().map.len(), 2);
+        assert!(live.paged.as_ref().unwrap().map.is_private(0));
+
+        assert!(s.retain(&be, &cfg, &mut live));
+        assert_eq!(
+            s.resident_pages(),
+            4,
+            "the cap evicted the oldest to make room"
+        );
+        assert!(s.resident.iter().any(|r| r.tokens == tokens(3, 1024)));
+        assert!(s.resident.iter().all(|r| r.tokens != tokens(4, 1024)));
+
+        let _again = resume_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert_eq!((s.restores, s.resident_hits), (1, 1), "no second upload");
+        let _demoted = resume_conversation(&be, &cfg, &pool, &mut s, 4);
+        assert_eq!((s.restores, s.restored_tokens), (2, 2048));
+    }
+
+    /// The cap counts retained pages only: a live window the cap would otherwise exceed on its
+    /// own is never evicted, and evicting a resident a live slot shares frees nothing that slot maps.
+    #[test]
+    fn eviction_leaves_a_live_slots_shared_pages_alone() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
+        let mut s = cache();
+        s.set_resident_cap(Some(2));
+        let _window = paged_slot(&be, &cfg, &pool, 1024);
+
+        park_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert_eq!(pool.used_pages(), 4, "a live window plus one retained");
+        assert_eq!((s.resident.len(), s.resident_spills), (1, 0));
+
+        let sharer = resume_conversation(&be, &cfg, &pool, &mut s, 3);
+        assert!(!sharer.paged.as_ref().unwrap().map.is_private(0));
+        let mut other = paged_slot(&be, &cfg, &pool, 1024);
+        other.cached = tokens(4, 1024);
+        let used = pool.used_pages();
+        assert_eq!(used, 6);
+        assert!(s.retain(&be, &cfg, &mut other));
+
+        assert_eq!(s.resident_spills, 1, "conversation 3 was the oldest");
+        assert!(s.resident.iter().all(|r| r.tokens != tokens(3, 1024)));
+        assert_eq!(pool.used_pages(), used, "the sharer still holds the pages");
+        assert_rows(&be, &cfg, &sharer, 0..1024);
+        drop(sharer);
+        assert_eq!(pool.used_pages(), used - 2);
     }
 
     /// A restore whose blocks cannot fill the destination's window re-prefills instead of leaving

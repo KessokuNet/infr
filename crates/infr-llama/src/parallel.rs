@@ -621,7 +621,7 @@ impl ParallelSeam {
             if let Err(e) = store.capture(&self.vk, cfg, kv, upto) {
                 tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
             }
-            store.retain(cfg, kv);
+            store.retain(&self.vk, cfg, kv);
             drop(store);
             kv.reset();
         }

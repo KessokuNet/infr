@@ -40,7 +40,7 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | 15    | [`/v1/models` reports the served context window](15-models-context.md)              | done                                                                    |
 | 16    | [Dynamic KV: one page pool, allocated per request](16-dynamic-kv.md)                | P1–P6 done; the activation reserve still prices the whole window (B238) |
 | 18    | [KV tiers behind traits](18-kv-tiers.md)                                           | shipped                                                                  |
-| 19    | [KV cache as a store, anywhere](19-kv-anywhere.md)                                 | P1 done; P2 slice A done (vram tier in config and sizing); P2–P4 scoped  |
+| 19    | [KV cache as a store, anywhere](19-kv-anywhere.md)                                 | P1 and P2 done (the `vram` tier); P3–P4 scoped                           |
 | 20    | [Cold KV in a compressed format](20-kv-cold-format.md)                             | scoped                                                                   |
 
 ## Sampling and reasoning

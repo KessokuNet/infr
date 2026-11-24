@@ -7064,6 +7064,27 @@ mod seam_helper_tests {
         assert!(super::kv_pool_cap_bytes(&ec, windows).is_err());
     }
 
+    /// With no `vram` entry (none, or storage tiers only) nothing is reserved: the pool cap is
+    /// `kv.pool_mb` or unset, there is no retention cap, and the device room is untouched.
+    #[test]
+    fn the_implicit_tier_changes_no_allocation() {
+        let storage = infr_core::config::KvTier {
+            backend: Some(infr_core::config::KvBackend::Redb),
+            ..Default::default()
+        };
+        for mut ec in [EngineConfig::default(), ec_with_tiers(vec![storage])] {
+            assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
+            assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
+            assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
+            assert_eq!(super::kv_pool_cap_bytes(&ec, 100 << 20).unwrap(), None);
+            ec.kv.pool_mb = Some(64);
+            assert_eq!(
+                super::kv_pool_cap_bytes(&ec, 100 << 20).unwrap(),
+                Some(64 << 20)
+            );
+        }
+    }
+
     /// The tier comes off the residency predicate, the streaming budget and the MoE expert budget
     /// exactly as it comes off the fit: one byte either side of the ceiling net of the tier.
     #[test]
