@@ -204,7 +204,7 @@ pub fn n_chunks(span: usize, chunk: usize) -> usize {
 /// `span.div_ceil(max_chunks)` caps the count; for every span where the caller's own policy
 /// already produced a small enough count this returns `chunk` UNCHANGED, so the recorded dispatch
 /// is byte-identical (Vulkan: it only bites above `max_chunk * max_chunks` ≈ 524k keys, reachable
-/// only under `INFR_KV_OVERFLOW`).
+/// only with a `host` `[[kv.window]]`).
 pub fn cap_chunk_count(span: usize, chunk: usize, max_chunks: usize) -> usize {
     chunk.max(span.div_ceil(max_chunks.max(1)))
 }

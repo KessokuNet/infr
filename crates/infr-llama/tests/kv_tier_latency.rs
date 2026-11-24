@@ -49,15 +49,15 @@ fn engine(
 ) -> infr_llama::EngineConfig {
     let mut c = infr_llama::EngineConfig::default();
     c.kv.slots = 1;
-    let mut redb = infr_core::config::KvTier {
+    let mut redb = infr_core::config::KvBlock {
         backend: Some(infr_core::config::KvBackend::Redb),
         size: Some(infr_core::SizeSpec::Bytes(store_mb << 20)),
         ..Default::default()
     };
     redb.path = disk.map(std::path::Path::to_path_buf);
-    c.kv.tiers.push(redb);
+    c.kv.block.push(redb);
     if let Some(url) = url {
-        c.kv.tiers.push(infr_core::config::KvTier {
+        c.kv.block.push(infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redis),
             url: Some(url.to_string()),
             ..Default::default()

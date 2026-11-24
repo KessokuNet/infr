@@ -4,7 +4,8 @@ Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 done (the `vram` ti
 then its behaviour under pressure); P3 built and green on the CPU gate plus its Vulkan placement
 tests, the bit-identity and decode numbers measured on the RX 580; P4
 built and measured (the store-backed experiment; the cost table in `docs/perf/kv-prefix.md` says it
-is not a speed play). Plan 18 unified where idle blocks
+is not a speed play); P5 built (the config surface is three sections and paging is the default;
+the tier-list spelling used in P1-P4 below no longer exists). Plan 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
 the default rather than a hard-coded device buffer.
 
@@ -206,6 +207,28 @@ that rounding: leave a few MiB.
     than the window is refused at open rather than mirrored into nothing. The mirror lives where the
     prefix store is opened (the `ParallelSeam` engine: `infr serve`, `infr multi`); one-shot
     `infr run` places the window host-side instead and warns that it opens no store.
+
+- **P5** (built) the three-section config surface. The `[[kv.tiers]]` list and the legacy
+  `kv.overflow*` / `kv.pool_mb` keys are gone, replaced by three sections named by how long their
+  data lasts: `[[kv.window]]` (the live rows: `vram` first, then `host`, at most one of each; `vram`
+  `size` optional and meaning "fill the device room the fit leaves", `host` `size` required),
+  `[kv.pages]` (the retained-pages reserve above the windows; writing it declares paging), and
+  `[[kv.block]]` (the 128-token prefix extents: `redb` and `redis`, fastest first, a `redis` entry
+  never above another store). The three are independent: no window is one implicit `vram` window,
+  no pages means the pool is just the windows, no blocks means no prefix store. `KvCfg::layout`
+  resolves them to a `KvLayout { window: WindowPlan, pages, blocks, store_backed }`; every window
+  prices exactly what it says (`kv_device_bytes` is `kv.min(device_cap)`, nothing beside a `host`
+  window, and the whole cache when neither bounds it), so the legacy rescue rung that kept an
+  unbounded spill past the fit is deleted, and one `refuse_window` replaces the two tier refusals.
+  The pool's cap is the windows' share plus `[kv.pages]`. Each removed key is a load error naming
+  its replacement (and `kv.overflow_reserve_mb` is gone with no replacement: nothing ever read
+  it). `kv.paged` is on by default
+  wherever a session has several slots, a page-capable backend and a poolable layer
+  (`KvCfg::paging`); a TurboQuant format with `paged` unset turns it off for the run with a
+  warning, and asking for paging beside one is a load error. P4's store-backed window no longer has
+  a config spelling: `KvCfg::store_backed` is a programmatic switch (no env key, no TOML key, no
+  `--set` path, like `CpuCfg::reference`) that only the measurement harness sets, with the first
+  `[[kv.block]]` store as the backing.
 
 ## Non-goals
 

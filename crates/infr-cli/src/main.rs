@@ -1380,6 +1380,23 @@ impl ThinkRender {
     }
 }
 
+/// Say so when `[[kv.block]]` entries are configured on a path that never opens the prefix store
+/// (every path through [`build_chat_model`]): only the Vulkan concurrent engine does.
+fn warn_unopened_block_stores(cfg: &Config) {
+    let Ok(layout) = cfg.kv.layout() else {
+        return;
+    };
+    if layout.blocks.is_empty() {
+        return;
+    }
+    let stores: Vec<String> = layout.blocks.iter().map(|b| b.describe()).collect();
+    tracing::warn!(
+        blocks = %stores.join(", "),
+        "kv: `[[kv.block]]` is configured but this run opens no prefix store: only the Vulkan \
+         concurrent engine (`infr serve`, `infr multi`) opens it, so nothing is saved or restored here"
+    );
+}
+
 /// Build the per-backend generation primitive (`ChatModel`) for run AND serve, from the backend the
 /// resolved config selects ([`selected_backend`]) and the cheap diffusion-gemma arch peek the caller
 /// already did. ONE funnel so `cmd_run` and `cmd_serve` can never disagree on how a backend is
@@ -1392,6 +1409,7 @@ fn build_chat_model(
     cfg: &Arc<Config>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     let backend = selected_backend(cfg)?;
+    warn_unopened_block_stores(cfg);
     if is_dg {
         // diffusion-gemma (Phase 3/D, docs/diffusion-gemma.md): the entropy-bound block-diffusion
         // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
@@ -1469,13 +1487,13 @@ fn cmd_run(
     // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
     // chat reply and still overridable via INFR_MAX_NEW.
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    // A leading storage tier is the slot's backing only where the prefix store is opened — the
-    // `ParallelSeam` engine behind `infr serve`. This path never opens it, so say what the list
+    // A store-backed window is mirrored only where the prefix store is opened — the
+    // `ParallelSeam` engine behind `infr serve`. This path never opens it, so say what the config
     // does here (host-resident rows) and what it does not (a mirrored window).
-    if cfg.kv.residency().is_ok_and(|r| r.store_backed) {
+    if cfg.kv.layout().is_ok_and(|l| l.store_backed) {
         tracing::warn!(
-            "kv.tiers: a storage tier leads the list, and `infr run` does not open the store: the \
-             window is host-resident and stays in its slot; `infr serve` mirrors it every step"
+            "kv: the window is store-backed, and `infr run` does not open the store: the window \
+             is host-resident and stays in its slot; `infr serve` mirrors it every step"
         );
     }
 

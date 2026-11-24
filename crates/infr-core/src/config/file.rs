@@ -88,11 +88,14 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
         path: label.to_path_buf(),
         message: e.message().to_string(),
     })?;
+    check_kv_keys(&doc)?;
     let known = Config::all_paths();
     let mut partial = PartialConfig::default();
     let mut warnings = Vec::new();
     walk(&doc, "", &known, &mut partial, &mut warnings)?;
-    super::check_layer_tiers(partial.kv.tiers.as_ref())?;
+    declare_empty_kv_pages(&doc, &mut partial);
+    declare_empty_kv_entries(&doc, &mut partial);
+    super::kv::check_layer_backends(partial.kv.window.as_ref(), partial.kv.block.as_ref())?;
     // A relative tuning-file path inside a config file names a file beside THAT file, the usual
     // convention for a path in a config file; `INFR_TUNE_FILE` and `--set` stay relative to the
     // working directory.
@@ -105,6 +108,109 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
     }
     super::tune::stamp_layer(&mut partial, super::TuneLevel::Config);
     Ok((partial, warnings))
+}
+
+/// A removed or code-only `kv.*` key is a load error naming what replaces it, not an unknown-key
+/// warning: ignoring it would silently change where the KV cache lives.
+fn check_kv_keys(doc: &toml::Table) -> Result<(), ConfigError> {
+    let Some(toml::Value::Table(kv)) = doc.get("kv") else {
+        return Ok(());
+    };
+    let text = |key: &str| kv.get(key).and_then(scalar);
+    for key in [
+        "tiers",
+        "overflow",
+        "overflow_vram_mb",
+        "overflow_reserve_mb",
+        "pool_mb",
+    ] {
+        let Some(value) = kv.get(key) else {
+            continue;
+        };
+        let path = format!("kv.{key}");
+        // The old MiB counts become the new size grammar's `<n>m`.
+        let held = match key {
+            "overflow" => text("overflow_vram_mb"),
+            _ => scalar(value),
+        }
+        .map(|mib| format!("{mib}m"));
+        let mut message = super::kv::removed_kv_key(&path, held.as_deref())
+            .unwrap_or_else(|| format!("`{path}` was removed"));
+        if let toml::Value::Array(items) = value {
+            let old: Vec<super::kv::OldTier> = items
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .map(|t| super::kv::OldTier {
+                    backend: t.get("backend").and_then(scalar),
+                    size: t.get("size").and_then(scalar),
+                    path: t.get("path").and_then(scalar),
+                    url: t.get("url").and_then(scalar),
+                })
+                .collect();
+            message.push_str(&format!(
+                "\n\nYour list becomes:\n\n{}",
+                super::kv::tiers_replacement(&old)
+            ));
+        }
+        return Err(ConfigError::Value { path, message });
+    }
+    if kv.contains_key("store_backed") {
+        return Err(refused_path("kv.store_backed"));
+    }
+    Ok(())
+}
+
+/// The error for a `kv.*` path only code may set.
+pub(super) fn refused_path(path: &str) -> ConfigError {
+    ConfigError::Value {
+        path: path.to_string(),
+        message: super::kv::programmatic_kv_key(path)
+            .unwrap_or("not a config key")
+            .to_string(),
+    }
+}
+
+/// `[kv.pages]` with no keys still declares paging, which the key-by-key walk cannot see.
+fn declare_empty_kv_pages(doc: &toml::Table, partial: &mut PartialConfig) {
+    let empty = doc
+        .get("kv")
+        .and_then(|kv| kv.get("pages"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty);
+    if empty {
+        partial
+            .kv
+            .pages
+            .get_or_insert_with(Default::default)
+            .declared = true;
+    }
+}
+
+/// A `[[kv.window]]` or `[[kv.block]]` table with no keys sets no path, so the key-by-key walk
+/// never sees it. Give it an entry anyway: validation then refuses it for its missing `backend`,
+/// naming its index, instead of the entry vanishing from the list.
+fn declare_empty_kv_entries(doc: &toml::Table, partial: &mut PartialConfig) {
+    fn extend<T: Default>(list: &mut Option<Vec<T>>, entries: &[toml::Value]) {
+        if entries.is_empty() {
+            return;
+        }
+        let list = list.get_or_insert_with(Vec::new);
+        if list.len() < entries.len() {
+            list.resize_with(entries.len(), T::default);
+        }
+    }
+    let entries = |name: &str| {
+        doc.get("kv")
+            .and_then(|kv| kv.get(name))
+            .and_then(toml::Value::as_array)
+            .filter(|items| items.iter().all(toml::Value::is_table))
+    };
+    if let Some(items) = entries("window") {
+        extend(&mut partial.kv.window, items);
+    }
+    if let Some(items) = entries("block") {
+        extend(&mut partial.kv.block, items);
+    }
 }
 
 /// Recursive descent over the document, turning each scalar leaf into a `set_path` call.

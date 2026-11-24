@@ -1,8 +1,9 @@
-//! A storage tier that LEADS `[[kv.tiers]]` becomes the authoritative copy of a slot's live
-//! window: after every forward that advances the window, the rows go out to the store and come
-//! back, and the slot's buffers are rewritten from the store's answer. That is what makes the
-//! placement a property of the tier list rather than of the engine — the slot holds a staging
-//! copy, the store holds the truth.
+//! A store-backed window (the first `[[kv.block]]` store, switched on programmatically by the
+//! measurement harness) becomes the authoritative copy of a slot's live window: after every
+//! forward that advances the window, the rows go out to the store and come back, and the slot's
+//! buffers are rewritten from the store's answer. That is what makes the placement a property of
+//! the config rather than of the engine — the slot holds a staging copy, the store holds the
+//! truth.
 //!
 //! Three deliberate choices, each of which costs speed and buys a property the plan asked for:
 //!

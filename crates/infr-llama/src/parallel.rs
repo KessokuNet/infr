@@ -231,17 +231,17 @@ pub struct ParallelSeam {
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
     /// The cross-conversation KV prefix cache shared by every conversation on this engine (see
-    /// [`crate::seam::BlockCache`]). Empty and inert unless `kv.tiers` names a store.
+    /// [`crate::seam::BlockCache`]). Empty and inert unless `[[kv.block]]` names a store.
     ///
-    /// `Arc<Mutex<..>>` because a storage tier that LEADS `[[kv.tiers]]` also makes this store the
-    /// authoritative copy of each slot's live window, so every slot's mirror holds the same cache
-    /// (see [`crate::seam::LiveWindow`]).
+    /// `Arc<Mutex<..>>` because a store-backed window also makes this store the authoritative copy
+    /// of each slot's live window, so every slot's mirror holds the same cache (see
+    /// [`crate::seam::LiveWindow`]).
     store: Arc<Mutex<crate::seam::BlockCache<Box<dyn crate::seam::KvStore>>>>,
-    /// The live-window mirror shared by every slot, when a storage tier leads `kv.tiers`. `None`
-    /// leaves the runner's per-step hook a no-op.
+    /// The live-window mirror shared by every slot, when the window is store-backed. `None` leaves
+    /// the runner's per-step hook a no-op.
     mirror: Option<Arc<crate::seam::LiveWindow>>,
     max_ctx: usize,
-    /// The session's page pool when `kv.paged` built one, kept here so `/status` can report its
+    /// The session's page pool when paging built one, kept here so `/status` can report its
     /// usage even while every slot's KV is checked out of the pool mutex.
     paged_pool: Option<Arc<crate::seam::KvPool>>,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
@@ -291,13 +291,13 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
-        // One store per `[[kv.tiers]]` entry, fastest first, with Redis above it when asked for.
+        // One store per `[[kv.block]]` entry, fastest first.
         let store_key = crate::seam::store_key(&model);
         let store = crate::seam::prefix_store_for(model.cfg(), store_key)?;
         let enabled = store.is_some();
         let store: Box<dyn crate::seam::KvStore> =
             store.unwrap_or_else(|| Box::new(crate::seam::NoStore));
-        let asked = crate::seam::kv_residency(model.engine_cfg())?.store_backed;
+        let asked = crate::seam::kv_layout(model.engine_cfg())?.store_backed;
         // A model whose cache carries state its rows do not (a compressor ring, a delta net) cannot
         // be mirrored: the store would hold the K/V rows of a window whose producing state lives
         // outside them, and a later reader would resume with that state missing.
@@ -310,7 +310,7 @@ impl ParallelSeam {
         let store_backed = asked && enabled && !model.config().has_unrewindable_state();
         if asked && !enabled {
             tracing::warn!(
-                "kv.tiers: a storage tier leads the list but no store opened, so the live window \
+                "kv: the window is store-backed but no block store opened, so the live window \
                  stays in its slot"
             );
         }
@@ -356,7 +356,7 @@ impl ParallelSeam {
     }
 
     /// The live-window mirror's `(steps, bytes written, bytes read, bytes of the last step)`. All
-    /// zero unless a storage tier leads `kv.tiers`; under that placement both byte totals are the
+    /// zero unless the window is store-backed; under that placement both byte totals are the
     /// same window moved once each way, per step.
     pub fn kv_mirror_stats(&self) -> (u64, u64, u64, u64) {
         let store = self.store.lock().expect("kv store lock");
@@ -375,7 +375,7 @@ impl ParallelSeam {
     }
 
     /// Parked page maps: `(resumes that adopted resident pages, tokens those pages held, residents
-    /// spilled under page pressure)`. Zero unless `kv.paged` built a pool.
+    /// spilled under page pressure)`. Zero unless paging built a pool.
     pub fn kv_resident_stats(&self) -> (u64, u64, u64) {
         let store = self.store.lock().expect("kv store lock");
         (
@@ -390,10 +390,25 @@ impl ParallelSeam {
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         let fit = self.model.kv_fit_ctx(&self.vk);
+        let caps = infr_core::backend::Backend::capabilities(&self.vk);
+        let (cfg, ec) = (self.model.config(), self.model.engine_cfg());
+        crate::seam::log_unpaged_session(cfg, ec, &caps, n_slots);
+        // `[kv.pages]` still sizes the pool, but it buys a parked conversation only where a slot's
+        // whole page map can be kept: a recurrent mixer or a layer outside the pool leaves the
+        // reserve holding nothing. Say so once, at open, so the size does not read as a promise.
+        if crate::seam::kv_layout(ec).is_ok_and(|layout| layout.pages.is_some()) {
+            if let Some(why) = crate::seam::retention_refusal(cfg) {
+                tracing::warn!(
+                    "kv.pages: `[kv.pages]` reserves retained pages, but this model cannot hold a \
+                     parked conversation's pages: {why}. The reserve still sizes the pool; it just \
+                     never keeps a parked slot."
+                );
+            }
+        }
         let paged_blocks = crate::seam::paged_pages_for(
             n_slots,
-            self.model.engine_cfg().kv.paged == Some(true),
-            &infr_core::backend::Backend::capabilities(&self.vk),
+            crate::seam::session_pages(cfg, ec, &caps, n_slots),
+            &caps,
             fit,
             self.max_ctx,
         );
@@ -428,19 +443,13 @@ impl ParallelSeam {
         // what the server advertises and admits requests against.
         self.max_ctx = slot0.max_ctx();
         self.paged_pool = slot0.paged_pool().map(Arc::clone);
-        // The `vram` tier is the retention budget: parked pages stay resident only up to its size.
+        // `[kv.pages]` is the retention budget: parked pages stay resident only up to its size.
         if let Some(pool) = &self.paged_pool {
-            let pages = crate::seam::vram_tier_pages(self.model.engine_cfg(), pool.page_bytes());
+            let pages = crate::seam::retained_pages(self.model.engine_cfg(), pool.page_bytes());
             self.store
                 .lock()
                 .map_err(|_| anyhow!("kv store lock poisoned"))?
                 .set_resident_cap(pages);
-        }
-        if self.model.engine_cfg().kv.paged == Some(true) && n_slots == 1 {
-            tracing::info!(
-                "kv.paged: single-slot engine never forks, so no page pool is allocated; KV stays \
-                 linear"
-            );
         }
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
@@ -488,9 +497,9 @@ impl ParallelSeam {
             // device bytes), which is why the mirror can read them without a device copy.
             tracing::warn!(
                 layers = cfg.n_layer,
-                "kv store: a storage tier leads kv.tiers, so the live window moves to the host \
-                 and is written to that store every step; put `vram` or `host` first to keep the \
-                 window in its slot"
+                "kv store: the window is store-backed, so the live rows move to the host and are \
+                 written to that store every step; declare a `[[kv.window]]` to keep them in \
+                 their slot"
             );
         }
         tracing::info!(
@@ -871,18 +880,13 @@ impl ParallelSeam {
             }
         };
         // Keep this turn's rows — prompt and reply — for whoever asks the adjacent question next.
-        // A failure here is a cache miss on the next request, never a failed request.
+        // A failure here is a cache miss on the next request, never a failed request. The store's
+        // own `info!` reports what was saved; a failure is the only thing news here.
         if let Some(kv) = guard.kv.as_ref() {
             let upto = crate::seam::capture_upto(self.model.config(), kv, prompt_tokens.len());
-            match self.store.lock().map(|mut s| {
-                s.capture(&self.vk, self.model.config(), kv, upto)
-                    .map(|kept| (kept, s.stats()))
-            }) {
-                Ok(Ok((kept, (blocks, bytes)))) if kept > 0 => {
-                    tracing::debug!(tokens = kept, blocks, bytes, "kv store: captured a prefix");
-                }
-                Ok(Err(e)) => tracing::warn!(error = %e, "kv store: capture failed"),
-                _ => {}
+            let mut store = self.store.lock().expect("kv store lock");
+            if let Err(e) = store.capture(&self.vk, self.model.config(), kv, upto) {
+                tracing::warn!(error = %e, "kv store: capture failed");
             }
         }
         stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);

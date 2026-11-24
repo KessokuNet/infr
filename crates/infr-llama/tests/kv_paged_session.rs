@@ -56,7 +56,7 @@ fn engine_kv(paged: bool, fmt: infr_core::DType) -> infr_llama::EngineConfig {
     c.kv.type_v = Some(fmt);
     // A tiny host store, so a recycled slot restores into its block (and copies a shared page
     // before it writes) — the two prefix mechanisms have to compose.
-    c.kv.tiers.push(infr_core::config::KvTier {
+    c.kv.block.push(infr_core::config::KvBlock {
         backend: Some(infr_core::config::KvBackend::Redb),
         size: Some(infr_core::SizeSpec::Bytes(64 << 20)),
         ..Default::default()
@@ -276,8 +276,14 @@ fn parked_slots_resume_two_conversations_in_a_one_conversation_pool() {
     let page_bytes = (row * 2 * cfg0.n_layer) as u64;
     let pps = ctx.div_ceil(infr_vulkan::paged::PAGE_ROWS) as u64;
     let mut c = engine(true);
-    c.kv.pool_mb = Some((page_bytes * (pps + 1)).div_ceil(1 << 20));
-    c.kv.tiers[0].size = Some(infr_core::SizeSpec::Bytes(256 << 20));
+    // A vram window with room for one conversation's pool and the slots' page tables, no more.
+    c.kv.window = vec![infr_core::config::WindowEntry {
+        backend: Some(infr_core::config::KvBackend::Vram),
+        size: Some(infr_core::SizeSpec::Bytes(
+            page_bytes * (pps + 1) + (2 << 20),
+        )),
+    }];
+    c.kv.block[0].size = Some(infr_core::SizeSpec::Bytes(256 << 20));
     let model = infr_llama::SeamModel::load_with(&path, None, Arc::new(c)).expect("load paged");
     let seam = infr_llama::parallel::ParallelSeam::new(
         model,

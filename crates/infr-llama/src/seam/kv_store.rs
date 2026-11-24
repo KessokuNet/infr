@@ -258,7 +258,7 @@ struct Resident {
 pub(crate) struct BlockCache<S: KvStore> {
     store: S,
     index: HashMap<u64, Entry>,
-    /// Whether `kv.tiers` configured a cache at all.
+    /// Whether `[[kv.block]]` configured a cache at all.
     enabled: bool,
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
@@ -333,9 +333,14 @@ impl<S: KvStore> BlockCache<S> {
     /// Fill the index from the store's extent ids and their metadata. A missing or unreadable
     /// formats blob leaves the cache empty; it never fails startup.
     fn load(&mut self) {
+        let started = std::time::Instant::now();
+        tracing::debug!("kv store: loading the block index");
         let formats = match self.store.meta(FORMATS_META_ID) {
             Ok(Some(blob)) => blob,
-            Ok(None) => return,
+            Ok(None) => {
+                tracing::debug!("kv store: no saved blocks; starting empty");
+                return;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "kv store: reading the saved formats failed");
                 return;
@@ -355,10 +360,18 @@ impl<S: KvStore> BlockCache<S> {
                 return;
             }
         };
+        let stored = ids.len();
         let ids: Vec<u64> = ids
             .into_iter()
             .filter(|id| *id != FORMATS_META_ID && !is_live_window(*id))
             .collect();
+        tracing::debug!(
+            extents = stored,
+            blocks = ids.len(),
+            k_fmt = ?k_fmt,
+            v_fmt = ?v_fmt,
+            "kv store: reading the saved block index"
+        );
         let metas = match self.store.metas(&ids) {
             Ok(metas) => metas,
             Err(e) => {
@@ -366,6 +379,7 @@ impl<S: KvStore> BlockCache<S> {
                 return;
             }
         };
+        let mut dropped = 0u64;
         for (id, meta) in ids.into_iter().zip(metas) {
             if let Some(blob) = meta {
                 match decode_meta(&blob) {
@@ -381,6 +395,7 @@ impl<S: KvStore> BlockCache<S> {
                         );
                     }
                     Err(e) => {
+                        dropped += 1;
                         tracing::warn!(id, error = %e, "kv store: dropped a block's bad index entry")
                     }
                 }
@@ -388,6 +403,9 @@ impl<S: KvStore> BlockCache<S> {
         }
         tracing::info!(
             blocks = self.index.len(),
+            bytes = self.index.values().map(|e| e.bytes).sum::<usize>(),
+            dropped,
+            elapsed_ms = started.elapsed().as_millis() as i64,
             "kv store: loaded the saved prefix index"
         );
     }
@@ -409,18 +427,13 @@ impl<S: KvStore> BlockCache<S> {
             }
         }
         if dropped > 0 {
-            tracing::debug!(
+            tracing::info!(
                 dropped,
                 slots,
                 "kv store: dropped live windows no slot owns"
             );
         }
         Ok(dropped)
-    }
-
-    /// `(blocks, bytes)` currently resident, for the capture log.
-    pub(crate) fn stats(&self) -> (usize, usize) {
-        (self.index.len(), self.index.values().map(|e| e.bytes).sum())
     }
 
     /// Store the rows downloaded from a live window as extent `id`, recording the tokens they
@@ -859,7 +872,7 @@ impl<S: KvStore> BlockCache<S> {
             return false;
         };
         // A page holds every pooled layer's rows; a layer outside the pool would come back empty.
-        if cfg.has_recurrent_state() || !(0..cfg.n_layer).all(|l| super::paged_layer(cfg, l)) {
+        if super::retention_refusal(cfg).is_some() {
             return false;
         }
         let pages = (kv.cached.len().min(kv.max_ctx) / PAGE_ROWS).min(held);
@@ -1072,12 +1085,12 @@ impl<S: KvStore> BlockCache<S> {
         }
         self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, all.snap.take())?;
         self.captures += 1;
-        tracing::debug!(
+        tracing::info!(
             rows = p,
             blocks = missing.len(),
             bytes = all.bytes(),
             elapsed_ms = started.elapsed().as_millis() as i64,
-            "kv store: captured a prefix"
+            "kv store: saved a prefix"
         );
         Ok(p)
     }
@@ -1143,40 +1156,39 @@ pub(crate) fn redact(url: &str) -> String {
     }
 }
 
-/// The store `kv.tiers` declares: one backend per entry, fastest first, folded so an eviction from
-/// one entry demotes into the next and a read promotes back up. `None` when the cache is off. A
-/// tier that cannot be opened costs only that tier: log and keep the rest. Leading `vram` and
-/// `host` entries are the live slots' memory, not stores, so the chain starts below them; a
-/// malformed one is an error.
+/// The store `[[kv.block]]` declares: one backend per entry, fastest first, folded so an eviction
+/// from one entry demotes into the next and a read promotes back up. `None` when the cache is off.
+/// A block store that cannot be opened costs only that store: log and keep the rest. A malformed
+/// section is an error.
 pub(crate) fn prefix_store_for(
     kv: &crate::EngineConfig,
     key: u64,
 ) -> anyhow::Result<Option<Box<dyn KvStore>>> {
-    let tiers = &kv.kv.tiers;
-    let skipped = storage_tiers_start(tiers)?;
-    if tiers.len() == skipped {
-        return Ok(None);
+    let blocks = kv.kv.layout().map_err(|e| anyhow!(e))?.blocks;
+    if blocks.is_empty() {
+        tracing::debug!("kv store: no [[kv.block]] entries; the prefix cache is off");
     }
+    let started = std::time::Instant::now();
     let mut chain: Option<Box<dyn KvStore>> = None;
-    for (i, tier) in tiers.iter().enumerate().skip(skipped).rev() {
-        let opened = match open_tier(tier, key) {
+    for (i, block) in blocks.iter().enumerate().rev() {
+        let opened = match open_block(block, key) {
             Ok(opened) => opened,
             Err(e) => {
-                tracing::warn!(tier = %tier.describe(), error = %e, "kv store: dropping a tier");
+                tracing::warn!(block = %block.describe(), error = %e, "kv store: dropping a block store");
                 continue;
             }
         };
-        tracing::info!(tier = %tier.describe(), "kv store: tier {i} of {}", tiers.len());
+        tracing::info!(block = %block.describe(), "kv store: block store {i} of {}", blocks.len());
         chain = match chain {
             Some(slow) => match opened {
                 Opened::Budgeted(fast) => Some(Box::new(Tiered::new(fast, slow))),
-                // Only a redis tier opens this way, and only when it leads the list with another
-                // store below it. `Config::load` refuses that list; a caller that skipped the
-                // check gets the same answer here rather than a chain the placement does not name.
+                // Only a redis store opens this way, and only when it sits above another store.
+                // `Config::load` refuses that list; a caller that skipped the check gets the same
+                // answer here rather than a chain the placement does not name.
                 Opened::Plain(_) => anyhow::bail!(
-                    "kv store: tier {i} ({}) cannot hold a chain above it, because it does not \
-                     evict; declare the bounded store first",
-                    tier.describe()
+                    "kv store: block store {i} ({}) cannot sit above another store, because it does \
+                     not evict; declare the bounded store first",
+                    block.describe()
                 ),
             },
             None => Some(match opened {
@@ -1185,75 +1197,74 @@ pub(crate) fn prefix_store_for(
             }),
         };
     }
+    if chain.is_some() {
+        tracing::info!(
+            store_entries = blocks.len(),
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            "kv store: opened the block chain"
+        );
+    }
     Ok(chain)
 }
 
-/// Index of the first storage entry: past every leading addressable (`vram`, `host`) entry, which
-/// the validation keeps to the front of the list.
-fn storage_tiers_start(tiers: &[infr_core::config::KvTier]) -> anyhow::Result<usize> {
-    let vram = infr_core::config::kv_vram_tier_bytes(tiers).map_err(|e| anyhow!(e))?;
-    let host = infr_core::config::kv_host_tier_bytes(tiers).map_err(|e| anyhow!(e))?;
-    Ok(usize::from(vram.is_some()) + usize::from(host.is_some()))
-}
-
-/// A tier that can demote (it has a budget) or one that cannot (the server owns its eviction).
+/// A block store that can demote (it has a budget) or one that cannot (the server owns its
+/// eviction).
 enum Opened {
     Budgeted(Box<dyn BudgetedStore>),
     Plain(Box<dyn KvStore>),
 }
 
-/// A redb tier's budget when its entry names none, which is what `--set kv.tiers=redb` produces.
-const DEFAULT_TIER_BYTES: u64 = 1 << 30;
-
-fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opened> {
-    let Some(backend) = tier.backend else {
-        return Err(anyhow!("`backend` is required (vram, host, redb or redis)"));
+fn open_block(block: &infr_core::config::KvBlock, key: u64) -> anyhow::Result<Opened> {
+    let Some(backend) = block.backend else {
+        return Err(anyhow!("`backend` is required (redb or redis)"));
     };
     match backend {
         KvBackend::Redb => {
-            if tier.url.is_some() {
+            if block.url.is_some() {
                 return Err(anyhow!(
-                    "a redb tier keeps its blocks in `path`, and `url` belongs to a redis tier"
+                    "a redb block store keeps its blocks in `path`, and `url` belongs to a redis one"
                 ));
             }
-            let size = match tier.size {
-                None => DEFAULT_TIER_BYTES,
+            let size = match block.size {
+                None => infr_core::config::KV_REDB_DEFAULT_BYTES,
                 Some(infr_core::SizeSpec::Percent(_)) => {
-                    return Err(anyhow!("a tier `size` is bytes, not a share of something"))
+                    return Err(anyhow!(
+                        "a block store `size` is bytes, not a share of something"
+                    ))
                 }
                 Some(infr_core::SizeSpec::Bytes(0)) => {
-                    return Err(anyhow!("a tier `size` has to be more than zero"))
+                    return Err(anyhow!("a block store `size` has to be more than zero"))
                 }
                 Some(infr_core::SizeSpec::Bytes(bytes)) => bytes,
             };
-            let store = match &tier.path {
+            let store = match &block.path {
                 Some(path) => RedbKv::open_file(path, key, size as usize)?,
                 None => RedbKv::open_memory(key, size as usize)?,
             };
             Ok(Opened::Budgeted(Box::new(store)))
         }
         KvBackend::Redis => {
-            if tier.path.is_some() {
+            if block.path.is_some() {
                 return Err(anyhow!(
-                    "a redis tier is named by `url`, and `path` belongs to a redb tier"
+                    "a redis block store is named by `url`, and `path` belongs to a redb one"
                 ));
             }
-            if tier.size.is_some() {
+            if block.size.is_some() {
                 tracing::warn!(
-                    tier = %tier.describe(),
-                    "kv store: a redis tier is budgeted by the server, so `size` is ignored"
+                    block = %block.describe(),
+                    "kv store: a redis block store is budgeted by the server, so `size` is ignored"
                 );
             }
-            let url = tier
+            let url = block
                 .url
                 .as_deref()
-                .ok_or_else(|| anyhow!("a redis tier needs a `url`"))?;
+                .ok_or_else(|| anyhow!("a redis block store needs a `url`"))?;
             RedisKv::connect(url, key)
                 .map(|store| Opened::Plain(Box::new(store)))
                 .map_err(|e| anyhow!("{}: {e}", redact(url)))
         }
         KvBackend::Vram | KvBackend::Host => Err(anyhow!(
-            "a {backend} tier holds live slots, not blocks; the chain starts below it"
+            "{backend} memory holds live rows, not blocks; declare it under `[[kv.window]]`"
         )),
     }
 }
@@ -1688,125 +1699,122 @@ mod tests {
         );
     }
 
-    /// A redb tier gets 1 GiB when its entry names no size, which is what `--set kv.tiers=redb`
-    /// builds; a field that belongs to the other backend is refused instead of ignored.
+    /// A redb block store gets 1 GiB when its entry names no size, which is what
+    /// `--set kv.block=redb` builds; a field that belongs to the other backend is refused instead
+    /// of ignored.
     #[test]
-    fn a_tier_is_checked_against_its_backend() {
+    fn a_block_store_is_checked_against_its_backend() {
         use infr_core::SizeSpec;
-        let tier = |backend: KvBackend| infr_core::config::KvTier {
+        let block = |backend: KvBackend| infr_core::config::KvBlock {
             backend: Some(backend),
             ..Default::default()
         };
-        let Ok(Opened::Budgeted(redb)) = open_tier(&tier(KvBackend::Redb), 7) else {
-            panic!("a redb tier with no size opens")
+        let Ok(Opened::Budgeted(redb)) = open_block(&block(KvBackend::Redb), 7) else {
+            panic!("a redb block store with no size opens")
         };
-        assert_eq!(redb.capacity(), DEFAULT_TIER_BYTES as usize);
+        assert_eq!(
+            redb.capacity(),
+            infr_core::config::KV_REDB_DEFAULT_BYTES as usize
+        );
 
-        let wrong_url = infr_core::config::KvTier {
+        let wrong_url = infr_core::config::KvBlock {
             url: Some("redis://127.0.0.1:1/0".into()),
-            ..tier(KvBackend::Redb)
+            ..block(KvBackend::Redb)
         };
-        assert!(open_tier(&wrong_url, 7).is_err(), "redb has no url");
+        assert!(open_block(&wrong_url, 7).is_err(), "redb has no url");
 
-        let wrong_path = infr_core::config::KvTier {
+        let wrong_path = infr_core::config::KvBlock {
             path: Some(std::path::PathBuf::from("/tmp/kv.redb")),
-            ..tier(KvBackend::Redis)
+            ..block(KvBackend::Redis)
         };
-        assert!(open_tier(&wrong_path, 7).is_err(), "redis has no path");
+        assert!(open_block(&wrong_path, 7).is_err(), "redis has no path");
 
-        for size in [SizeSpec::Bytes(0), SizeSpec::Percent(50.0)] {
-            let bad = infr_core::config::KvTier {
+        for size in [SizeSpec::Bytes(0), SizeSpec::Percent(0.5)] {
+            let bad = infr_core::config::KvBlock {
                 size: Some(size),
-                ..tier(KvBackend::Redb)
+                ..block(KvBackend::Redb)
             };
-            assert!(open_tier(&bad, 7).is_err(), "{size:?} is not a budget");
+            assert!(open_block(&bad, 7).is_err(), "{size:?} is not a budget");
         }
     }
 
-    fn engine_with(tiers: Vec<infr_core::config::KvTier>) -> crate::EngineConfig {
+    fn engine_with(blocks: Vec<infr_core::config::KvBlock>) -> crate::EngineConfig {
         let mut ec = crate::EngineConfig::default();
-        ec.kv.tiers = tiers;
+        ec.kv.block = blocks;
         ec
     }
 
-    fn tier_of(backend: KvBackend, size: Option<u64>) -> infr_core::config::KvTier {
-        infr_core::config::KvTier {
+    fn block_of(backend: KvBackend, size: Option<u64>) -> infr_core::config::KvBlock {
+        infr_core::config::KvBlock {
             backend: Some(backend),
             size: size.map(infr_core::SizeSpec::Bytes),
             ..Default::default()
         }
     }
 
-    /// A leading vram entry is skipped, so a list holding only that entry keeps the cache
-    /// resident-only and the tiers below it build the chain they always did.
-    #[test]
-    fn a_leading_vram_tier_is_not_a_store() {
-        let vram = tier_of(KvBackend::Vram, Some(1 << 20));
-        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
-        let ec = engine_with(vec![vram.clone()]);
-        assert!(prefix_store_for(&ec, 7).unwrap().is_none());
+    fn entry_of(backend: KvBackend, size: Option<u64>) -> infr_core::config::WindowEntry {
+        infr_core::config::WindowEntry {
+            backend: Some(backend),
+            size: size.map(infr_core::SizeSpec::Bytes),
+        }
+    }
 
-        let ec = engine_with(vec![vram.clone(), redb.clone()]);
-        assert!(prefix_store_for(&ec, 7).unwrap().is_some());
-        assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), 1);
-        let ec = engine_with(vec![redb.clone()]);
-        assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), 0);
-        assert!(prefix_store_for(&ec, 7).unwrap().is_some());
+    /// Windows hold live rows, not blocks: a config of only windows keeps the prefix cache off,
+    /// and the chain is built from `[[kv.block]]` alone.
+    #[test]
+    fn windows_are_not_stores() {
+        let redb = block_of(KvBackend::Redb, Some(1 << 20));
+        for windows in [
+            vec![entry_of(KvBackend::Vram, Some(1 << 20))],
+            vec![entry_of(KvBackend::Host, Some(1 << 20))],
+            vec![
+                entry_of(KvBackend::Vram, Some(1 << 20)),
+                entry_of(KvBackend::Host, Some(1 << 20)),
+            ],
+        ] {
+            let mut ec = engine_with(Vec::new());
+            ec.kv.window = windows.clone();
+            assert!(prefix_store_for(&ec, 7).unwrap().is_none(), "{windows:?}");
+            ec.kv.block = vec![redb.clone()];
+            assert!(prefix_store_for(&ec, 7).unwrap().is_some(), "{windows:?}");
+        }
+        assert!(prefix_store_for(&engine_with(vec![redb]), 7)
+            .unwrap()
+            .is_some());
         assert!(prefix_store_for(&engine_with(Vec::new()), 7)
             .unwrap()
             .is_none());
     }
 
-    /// A vram entry below the first slot, or a malformed leading one, is an error rather than a
-    /// dropped tier.
+    /// A window backend in the block list, or a malformed block, is an error rather than a
+    /// dropped store.
     #[test]
-    fn a_misplaced_or_malformed_vram_tier_is_an_error() {
-        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
-        let late = engine_with(vec![redb, tier_of(KvBackend::Vram, Some(1 << 20))]);
-        let Err(err) = prefix_store_for(&late, 7) else {
-            panic!("vram after a storage tier must be refused")
+    fn a_misplaced_or_malformed_block_is_an_error() {
+        for backend in [KvBackend::Vram, KvBackend::Host] {
+            let bad = engine_with(vec![block_of(backend, Some(1 << 20))]);
+            let Err(err) = prefix_store_for(&bad, 7) else {
+                panic!("{backend} is a window, not a block store")
+            };
+            assert!(
+                err.to_string().contains("kv.block[0]")
+                    && err.to_string().contains("[[kv.window]]"),
+                "{err}"
+            );
+            assert!(open_block(&block_of(backend, Some(1)), 7).is_err());
+        }
+        let zero = engine_with(vec![block_of(KvBackend::Redb, Some(0))]);
+        assert!(prefix_store_for(&zero, 7).is_err());
+        let redis_first = engine_with(vec![
+            infr_core::config::KvBlock {
+                url: Some("redis://127.0.0.1:1/0".into()),
+                ..block_of(KvBackend::Redis, None)
+            },
+            block_of(KvBackend::Redb, Some(1 << 20)),
+        ]);
+        let Err(err) = prefix_store_for(&redis_first, 7) else {
+            panic!("a redis block store above another store must be refused")
         };
-        assert!(err.to_string().contains("kv.tiers[1]"), "{err}");
-        for size in [None, Some(0)] {
-            let bad = engine_with(vec![tier_of(KvBackend::Vram, size)]);
-            assert!(prefix_store_for(&bad, 7).is_err(), "{size:?}");
-        }
-        assert!(open_tier(&tier_of(KvBackend::Vram, Some(1)), 7).is_err());
-    }
-
-    /// Leading `vram` and `host` entries are the live slots' memory, so the storage chain starts
-    /// after them, and a list holding only those keeps the cache resident-only.
-    #[test]
-    fn leading_vram_and_host_tiers_are_not_stores() {
-        let vram = tier_of(KvBackend::Vram, Some(1 << 20));
-        let host = tier_of(KvBackend::Host, Some(1 << 20));
-        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
-        for (tiers, skipped, has_store) in [
-            (vec![host.clone()], 1, false),
-            (vec![vram.clone(), host.clone()], 2, false),
-            (vec![host.clone(), redb.clone()], 1, true),
-            (vec![vram, host, redb], 2, true),
-        ] {
-            let ec = engine_with(tiers);
-            assert_eq!(storage_tiers_start(&ec.kv.tiers).unwrap(), skipped);
-            assert_eq!(prefix_store_for(&ec, 7).unwrap().is_some(), has_store);
-        }
-    }
-
-    /// A host entry below a storage tier, or a malformed one, is an error naming the entry.
-    #[test]
-    fn a_misplaced_or_malformed_host_tier_is_an_error() {
-        let redb = tier_of(KvBackend::Redb, Some(1 << 20));
-        let late = engine_with(vec![redb, tier_of(KvBackend::Host, Some(1 << 20))]);
-        let Err(err) = prefix_store_for(&late, 7) else {
-            panic!("host after a storage tier must be refused")
-        };
-        assert!(err.to_string().contains("kv.tiers[1] (host)"), "{err}");
-        for size in [None, Some(0)] {
-            let bad = engine_with(vec![tier_of(KvBackend::Host, size)]);
-            assert!(prefix_store_for(&bad, 7).is_err(), "{size:?}");
-        }
-        assert!(open_tier(&tier_of(KvBackend::Host, Some(1)), 7).is_err());
+        assert!(err.to_string().contains("kv.block[0] (redis)"), "{err}");
     }
 
     /// A block rewritten while an older copy sits below it must not leave that copy behind: the
@@ -2139,20 +2147,21 @@ mod tests {
         assert_eq!(s.resident.len(), 1);
     }
 
-    /// The `vram` tier is a reservation beside the live windows: a paged session whose window is
-    /// full still has the tier's bytes of pool left for retained pages. A pool sized by the tier
-    /// alone (the old rule) cannot even hold the window.
+    /// `[kv.pages]` is a reservation beside the live windows: a paged session whose window is
+    /// full still has the reserve's bytes of pool left for retained pages. A pool sized by the
+    /// reserve alone cannot even hold the window.
     #[test]
-    fn a_full_window_leaves_the_vram_tier_free_in_the_pool() {
+    fn a_full_window_leaves_the_pages_reserve_free_in_the_pool() {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
         let page_bytes = crate::seam::kv_page_bytes(&cfg, DType::F16, DType::F16);
         let window_pages = 2usize;
         let tier_pages = 3usize;
-        let ec = engine_with(vec![tier_of(
-            KvBackend::Vram,
-            Some(tier_pages as u64 * page_bytes),
-        )]);
+        let mut ec = engine_with(Vec::new());
+        ec.kv.pages = infr_core::config::KvPages {
+            declared: true,
+            size: Some(infr_core::SizeSpec::Bytes(tier_pages as u64 * page_bytes)),
+        };
         // The zero page rides on top of the windows, as `paged_pages_for` counts it.
         let windows = (1 + window_pages) as u64 * page_bytes;
         let cap = crate::seam::kv_pool_cap_bytes(&ec, windows, 0)
@@ -2175,24 +2184,22 @@ mod tests {
         drop(slot);
     }
 
-    /// A whole `host` tier bounds the page pool at its size, and a store chain built under it
+    /// A whole `host` window bounds the page pool at its size, and a store chain built beside it
     /// parks and resumes conversations like any other: the retained pages resume with no upload,
-    /// and a conversation the pool had to give back restores from the storage tier below.
+    /// and a conversation the pool had to give back restores from the block store.
     #[test]
-    fn a_whole_host_tier_parks_and_resumes_through_its_chain() {
+    fn a_whole_host_window_parks_and_resumes_through_its_chain() {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
         let page_bytes = crate::seam::kv_page_bytes(&cfg, DType::F16, DType::F16);
         let host_pages = 7usize;
         let fmts = (DType::F16, DType::F16);
         let slot_bytes = crate::seam::kv_paged_slot_bytes(&cfg, 1024, false, 1, fmts, 1);
-        let ec = engine_with(vec![
-            tier_of(
-                KvBackend::Host,
-                Some(host_pages as u64 * page_bytes + slot_bytes),
-            ),
-            tier_of(KvBackend::Redb, Some(1 << 20)),
-        ]);
+        let mut ec = engine_with(vec![block_of(KvBackend::Redb, Some(1 << 20))]);
+        ec.kv.window = vec![entry_of(
+            KvBackend::Host,
+            Some(host_pages as u64 * page_bytes + slot_bytes),
+        )];
         let windows = 12 * page_bytes;
         let cap = crate::seam::kv_pool_cap_bytes(&ec, windows, slot_bytes)
             .unwrap()
@@ -2200,15 +2207,15 @@ mod tests {
         let pages = crate::seam::pool_pages_for_cap(cap, page_bytes).unwrap();
         assert_eq!(
             pages, host_pages,
-            "the tier, not the windows, bounds the pool"
+            "the window, not the pool default, bounds the pool"
         );
-        assert_eq!(crate::seam::vram_tier_pages(&ec, page_bytes), None);
+        assert_eq!(crate::seam::retained_pages(&ec, page_bytes), None);
 
         let pool =
             crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, pages).unwrap();
         let store = prefix_store_for(&ec, 7)
             .unwrap()
-            .expect("redb below the host tier");
+            .expect("a redb block store beside the host window");
         let mut s = BlockCache::new(store, true);
         s.set_resident_cap(Some(4));
         for seed in [3, 4, 5] {
@@ -2226,13 +2233,13 @@ mod tests {
     }
 
     fn ec_tier(ec: &crate::EngineConfig) -> u64 {
-        crate::seam::vram_tier_bytes(ec).unwrap()
+        crate::seam::device_pages_bytes(ec).unwrap()
     }
 
-    /// Retained pages are capped at the tier: the oldest resident goes first, and a park larger
+    /// Retained pages are capped at the reserve: the oldest resident goes first, and a park larger
     /// than the whole budget is not retained at all.
     #[test]
-    fn residents_are_capped_at_the_vram_tier() {
+    fn residents_are_capped_at_the_pages_reserve() {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
         let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 12).unwrap();
@@ -2245,7 +2252,7 @@ mod tests {
         let mut open = cache();
         park(&mut open, 3);
         park(&mut open, 4);
-        assert_eq!(open.resident.len(), 2, "no tier, no retention cap");
+        assert_eq!(open.resident.len(), 2, "no reserve, no retention cap");
 
         let mut s = cache();
         s.set_resident_cap(Some(2));

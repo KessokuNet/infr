@@ -61,6 +61,26 @@ pub(crate) fn no_poolable_layer(cfg: &Config) -> Option<&'static str> {
     }
 }
 
+/// Why a model's slots cannot be parked as retained pages, in the caller's words. `None` when a
+/// whole page map can be retained: every layer has to be in the pool (a page holds all of their
+/// rows), and no layer may carry state the rows do not.
+pub(crate) fn retention_refusal(cfg: &Config) -> Option<&'static str> {
+    if cfg.has_recurrent_state() {
+        return Some(
+            "a recurrent mixer (DeltaNet, short convolution) carries state the rows do not, so a \
+             parked slot would come back without it",
+        );
+    }
+    if (0..cfg.n_layer).any(|l| !paged_layer(cfg, l)) {
+        return Some(
+            "a page holds every pooled layer's rows, and this model has a layer outside the pool \
+             (a sliding-window ring, a recurrent state, or a compressed cache), so a parked slot \
+             would come back incomplete",
+        );
+    }
+    None
+}
+
 /// The physical pages behind one session's conversation slots.
 pub(crate) struct KvPool {
     /// Per layer: that layer's K pool buffer, `None` for a layer that keeps a private cache.
@@ -137,7 +157,7 @@ impl KvPool {
         // points at it.
         let zero = ledger.alloc().expect("a pool has at least two pages");
         debug_assert_eq!(zero, 0);
-        Ok(Arc::new(Self {
+        let pool = Arc::new(Self {
             k,
             v,
             k_row,
@@ -148,7 +168,20 @@ impl KvPool {
             pps,
             slot_rows,
             total_pages: pages,
-        }))
+        });
+        tracing::info!(
+            pages,
+            usable = pages - 1,
+            page_rows = PAGE_ROWS,
+            page_bytes = pool.page_bytes(),
+            pooled_layers = pool.k.iter().filter(|b| b.is_some()).count(),
+            bytes = pool.page_bytes() * pages as u64,
+            slot_rows,
+            k_fmt = ?k_fmt,
+            v_fmt = ?v_fmt,
+            "kv.paged: built the page pool"
+        );
+        Ok(pool)
     }
 
     /// Layer `l`'s K pool, or `None` when that layer keeps a private cache.
@@ -893,6 +926,43 @@ mod tests {
         assert!((0..c.n_layer)
             .filter(|&l| c.is_recurrent_layer(l))
             .all(|l| !paged_layer(&c, l)));
+    }
+
+    /// A parked slot's pages hold every pooled layer's rows and nothing else, so a model with a
+    /// layer outside the pool (or one whose mixer carries state the rows do not) cannot be parked
+    /// at all — the reason `[kv.pages]` is warned about at open.
+    #[test]
+    fn retention_needs_every_layer_in_the_pool() {
+        assert!(
+            retention_refusal(&cfg()).is_none(),
+            "two plain attention layers"
+        );
+
+        let mixed = Config {
+            n_layer: 2,
+            n_head: 4,
+            n_kv: 2,
+            n_embd: 64,
+            head_dim: 16,
+            deepseek2: true,
+            ..Default::default()
+        };
+        let why = retention_refusal(&mixed).expect("a layer outside the pool");
+        assert!(why.contains("outside the pool"), "{why}");
+
+        let all_recurrent = Config {
+            n_layer: 2,
+            n_head: 4,
+            n_kv: 2,
+            n_embd: 64,
+            head_dim: 16,
+            lfm3: true,
+            shortconv_layers: vec![true, true],
+            shortconv_l_cache: 4,
+            ..Default::default()
+        };
+        let why = retention_refusal(&all_recurrent).expect("recurrent state");
+        assert!(why.contains("recurrent"), "{why}");
     }
 
     /// A prefix that ends inside a page must still be reused, not dropped: the tail rows are copied

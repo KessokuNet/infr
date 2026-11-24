@@ -50,8 +50,8 @@ fn model_path() -> Option<PathBuf> {
     .find_map(|(repo, file)| store.snapshot_file(repo, file))
 }
 
-/// The three placements compared: `None` is the plain `vram` engine, the others lead `kv.tiers`
-/// with the store whose cost is being measured.
+/// The three placements compared: `Vram` is the plain engine, the others back the live window
+/// with the `[[kv.block]]` store whose cost is being measured.
 #[derive(Clone, Copy)]
 enum Tier {
     Vram,
@@ -74,19 +74,20 @@ fn engine(tier: Tier, disk: &std::path::Path, url: Option<&str>) -> infr_llama::
     c.kv.slots = 1;
     let entry = match tier {
         Tier::Vram => return c,
-        Tier::RedbFile => infr_core::config::KvTier {
+        Tier::RedbFile => infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redb),
             size: Some(infr_core::SizeSpec::Bytes(1024 << 20)),
             path: Some(disk.to_path_buf()),
             ..Default::default()
         },
-        Tier::Redis => infr_core::config::KvTier {
+        Tier::Redis => infr_core::config::KvBlock {
             backend: Some(infr_core::config::KvBackend::Redis),
             url: url.map(str::to_string),
             ..Default::default()
         },
     };
-    c.kv.tiers.push(entry);
+    c.kv.block.push(entry);
+    c.kv.store_backed = true;
     c
 }
 

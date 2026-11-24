@@ -236,124 +236,155 @@ On `serve` these are the server defaults — a per-request OpenAI
 `temperature`/`top_p` still overrides them.
 
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
-`force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
-host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`; the
-first two are deprecated in favor of a `host` tier below) that spills KV to
-system RAM when VRAM runs out. `[[kv.tiers]]` turns on the
-cross-conversation prefix store (reverse PagedAttention, see
-`docs/perf/kv-prefix.md`) and says where it keeps its blocks: the K/V rows of a
-prompt stay there after its slot is recycled, and a later request sharing that
-prefix uploads them instead of re-prefilling. One entry per store, fastest
-first — a write that no longer fits a tier is demoted to the next one, and a
-read falls through and promotes it back:
+`force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, `paged`, and
+where the cache lives. Three sections place it, named by how long the data in
+each one lasts:
+
+| noun   | section        | holds                                                  | lasts                              |
+| ------ | -------------- | ------------------------------------------------------ | ---------------------------------- |
+| window | `[[kv.window]]` | the live rows of every running conversation            | short: one request                 |
+| pages  | `[kv.pages]`   | the page maps of parked conversations, above the windows | medium: until pressure or the reserve evicts them |
+| blocks | `[[kv.block]]` | 128-token prefix extents of finished prompts           | long: until the store evicts them  |
 
 ```toml
-[[kv.tiers]]
+[kv]
+paged = true        # the default; `paged = false` opts out
+
+[[kv.window]]       # the live rows; the order is the placement ladder, vram first
 backend = "vram"
-size = "2g"                 # device bytes held for retained idle pages
+size = "4g"         # optional: omitted fills the device room the fit leaves
 
-[[kv.tiers]]
+[[kv.window]]
+backend = "host"
+size = "16g"        # required
+
+[kv.pages]          # retention reserve for parked page maps
+size = "2g"         # optional: absent, the pool is just the windows
+
+[[kv.block]]        # prefix extents; the order is the demotion chain
 backend = "redb"
-size = "1g"                 # bytes this tier keeps before evicting
-path = "/var/cache/infr/kv-prefix.redb"   # optional: unset keeps it in memory
+size = "20g"        # bytes this store keeps before demoting or evicting (default 1g)
+path = "/var/cache/infr/kv.redb"          # optional: unset keeps it in memory
 
-[[kv.tiers]]
+[[kv.block]]
 backend = "redis"
-url = "redis://127.0.0.1:6379/2"          # required; redis, rediss or valkey
+url = "redis://cache.internal:6379/0"     # required; redis, rediss or valkey
 ```
 
-A redb tier is one database file that loads its index at startup (not the rows),
-so a restart keeps its prefixes; leaving `path` out keeps the same database in
-anonymous memory, which is faster and gone with the process. A redb tier with
-no `size` keeps 1 GiB. A redis tier is shared, so several servers can point at
-it; its budget is the server's `maxmemory`, which is why it goes last.
+The three sections are independent. With no `[[kv.window]]` there is one
+implicit `vram` window that fills the device room after the weights and the
+activation reserve, which is what a plain `infr run` allocates; with no
+`[kv.pages]` the pool holds exactly the windows; with no `[[kv.block]]` there is
+no prefix store. Sizes take the shared size grammar (`1g`, `512m`).
 
-Every entry has to name its `backend` (`vram`, `host`, `redb`, `redis` or `valkey`): an
-entry with only a `path` or a `size`, and any other name, is an error when the
-config loads rather than a guessed `redb` tier. A `vram` entry is device
-memory, valid only as the first entry, with a byte `size` and no `path` or
-`url`. It is a reservation beside the live windows: the slots divide what is
-left after it, so the context window shrinks by its `size`, and a paged pool
-(`paged`) grows by the same bytes to keep parked pages resident, capped at
-that size. A `vram` tier that leaves less than one window of KV (or less than an
-explicit `--ctx`) on a device that would otherwise serve it is refused at open,
-naming the tier. Without one, nothing changes.
+**Windows.** Attention reads every row of the live window on every step, so a
+window can sit only in memory the kernels address directly: `vram`, or `host`
+(system RAM read over PCIe, the `-nkvo` analogue, for a model that leaves no
+room for a window). A storage backend in `[[kv.window]]` is a load error that
+points at `[[kv.block]]`. `vram` may appear once and first, with an optional
+byte `size`; `host` may appear once, after `vram` or alone, with a required
+byte `size`; neither takes a `path` or `url`. The fit prices what each window
+says: a sized `vram` window counts only its `size` against VRAM and the rest of
+the cache lands in the `host` window (the window is then bound by the two sizes
+added); a `host` window alone puts no KV on the device; an unsized `vram` window
+beside a `host` one prices no KV in the device at all, and the placement check
+is what prices the split — each buffer takes the device part while it fits what
+is left of it and moves whole to the host window when it does not; unsized and
+alone it prices the whole cache in the device. The activation reserve still
+counts.
+A window configuration that cannot hold one window of KV (or an explicit
+`--ctx`) on a device that would otherwise serve it is refused at open, naming
+`[[kv.window]]` and both sizes. Decode reads the whole window each step, so a
+`host` window sets the pace at PCIe bandwidth
+(`docs/perf/kv-prefix.md`, `docs/plan/19-kv-anywhere.md`).
 
-A `host` entry is the same idea in system RAM, for a model that leaves no
-room for a window: the live slot's KV buffers are host-allocated and the
-unchanged kernels read them over PCIe. It takes a byte `size` and no `path` or
-`url`, and is valid as the first entry or directly after a leading `vram`
-entry (vram window first, host spill second, storage after):
+**Pages.** `[kv.pages]` is a reservation beside the live windows for the page
+maps of parked conversations. A slot that is generating cannot have its rows
+evicted underneath the kernels, so retention lives above the windows: the pool's
+cap is the windows' share plus this `size`, parked maps stay resident up to it
+and are dropped least-recently-used first, and a resume that finds its pages
+there uploads nothing. Retained pages that sit in device memory (every layout
+without a `host` window) come off the budget the fit divides among slots, so the
+context window shrinks by the `size`. A section with no `size` still declares
+paging, like `paged = true`.
 
-```toml
-[[kv.tiers]]
-backend = "vram"            # optional: the device-resident part of the live KV
-size = "1g"
+**Blocks.** `[[kv.block]]` is the cross-conversation prefix store (reverse
+PagedAttention): the K/V rows of a prompt stay there after its slot is recycled,
+and a later request sharing the prefix uploads them instead of re-prefilling.
+One entry per store, fastest first: a write that no longer fits a store is
+demoted to the next one, and a read falls through and promotes the block back.
+A block store is a prefill cache read once per request, never a swap that
+attention reads from, so it is never a window. A `redb` entry is one database
+file that loads its index at startup (not the rows), so a restart keeps its
+prefixes; leaving `path` out keeps the same database in anonymous memory, which
+is faster and gone with the process; with no `size` it keeps 1 GiB, and it takes
+no `url`. A `redis` entry needs a `url` and takes no `path` or `size`: it is
+shared, so several servers can point at it, and its budget is the server's
+`maxmemory`, which is why no other store may sit below it in the chain. Every
+entry has to name its `backend`, and a `vram` or `host` backend here is an error
+that points at `[[kv.window]]`. The config file is where a block list is
+written, because the store holds prompt-derived data and switching it on should
+be deliberate; `--set kv.block=redb` gives a single in-memory store for a quick
+comparison, and any other list replaced this way loses the file's entries.
 
-[[kv.tiers]]
-backend = "host"            # the rest of the live KV, in system RAM
-size = "8g"
-```
+**Paging.** The paged pool is the default: the session's slots share one pool of
+physical pages built with the session's KV in the cold init; a slot allocates
+pages as its sequence grows and returns them when it resets, a fork points at
+its parent's complete pages, and only a page a slot writes is copied first. With
+paging the per-request window `infr serve -np N` advertises is the pool's fit,
+not the fit divided by `N`, because a slot owns pages only while it uses them.
+Paging helps a full-attention model the most; ring, recurrent, MLA and diffusion
+layers stay compact. It is on where it can do something: several slots, a backend
+with a page-table path (only Vulkan walks one), and at least one poolable layer,
+so a one-slot server (`infr serve` without `--parallel`, and every CPU/Metal
+serve) never builds a pool, and `infr run` builds one only when a second
+conversation actually forks into it. `paged` is `INFR_KV_PAGED` in the
+environment.
 
-With a `host` entry the context fit counts only the device part (none, when it
-leads) against VRAM, the activation reserve still counts, and the window is
-bound by `vram + host` bytes; a tier that cannot hold one window (or an
-explicit `--ctx`) is refused at open, naming it, and a pool buffer past the
-tier's `size` fails its allocation. The `vram` entry before it is that device
-part, not a retention reservation. A `paged` pool allocates its pages
-host-side, bounded by the same bytes. Decode reads every row of the window each
-step, so expect PCIe bandwidth to set the pace (`docs/plan/19-kv-anywhere.md`).
+| config | result |
+| ------ | ------ |
+| `paged` unset, no TurboQuant format | paging on |
+| `paged = true` or `[kv.pages]`, TurboQuant `type_k` / `type_v` named | load error naming both keys |
+| `paged` unset, a TurboQuant format named | paging off for the run, with a warning at load |
+| `paged = false`, any format | linear, no warning |
+| `paged` unset, the backend or the model's layers cannot page | linear, an info line at session init |
+| `paged = true`, the backend or the model's layers cannot page | linear, a warning at session init |
 
-A storage entry (`redb` or `redis`) may also lead, and then it is the slot's backing rather than a
-place idle blocks go: the slot's buffers are host-allocated like a `host` tier's, and the live
-window is written to the store and read back after every forward that advances it. A single-entry
-list of either kind therefore changes meaning: `[[kv.tiers]] backend = "redb"` used to be just a
-prefix store with a VRAM window, and keeping that now takes a `vram` or `host` entry first — the
-first entry is where a slot's rows live, whatever backend it names. It is the same
-code path as a `host` entry with the store doing the copying, and an experiment rather than a
-configuration to recommend: a step moves the whole window (rows x row bytes) in each direction, so
-`docs/perf/kv-prefix.md` has the measured cost and `crates/infr-llama/tests/kv_store_backed.rs`
-is the harness that fills it in. Under it a redb `size` must hold one window per slot (the tier's cap
-is the host cap too, and a window larger than the store is refused at open), while a leading `redis`
-entry takes no `size` — its budget is the server's `maxmemory` — and a `path` there, or a `url` on a
-leading `redb` entry, is an error. A leading `redis` entry also cannot have another store below it:
-the server owns its eviction, so it cannot be the bounded half of a chain; declare the `redb` entry
-first. Each slot's window lives under a reserved extent id, so it is never evicted as a cache block,
-and a window whose slot the engine no longer has is dropped when the store opens. The store also
-keeps the window's tokens, so a later request
-whose prompt begins with them resumes without re-prefilling. Only plain K/V models resume that way:
-a cache carrying state the rows do not (compressor rings, delta nets) refuses to hydrate and leaves
-the window in the slot, and `paged` alongside a leading storage tier works but doubles the window's
-bytes for nothing. The mirror itself runs where the prefix store is opened — `infr serve` and
-`infr multi`; one-shot `infr run` never opens it, so it places the window host-side, warns that the
-store is untouched, and leaves the rows in the slot.
+`paged = false` together with `[kv.pages]` is a load error naming both.
 
-`overflow` and `overflow_vram_mb` are deprecated spellings of this: a `vram`
-entry of `overflow_vram_mb` followed by an unbounded `host` entry (a bare `host`
-entry when it is `0`). They keep today's behavior (the fit still prices the whole
-cache in VRAM and the spill is the clamp ladder's last rung), and a `host`
-entry in the list takes precedence over them. `INFR_KV_OVERFLOW` and
-`INFR_KV_OVERFLOW_VRAM_MB` remain their env twins. `overflow_vram_mb` now caps
-live device KV bytes rather than lifetime bytes (identical until KV buffers are
-freed and reallocated).
+**Where the bytes go.** Placement is fixed when the session starts. The startup
+log's resident and spilled counts are the ground truth for a given run.
 
-Sizes take the shared size grammar (`1g`, `512m`). The config file is the only
-place a tier list is written, because the store holds prompt-derived data and
-switching it on should be deliberate; `--set kv.tiers=redb` gives a single
-in-memory tier for a quick comparison, and any other list replaced this way loses
-the file's entries. A planar Q8_0 KV cache on Vulkan is handled: the row copies
-interleave its codes and scales, so no backend is refused.
-`paged`
-(`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
-share one pool of physical pages, built with the session's KV in the cold init;
-a slot allocates pages as its sequence grows and returns them when it resets, a
-fork points at its parent's complete pages, and only a page a slot writes is
-copied first. `pool_mb` (`INFR_KV_POOL_MB`) caps the pool in MiB; unset sizes it
-at one full window per slot, which is what the linear slots cost. Paging helps a
-full-attention model the most — ring, recurrent, MLA and diffusion layers stay
-compact. Only the Vulkan backend walks a page table; elsewhere the knob warns
-and the slots stay linear. The two knobs are independent and compose: the pool
-shares pages between live slots, and the store survives slot recycling.
+| what | where it physically sits |
+| ---- | ------------------------ |
+| window | per-layer K and V buffers, each allocated whole on one side: the vram part while a buffer fits what is left of it, else the host part. A split window can have some layers in VRAM and some in host RAM |
+| pages | the same per-layer buffers, in 512-row units, so the pool is those buffers grown by the retained pages |
+| page tables | one small `u32` buffer per slot, mapping a slot's logical pages to physical ones |
+| blocks | a redb file (or anonymous memory), or Redis server memory |
+
+**Removed keys.** `kv.tiers`, `kv.overflow`, `kv.overflow_vram_mb`,
+`kv.overflow_reserve_mb` and `kv.pool_mb` no longer load; each is an error that
+prints the replacement. `kv.tiers` never had an environment variable (there is
+no `INFR_KV_TIERS`); the other four did, as `INFR_KV_OVERFLOW`,
+`INFR_KV_OVERFLOW_VRAM_MB`, `INFR_KV_OVERFLOW_RESERVE_MB` and `INFR_KV_POOL_MB`,
+and those are errors too. Storage entries of
+the old `[[kv.tiers]]` list become `[[kv.block]]` and a leading `vram` or `host`
+entry becomes a `[[kv.window]]` (a lone `vram` entry, which only reserved
+retained pages, becomes `[kv.pages]`). `overflow` with `overflow_vram_mb` becomes
+a `vram` window of that `size` followed by a `host` window; the old host side was
+unbounded, so a cap has to be chosen. `overflow_reserve_mb` is gone with no
+replacement: the VRAM guard's device headroom is a fixed constant and the key
+never reached it. The
+old `pool_mb` capped the whole pool, which is now the windows plus the pages, so
+its number becomes the `vram` window's `size` (a cap on the whole pool) or the
+`[kv.pages]` `size` (room for parked conversations beyond the windows).
+
+A planar Q8_0 KV cache on Vulkan is handled: the row copies interleave its codes
+and scales, so no backend is refused. A store-backed window, where the first
+block store is the authoritative copy of the live window and every step moves
+the window out and back, exists only as a measurement harness
+(`crates/infr-llama/tests/kv_store_backed.rs`, `docs/perf/kv-prefix.md`): the
+switch for it has no config key, no `--set` path and no environment variable.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
