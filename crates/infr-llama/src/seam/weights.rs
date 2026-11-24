@@ -437,6 +437,14 @@ pub(crate) struct SeamKv {
     /// prefix instead of re-prefilling from zero. Capped by
     /// [`RECURRENT_SNAP_CAP_BYTES`], oldest evicted first.
     pub(super) recurrent_snaps: Vec<RecurrentSnap>,
+    /// Where this slot's live window is mirrored every step, when a storage tier leads
+    /// `[[kv.tiers]]` (see [`crate::seam::LiveWindow`]). `None` on every other placement, which
+    /// makes the runner's hook a no-op and the run byte-identical to one without it.
+    ///
+    /// Per SLOT, not per process: the mirror names the slot's own extent id, and N sequences run
+    /// concurrently here, so this cannot be a thread-local (see `generate_dense_backend_bound`'s
+    /// `req` doc for the last time that assumption was wrong).
+    pub(crate) mirror: Option<std::sync::Arc<dyn crate::seam::mirror::Mirror>>,
 }
 
 /// Host memory one slot may spend on [`SeamKv::recurrent_snaps`]. The prefix store keeps its own
@@ -708,8 +716,80 @@ pub(crate) struct KvLayerView<'a> {
     pub(crate) ring: bool,
 }
 
+/// Where one slot's KV rows are and how to address them, borrowed from a [`SeamKv`]'s fields.
+/// Everything a row read or write needs from the slot, without borrowing the whole slot: the
+/// runner holds its fields destructured while a step runs, so it builds one from the locals.
+#[derive(Clone, Copy)]
+pub(crate) struct SlotView<'a> {
+    pub(crate) kbufs: &'a [std::sync::Arc<dyn Buffer>],
+    pub(crate) vbufs: &'a [std::sync::Arc<dyn Buffer>],
+    pub(crate) k_fmt: DType,
+    pub(crate) v_fmt: DType,
+    pub(crate) max_ctx: usize,
+    pub(crate) kv_ring: bool,
+    pub(crate) ubatch: usize,
+    pub(crate) paged: Option<&'a crate::seam::PagedSlot>,
+    /// Host copies of every recurrent layer's state, oldest first.
+    pub(crate) snaps: &'a [RecurrentSnap],
+    /// One past the highest row any execute on this slot may have written.
+    pub(crate) rows: usize,
+    /// The tokens the rows are KNOWN to match from 0: never more than `rows`, and always a prefix
+    /// of what the rows hold (`cached` truncates before a rewind-prefill rewrites them).
+    pub(crate) cached: &'a [u32],
+}
+
+impl<'a> SlotView<'a> {
+    /// Where layer `l`'s logical rows sit: the slot's pages, a sliding-window ring, or linear.
+    pub(crate) fn row_layout(
+        &self,
+        be: &dyn Backend,
+        cfg: &Config,
+        l: usize,
+    ) -> Box<dyn crate::seam::rows::RowLayout + 'a> {
+        if let Some(p) = self.paged.filter(|_| crate::seam::paged_layer(cfg, l)) {
+            return Box::new(&p.map);
+        }
+        if self.kv_ring && cfg.is_swa_layer(l) {
+            return Box::new(crate::seam::rows::Ring {
+                rows: crate::seam::kv_rows_at(
+                    cfg,
+                    l,
+                    self.max_ctx,
+                    true,
+                    self.ubatch,
+                    be.kv_row_align(),
+                ),
+            });
+        }
+        Box::new(crate::seam::rows::Linear)
+    }
+
+    /// The oldest row layer `l` still holds: a ring recycled everything before this.
+    pub(crate) fn oldest(&self, be: &dyn Backend, cfg: &Config, l: usize) -> usize {
+        self.row_layout(be, cfg, l)
+            .oldest_resident(self.rows.max(self.cached.len()))
+    }
+}
+
 impl SeamKv {
-    /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
+    /// The addressable view of this slot's KV rows: what reads and writes them without borrowing
+    /// the whole slot.
+    pub(crate) fn view(&self) -> SlotView<'_> {
+        SlotView {
+            kbufs: &self.kbufs[..],
+            vbufs: &self.vbufs[..],
+            k_fmt: self.k_fmt,
+            v_fmt: self.v_fmt,
+            max_ctx: self.max_ctx,
+            kv_ring: self.kv_ring,
+            ubatch: self.ubatch,
+            paged: self.paged.as_ref(),
+            snaps: &self.recurrent_snaps[..],
+            rows: self.written_end,
+            cached: &self.cached[..],
+        }
+    }
+
     /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
     /// free memory (`crate::seam::reclamp_ctx_to_live_room`). A caller that keeps its own copy
     /// (`DenseVulkanSession::max_ctx`, `ParallelSeam::max_ctx`) refreshes it from here after the
@@ -752,26 +832,7 @@ impl SeamKv {
         cfg: &Config,
         l: usize,
     ) -> Box<dyn crate::seam::rows::RowLayout + '_> {
-        if let Some(p) = self
-            .paged
-            .as_ref()
-            .filter(|_| crate::seam::paged_layer(cfg, l))
-        {
-            return Box::new(&p.map);
-        }
-        if self.kv_ring && cfg.is_swa_layer(l) {
-            return Box::new(crate::seam::rows::Ring {
-                rows: crate::seam::kv_rows_at(
-                    cfg,
-                    l,
-                    self.max_ctx,
-                    true,
-                    self.ubatch,
-                    be.kv_row_align(),
-                ),
-            });
-        }
-        Box::new(crate::seam::rows::Linear)
+        self.view().row_layout(be, cfg, l)
     }
 
     /// A slot with only KV buffers, for tests of the row stores.
@@ -844,6 +905,7 @@ impl SeamKv {
             mtp_delta_ckpt: None,
             delta_snapshot_refused: false,
             recurrent_snaps: Vec::new(),
+            mirror: None,
         })
     }
 
@@ -880,6 +942,9 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        // The rows are gone with the claim; leaving `written_end` behind would have the slot claim
+        // rows past the ones it holds.
+        self.written_end = 0;
         self.recurrent_snaps.clear();
         if let Some(p) = &mut self.paged {
             p.release_pages();
@@ -1112,6 +1177,9 @@ impl SeamKv {
             mtp_delta_ckpt: None,
             delta_snapshot_refused: false,
             recurrent_snaps: Vec::new(),
+            // A fork is a different slot, so the parent's extent id is wrong for it; the engine
+            // attaches the fork's own mirror when it builds the pool.
+            mirror: None,
         };
         if let Some(p) = &child.paged {
             tracing::info!("kv.paged: forked slot with {} shared pages", p.map.len());

@@ -1469,6 +1469,16 @@ fn cmd_run(
     // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
     // chat reply and still overridable via INFR_MAX_NEW.
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
+    // A leading storage tier is the slot's backing only where the prefix store is opened — the
+    // `ParallelSeam` engine behind `infr serve`. This path never opens it, so say what the list
+    // does here (host-resident rows) and what it does not (a mirrored window).
+    if cfg.kv.residency().is_ok_and(|r| r.store_backed) {
+        tracing::warn!(
+            "kv.tiers: a storage tier leads the list, and `infr run` does not open the store: the \
+             window is host-resident and stays in its slot; `infr serve` mirrors it every step"
+        );
+    }
+
     // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
     // answers (lists/stories); override with `--max-new` / `sampling.max_new` / INFR_MAX_NEW.
     //

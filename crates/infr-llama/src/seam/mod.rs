@@ -21,6 +21,7 @@ mod dsv4_emit;
 mod dsv4_plan;
 mod kv_store;
 mod kv_tier;
+mod mirror;
 pub mod model;
 mod pool;
 mod routing;
@@ -32,12 +33,13 @@ mod wshape;
 
 pub(crate) use kv_store::{capture_upto, prefix_store_for, store_key, BlockCache};
 pub(crate) use kv_tier::{KvStore, NoStore};
+pub(crate) use mirror::{attach as attach_mirror, LiveWindow};
 pub(crate) use pool::{paged_layer, KvPool, PagedSlot, POOL_BLOCKS};
 pub use routing::Routing;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
-pub(crate) use weights::SeamKv;
+pub(crate) use weights::{SeamKv, SlotView};
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
@@ -7123,9 +7125,10 @@ mod seam_helper_tests {
         }
     }
 
-    /// With no `vram` tier the budget is untouched: a storage-only list prices like no list, and
-    /// a tier of `S` bytes prices exactly like `S` more bytes of weights, so the window shrinks by
-    /// `S` and nothing else moves.
+    /// With no `vram` tier the budget is untouched and a tier of `S` bytes prices exactly like `S`
+    /// more bytes of weights, so the window shrinks by `S` and nothing else moves. A storage entry
+    /// that LEADS the list is the slot's backing instead, so it prices like a `host` entry of the
+    /// window that store can hold (the redb default when it states no `size`).
     #[test]
     fn a_vram_tier_shrinks_the_fit_by_its_size_and_nothing_else() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
@@ -7142,7 +7145,11 @@ mod seam_helper_tests {
         };
         assert_eq!(
             fit(&ec_with_tiers(vec![storage.clone()]), weights),
-            implicit
+            fit(
+                &ec_with_tiers(vec![host_tier(infr_core::config::KV_REDB_DEFAULT_BYTES)]),
+                weights
+            ),
+            "a leading storage tier bounds the window like a host tier of its size"
         );
 
         let tier = 2 * 1024 * 1024 * 1024;
@@ -7727,25 +7734,42 @@ mod seam_helper_tests {
         assert!(super::kv_pool_cap_bytes(&ec, windows, 0).is_err());
     }
 
-    /// With no `vram` entry (none, or storage tiers only) nothing is reserved: the pool cap is
-    /// `kv.pool_mb` or unset, there is no retention cap, and the device room is untouched.
+    /// With no `vram` entry nothing is reserved: the pool cap is `kv.pool_mb` or unset, there is no
+    /// retention cap, and the device room is untouched. A storage entry that LEADS the list is the
+    /// slot's backing, so it states a host cap and the pool's cap becomes the store's bound rather
+    /// than "unset" — the windows' bytes when the store is larger than they are.
     #[test]
     fn the_implicit_tier_changes_no_allocation() {
+        let mut ec = EngineConfig::default();
+        assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
+        assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
+        assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
+        assert_eq!(super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(), None);
+        ec.kv.pool_mb = Some(64);
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
+            Some(64 << 20)
+        );
+
         let storage = infr_core::config::KvTier {
             backend: Some(infr_core::config::KvBackend::Redb),
             ..Default::default()
         };
-        for mut ec in [EngineConfig::default(), ec_with_tiers(vec![storage])] {
-            assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
-            assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
-            assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
-            assert_eq!(super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(), None);
-            ec.kv.pool_mb = Some(64);
-            assert_eq!(
-                super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
-                Some(64 << 20)
-            );
-        }
+        let mut ec = ec_with_tiers(vec![storage]);
+        assert_eq!(super::vram_tier_bytes(&ec).unwrap(), 0);
+        assert_eq!(super::vram_tier_pages(&ec, 1 << 20), None);
+        assert_eq!(super::net_of_vram_tier(&ec, 12_345), 12_345);
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
+            Some(100 << 20),
+            "without `kv.pool_mb` the store's cap resolves to the windows' bytes"
+        );
+        ec.kv.pool_mb = Some(64);
+        assert_eq!(
+            super::kv_pool_cap_bytes(&ec, 100 << 20, 0).unwrap(),
+            Some(64 << 20),
+            "`kv.pool_mb` still sets the cap under a leading store"
+        );
     }
 
     /// The tier comes off the residency predicate, the streaming budget and the MoE expert budget

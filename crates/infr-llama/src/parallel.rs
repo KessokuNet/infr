@@ -232,7 +232,14 @@ pub struct ParallelSeam {
     gate: Option<Arc<StepGate>>,
     /// The cross-conversation KV prefix cache shared by every conversation on this engine (see
     /// [`crate::seam::BlockCache`]). Empty and inert unless `kv.tiers` names a store.
-    store: Mutex<crate::seam::BlockCache<Box<dyn crate::seam::KvStore>>>,
+    ///
+    /// `Arc<Mutex<..>>` because a storage tier that LEADS `[[kv.tiers]]` also makes this store the
+    /// authoritative copy of each slot's live window, so every slot's mirror holds the same cache
+    /// (see [`crate::seam::LiveWindow`]).
+    store: Arc<Mutex<crate::seam::BlockCache<Box<dyn crate::seam::KvStore>>>>,
+    /// The live-window mirror shared by every slot, when a storage tier leads `kv.tiers`. `None`
+    /// leaves the runner's per-step hook a no-op.
+    mirror: Option<Arc<crate::seam::LiveWindow>>,
     max_ctx: usize,
     /// The session's page pool when `kv.paged` built one, kept here so `/status` can report its
     /// usage even while every slot's KV is checked out of the pool mutex.
@@ -290,6 +297,28 @@ impl ParallelSeam {
         let enabled = store.is_some();
         let store: Box<dyn crate::seam::KvStore> =
             store.unwrap_or_else(|| Box::new(crate::seam::NoStore));
+        let asked = crate::seam::kv_residency(model.engine_cfg())?.store_backed;
+        // A model whose cache carries state its rows do not (a compressor ring, a delta net) cannot
+        // be mirrored: the store would hold the K/V rows of a window whose producing state lives
+        // outside them, and a later reader would resume with that state missing.
+        if asked && model.config().has_unrewindable_state() {
+            tracing::warn!(
+                "kv store: this model's cache carries state its rows do not, so a leading storage \
+                 tier cannot be authoritative for it; the live window stays in the slot"
+            );
+        }
+        let store_backed = asked && enabled && !model.config().has_unrewindable_state();
+        if asked && !enabled {
+            tracing::warn!(
+                "kv.tiers: a storage tier leads the list but no store opened, so the live window \
+                 stays in its slot"
+            );
+        }
+        let store = Arc::new(Mutex::new(crate::seam::BlockCache::new(store, enabled)));
+        store
+            .lock()
+            .map_err(|_| anyhow!("kv store lock poisoned"))?
+            .reserve_windows(n_slots)?;
         let mut engine = Self {
             model,
             vk,
@@ -298,7 +327,8 @@ impl ParallelSeam {
                 tick: 0,
             }),
             freed: Condvar::new(),
-            store: Mutex::new(crate::seam::BlockCache::new(store, enabled)),
+            store: Arc::clone(&store),
+            mirror: store_backed.then(|| Arc::new(crate::seam::LiveWindow::new(store))),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -323,6 +353,25 @@ impl ParallelSeam {
     pub fn kv_store_stats(&self) -> (u64, u64, u64) {
         let store = self.store.lock().expect("kv store lock");
         (store.restores, store.restored_tokens, store.captures)
+    }
+
+    /// The live-window mirror's `(steps, bytes written, bytes read, bytes of the last step)`. All
+    /// zero unless a storage tier leads `kv.tiers`; under that placement both byte totals are the
+    /// same window moved once each way, per step.
+    pub fn kv_mirror_stats(&self) -> (u64, u64, u64, u64) {
+        let store = self.store.lock().expect("kv store lock");
+        (
+            store.mirror_steps,
+            store.mirror_written,
+            store.mirror_read,
+            store.mirror_last,
+        )
+    }
+
+    /// `(windows adopted from the store on checkout, tokens those windows held)`.
+    pub fn kv_hydrate_stats(&self) -> (u64, u64) {
+        let store = self.store.lock().expect("kv store lock");
+        (store.hydrated, store.hydrated_tokens)
     }
 
     /// Parked page maps: `(resumes that adopted resident pages, tokens those pages held, residents
@@ -383,7 +432,7 @@ impl ParallelSeam {
         if let Some(pool) = &self.paged_pool {
             let pages = crate::seam::vram_tier_pages(self.model.engine_cfg(), pool.page_bytes());
             self.store
-                .get_mut()
+                .lock()
                 .map_err(|_| anyhow!("kv store lock poisoned"))?
                 .set_resident_cap(pages);
         }
@@ -424,6 +473,26 @@ impl ParallelSeam {
             },
         );
         self.pool.get_mut().expect("fresh pool").slots = slots;
+        // A store-led list: give every slot its own mirror over the shared store, after the forks (a
+        // fork deliberately drops its parent's). The warmup above ran unmetered, so the store holds
+        // no window yet — each slot writes its own on its first real step.
+        if let Some(window) = &self.mirror {
+            let cfg = self.model.config();
+            let pool = self.pool.get_mut().expect("fresh pool");
+            for (i, slot) in pool.slots.iter_mut().enumerate() {
+                if let Some(kv) = slot.kv.as_mut() {
+                    crate::seam::attach_mirror(kv, window, i)?;
+                }
+            }
+            // The slot's rows are host-resident under this placement (the leading tier claims no
+            // device bytes), which is why the mirror can read them without a device copy.
+            tracing::warn!(
+                layers = cfg.n_layer,
+                "kv store: a storage tier leads kv.tiers, so the live window moves to the host \
+                 and is written to that store every step; put `vram` or `host` first to keep the \
+                 window in its slot"
+            );
+        }
         tracing::info!(
             "slots: {n_slots} x {} ctx ready in {:.1}s",
             self.max_ctx,
@@ -618,10 +687,22 @@ impl ParallelSeam {
                 .lock()
                 .map_err(|_| anyhow!("kv store lock poisoned"))?;
             let upto = crate::seam::capture_upto(cfg, kv, kv.cached_len());
-            if let Err(e) = store.capture(&self.vk, cfg, kv, upto) {
-                tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
-            }
+            let started = std::time::Instant::now();
+            let kept = match store.capture(&self.vk, cfg, kv, upto) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
+                    0
+                }
+            };
             store.retain(&self.vk, cfg, kv);
+            tracing::debug!(
+                slot = victim,
+                tokens = kv.cached_len(),
+                kept,
+                elapsed_ms = started.elapsed().as_millis() as i64,
+                "kv slots: parked a slot"
+            );
             drop(store);
             kv.reset();
         }
@@ -711,11 +792,27 @@ impl ParallelSeam {
             // A prefix this engine already materialized — possibly another conversation's — costs
             // one upload here and is then skipped by the prefill, like a seed from a sibling slot.
             if let Some(kv) = guard.kv.as_mut() {
-                let restored = self
-                    .store
-                    .lock()
-                    .map_err(|_| anyhow!("kv store lock poisoned"))?
-                    .restore(&self.vk, self.model.config(), kv, &prompt_tokens);
+                // The mirrored window this slot wrote on its last run, if it is a prefix of this
+                // prompt: row-exact and cheap where a block restore is somebody else's prefix.
+                let window = kv.mirror.clone();
+                let hydrated = match window {
+                    Some(m) => m.hydrate(&self.vk, self.model.config(), kv, &prompt_tokens)?,
+                    None => 0,
+                };
+                if hydrated > 0 {
+                    tracing::debug!(
+                        tokens = hydrated,
+                        "kv store: resumed the slot's stored window"
+                    );
+                }
+                let restored = if hydrated > 0 {
+                    Ok(0)
+                } else {
+                    self.store
+                        .lock()
+                        .map_err(|_| anyhow!("kv store lock poisoned"))?
+                        .restore(&self.vk, self.model.config(), kv, &prompt_tokens)
+                };
                 match restored {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(tokens = n, "kv store: restored a stored prefix"),

@@ -155,3 +155,53 @@ rest is the upload. Cheap next to the 38.5 s prefill it replaces.
 
 So: keep the store for chat-shaped workloads, and finish the table so a slot can
 stop being a contiguous buffer.
+
+## A store-backed window: what a step costs when the store holds the live rows
+
+A storage entry that leads `[[kv.tiers]]` makes the store the authoritative copy of the live window:
+the slot's buffers are host-allocated, and after every forward each row is written to the store and
+read back. The window is moved twice per step — once out, once in — so this table is the price of
+the policy, not a tuning knob. `crates/infr-llama/tests/kv_store_backed.rs` fills it in; it runs
+on the decode path only, with `#[ignore]` and no thresholds, because the answer is a number to read
+rather than a gate.
+
+Fill it in with:
+
+```sh
+# INFR_TEST_MODEL is optional: unset, the test takes Qwen/Qwen2.5-0.5B-Instruct-GGUF from the HF
+# cache, and it skips when neither that nor unsloth/Qwen3-0.6B-GGUF is there.
+INFR_TEST_MODEL=/path/to/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+INFR_TEST_REDIS_URL=redis://127.0.0.1:6379/9 \
+  cargo test -p infr-llama --release --test kv_store_backed -- --ignored --nocapture
+```
+
+The redis URL must point at an **empty** database — the test writes extents under its own model key
+and does not flush, and it never starts a server. `INFR_TEST_MODEL` is optional: unset, the test
+takes `Qwen/Qwen2.5-0.5B-Instruct-GGUF` from the HF cache. It prints one row per tier and context
+(`vram`, redb in a temporary file, redis on loopback) with decode tok/s, rows in the window, bytes
+moved per step, and the two running totals; copy them into the table below and note the GPU, the
+Vulkan driver and the Redis version beside it.
+
+| Tier leading `kv.tiers` | Context | Decode tok/s | Rows | Bytes/step | Steps | Written | Read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `vram` (baseline, no mirror) | ~2k | 141.5 | 2005 | 0 | 0 | 0 | 0 |
+| `redb`, `path` on disk | ~2k | 27.7 | 2006 | 25,423,872 | 21 | 337,428,480 | 337,428,480 |
+| `redis` on loopback | ~2k | 23.2 | 2005 | 25,411,584 | 21 | 337,305,600 | 337,305,600 |
+| `vram` (baseline, no mirror) | ~8k | 79.4 | 7933 | 0 | 0 | 0 | 0 |
+| `redb`, `path` on disk | ~8k | 7.8 | 7934 | 98,267,136 | 27 | 1,443,348,480 | 1,443,348,480 |
+| `redis` on loopback | ~8k | 6.1 | 7933 | 98,254,848 | 25 | 1,353,572,352 | 1,353,572,352 |
+
+Qwen2.5-0.5B-Instruct q4_k_m (24 layers, 2 KV heads, head dim 64, f16 KV) on an RX 580 (Vulkan0, RADV
+POLARIS10, 8 GiB), Valkey 9.0.7 on the same host, decode = 64 greedy tokens after a 2k/~8k prompt.
+`Bytes/step` is the last step and equals the window at that point; `written` and `read` are the
+running totals over the whole run, prefill steps included. At ~8k the window is 98 MB, so a step
+writes and reads 196 MB against a host-resident slot, and the decode rate falls by 10x against the
+same model on a `vram` tier (5x at ~2k).
+
+Read it against the bandwidth table in `docs/plan/19-kv-anywhere.md`: a Qwen2.5-0.5B row at ~8k is
+98 MB, so a step moves 196 MB, and the measured 7.8 tok/s is 1.5 GB/s of store traffic — the host
+RAM copy is not the limit, the encode-and-write is. Loopback Valkey lands slightly *below* a redb
+file on the same host, which settles the question the experiment was built to ask: no configuration
+in this list has a usable corner, and a store-backed window is a correctness-and-capability
+mechanism (any window size, any machine) rather than a fast one. A redb `path` on NVMe adds the
+file's page-cache behaviour to the same two copies, which is why it sits between the two.

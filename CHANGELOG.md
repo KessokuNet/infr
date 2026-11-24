@@ -70,6 +70,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   returning an `ActivatedListener` enum because the inherited systemd socket may
   be a Unix-domain listener as well as a TCP one.
 
+- **A storage tier that leads `[[kv.tiers]]` is now the slot's backing.** A list
+  whose first entry is `redb` or `redis` makes that store the authoritative copy
+  of the live window: the slot's buffers are host-allocated and the window is
+  written to the store and read back after every forward. This changes what an
+  existing list means — `[[kv.tiers]] backend = "redb"` alone, or
+  `--set kv.tiers=redb` — now runs under it, and a bare redb entry's 1 GiB
+  default becomes the window's bound. Lead with a `vram` or `host` entry to keep
+  the live window in memory with the store for idle blocks: the first entry is
+  what a slot's rows live in, so `vram` + `redb` is the old behavior with an
+  explicit retention reservation. An experiment, not a recommendation (the bytes
+  per step are in `docs/perf/kv-prefix.md`), it runs in `infr serve` and
+  `infr multi`, and one-shot `infr run` places the window host-side and warns
+  that it opens no store.
+
 ### Added
 
 - **`infr serve` enforces a reasoning budget.** `reasoning_effort` on
@@ -123,6 +137,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `host` entry in the list takes precedence over them. `kv.overflow_vram_mb` now
   caps live device KV bytes rather than lifetime bytes (identical until KV
   buffers are freed and reallocated).
+  A storage entry may also lead the list, and then it is the slot's backing
+  instead of a demotion target (see the change note above). The store also keeps
+  the window's tokens, so a later request sharing that prefix resumes without
+  re-prefilling; a model whose cache carries state the rows do not (compressor
+  rings, delta nets) leaves the window in its slot instead. A leading redb
+  tier's `size` must hold one window per slot (the tier is also the host cap),
+  a leading redis tier takes no `size` and cannot have another store below it
+  (the server owns its eviction, so it cannot be the bounded half of a chain),
+  and `ParallelSeam::kv_mirror_stats` reports steps and bytes moved. Window
+  extents live in a reserved id range, kept out of the content-addressed block
+  namespace (a re-derived index, so prefixes saved by the previous id
+  derivation are unreachable), are never evicted as cache blocks, and a window
+  whose slot the engine no longer has is dropped when the store opens. A window
+  is hydrated only when every layer's rows cover what the ring still attends
+  to, the store's KV formats match the slot's, and the pages to place it are
+  free; a failed upload leaves the slot empty rather than claiming the prefix.
 
 - **A request that outgrows the page pool parks an idle conversation instead of
   failing.** `infr serve` with `kv.paged` and a pool too small for every slot now

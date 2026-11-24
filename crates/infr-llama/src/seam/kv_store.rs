@@ -14,17 +14,19 @@
 //! re-prefilling the same tokens costs tens of seconds.
 
 use crate::Config;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use infr_core::backend::Backend;
 use infr_core::config::KvBackend;
 use infr_core::{DType, Metadata, TensorInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+use super::weights::SlotView;
 use super::{
     kv_tier::{
-        decode_meta, encode_meta, Bounded, BudgetedStore, DeviceKv, Fnv, KvRows, KvStore, RedbKv,
-        RedisKv, Tiered, FORMATS_META_ID,
+        decode_meta, encode_meta, is_live_window, Bounded, BudgetedStore, DeviceKv, Fnv, KvRows,
+        KvStore, RedbKv, RedisKv, Tiered, BLOCK_ID_FLOOR, FORMATS_META_ID, LIVE_WINDOW_BASE,
     },
     pool::{PagedSlot, SlotMap},
     weights::{RecurrentSnap, SeamKv},
@@ -53,7 +55,8 @@ pub(crate) fn capture_upto(cfg: &Config, kv: &SeamKv, prompt_len: usize) -> usiz
     }
 }
 
-/// Chain id of a block: the previous block's id mixed with this block's tokens.
+/// Chain id of a block: the previous block's id mixed with this block's tokens, kept below
+/// [`BLOCK_ID_FLOOR`] so a hash can never land on a live window's extent or a metadata id.
 ///
 /// FNV-1a, not `DefaultHasher`: the ids are written to a tier, so they must not change with the
 /// toolchain. Every lookup also compares the token ids, so a collision costs a miss, and a
@@ -64,11 +67,11 @@ fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     for t in tokens {
         h.bytes(&t.to_le_bytes());
     }
-    h.0
+    h.0 % BLOCK_ID_FLOOR
 }
 
 /// Version of the [`store_key`] derivation; bump it so blocks keyed the old way become unreachable.
-const KEY_NAMESPACE_VERSION: u64 = 2;
+const KEY_NAMESPACE_VERSION: u64 = 3;
 
 /// Namespace of a model's blocks: geometry, name, quantization and every tensor's name/dtype/shape;
 /// two files agreeing on all of those yet holding different weights still collide.
@@ -277,6 +280,18 @@ pub(crate) struct BlockCache<S: KvStore> {
     pub(crate) resident_tokens: u64,
     /// Residents given back to the pool under page pressure.
     pub(crate) resident_spills: u64,
+    /// A store-backed window: steps taken, bytes of the window written out and read back, the
+    /// last step's bytes, and live windows hydrated into a slot without a re-prefill.
+    pub(crate) mirror_steps: u64,
+    pub(crate) mirror_written: u64,
+    pub(crate) mirror_read: u64,
+    pub(crate) mirror_last: u64,
+    pub(crate) hydrated: u64,
+    pub(crate) hydrated_tokens: u64,
+    /// The live window's rows coming back from the store, reused across test steps so a mirrored
+    /// window allocates nothing per token.
+    #[cfg(test)]
+    mirror_down: KvRows,
 }
 
 impl<S: KvStore> BlockCache<S> {
@@ -300,6 +315,14 @@ impl<S: KvStore> BlockCache<S> {
             resident_hits: 0,
             resident_tokens: 0,
             resident_spills: 0,
+            mirror_steps: 0,
+            mirror_written: 0,
+            mirror_read: 0,
+            mirror_last: 0,
+            hydrated: 0,
+            hydrated_tokens: 0,
+            #[cfg(test)]
+            mirror_down: KvRows::default(),
         };
         if enabled {
             cache.load();
@@ -334,7 +357,7 @@ impl<S: KvStore> BlockCache<S> {
         };
         let ids: Vec<u64> = ids
             .into_iter()
-            .filter(|id| *id != FORMATS_META_ID)
+            .filter(|id| *id != FORMATS_META_ID && !is_live_window(*id))
             .collect();
         let metas = match self.store.metas(&ids) {
             Ok(metas) => metas,
@@ -373,9 +396,196 @@ impl<S: KvStore> BlockCache<S> {
         self.enabled
     }
 
+    /// Drop the live-window extents no slot of this engine owns: a previous run with a wider
+    /// `--parallel`, or a store-led run whose slots are gone. They are exempt from eviction, so a
+    /// bounded store that kept them would stay over budget for good.
+    pub(crate) fn reserve_windows(&mut self, slots: usize) -> Result<usize> {
+        let ids = self.store.extents()?;
+        let mut dropped = 0;
+        for id in ids.into_iter().filter(|id| is_live_window(*id)) {
+            if (LIVE_WINDOW_BASE - id) as usize >= slots {
+                self.store.remove(id)?;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                slots,
+                "kv store: dropped live windows no slot owns"
+            );
+        }
+        Ok(dropped)
+    }
+
     /// `(blocks, bytes)` currently resident, for the capture log.
     pub(crate) fn stats(&self) -> (usize, usize) {
         (self.index.len(), self.index.values().map(|e| e.bytes).sum())
+    }
+
+    /// Store the rows downloaded from a live window as extent `id`, recording the tokens they
+    /// match when those changed. Returns the bytes written.
+    ///
+    /// Split from the device side (see [`super::Mirror`]) so a slot's step does not hold the
+    /// shared store lock across its download and upload: the transfers touch buffers, not the
+    /// index, and one slot's copy must not stall every other slot's cache lookups.
+    pub(crate) fn mirror_put(
+        &mut self,
+        id: u64,
+        rows: KvRows,
+        meta: Option<&[u32]>,
+    ) -> Result<u64> {
+        let bytes = rows.bytes() as u64;
+        let snap = rows.snap.is_some();
+        self.store.put(id, 0, rows)?;
+        if let Some(tokens) = meta {
+            self.store
+                .set_meta(id, &encode_meta(tokens, snap, bytes as usize))?;
+        }
+        self.mirror_written += bytes;
+        Ok(bytes)
+    }
+
+    /// Read extent `id`'s rows `0..rows` back into `down`, insisting it holds exactly `expect`
+    /// bytes: the store's answer to what was just written, which is what makes it authoritative.
+    pub(crate) fn mirror_read(
+        &mut self,
+        id: u64,
+        rows: usize,
+        expect: u64,
+        down: &mut KvRows,
+    ) -> Result<()> {
+        down.clear();
+        ensure!(
+            self.store.get(id, 0..rows, down)?,
+            "kv store: the live window left the store one step after writing it"
+        );
+        ensure!(
+            down.bytes() as u64 == expect,
+            "kv store: the live window came back as {} bytes, not {expect}",
+            down.bytes()
+        );
+        self.mirror_read += expect;
+        self.mirror_steps += 1;
+        self.mirror_last = expect;
+        Ok(())
+    }
+
+    /// One step of `slot`'s live window through the store: download rows `0..slot.rows`, write
+    /// them as extent `id`, read them back, and write the store's answer into the slot. The
+    /// engine's steps go through [`super::Mirror`], which runs the transfers outside the lock;
+    /// this is the same sequence composition for tests.
+    #[cfg(test)]
+    pub(crate) fn mirror_step(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        slot: SlotView<'_>,
+        id: u64,
+        meta: Option<&[u32]>,
+    ) -> Result<()> {
+        let rows = slot.rows;
+        ensure!(rows > 0, "kv store: a live window of no rows");
+        let mut up = KvRows::default();
+        DeviceKv::on(id, be, cfg, slot).get(id, 0..rows, &mut up)?;
+        let bytes = self.mirror_put(id, up, meta)?;
+        let mut down = std::mem::take(&mut self.mirror_down);
+        let read = self.mirror_read(id, rows, bytes, &mut down);
+        self.mirror_down = down;
+        read?;
+        DeviceKv::on(id, be, cfg, slot).write(id, 0, &self.mirror_down)
+    }
+
+    /// Load extent `id`'s window into `kv` when its recorded tokens are a prefix of `prompt`.
+    ///
+    /// The mirror's counterpart to a block restore, and why a second process resumes without a
+    /// re-prefill: the window is row-exact, so `ParallelSeam::generate` tries it before the block
+    /// index. Anything it cannot prove applies is refused — including every model whose cache
+    /// carries state the rows do not (see `Config::has_unrewindable_state`): the extent holds K/V
+    /// rows and recurrent snapshots, not DeepSeek V4's compressor rings, so restoring one there
+    /// would leave the state that produced those rows behind.
+    pub(crate) fn hydrate(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        kv: &mut SeamKv,
+        prompt: &[u32],
+        id: u64,
+    ) -> Result<usize> {
+        if cfg.has_unrewindable_state() {
+            return Ok(0);
+        }
+        let Some(blob) = self.store.meta(id)? else {
+            return Ok(0);
+        };
+        let (tokens, snap, _bytes) = decode_meta(&blob)?;
+        // The rows were written under one pair of KV formats; another pair is not a cache miss
+        // that a re-prefill repairs, it is a different row layout for the same extent.
+        if self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
+            tracing::debug!(
+                stored = ?(self.k_fmt, self.v_fmt),
+                wanted = ?(kv.k_fmt, kv.v_fmt),
+                "kv store: the stored window has other KV formats"
+            );
+            return Ok(0);
+        }
+        // The runner never starts a prefill past `prompt.len() - 1` (one token has to be fed to
+        // sample from), so a longer prefix would not be used even if the store held it.
+        let n = super::common_prefix_len(&tokens, prompt).min(prompt.len().saturating_sub(1));
+        if n < MIN_PREFIX_TOKENS || n <= kv.cached_len() {
+            return Ok(0);
+        }
+        // A ring recycled the rows before `written_end`; a window that long is not in the store
+        // either (its first rows were never mirrored).
+        if kv.window_ring_rows(be, cfg).is_some_and(|rows| n > rows) {
+            return Ok(0);
+        }
+        let mut rows = KvRows::default();
+        if !self.store.get(id, 0..n, &mut rows)? {
+            return Ok(0);
+        }
+        // A snapshot travels with the extent's LAST row only, so a shorter prefix has none.
+        if snap && rows.snap.is_none() {
+            return Ok(0);
+        }
+        // A wrapped ring leaves the oldest rows in no layer at all: the extent's token metadata
+        // still names them, the rows it holds start later. Adopting that window would claim rows
+        // the attention kernel never receives, so require every layer to cover them — the same
+        // check a block restore makes.
+        for l in 0..cfg.n_layer {
+            if cfg.is_recurrent_layer(l) {
+                continue;
+            }
+            let from = kv.row_layout(be, cfg, l).oldest_resident(n);
+            if from < n && !rows.layers.get(l).is_some_and(|r| r.covers(from..n)) {
+                tracing::debug!(
+                    layer = l,
+                    need = from,
+                    "kv store: the stored window misses the rows a layer still attends to"
+                );
+                return Ok(0);
+            }
+        }
+        if let Some(p) = kv.paged.as_mut() {
+            // Hydration is an optimisation: pages it cannot get are a re-prefill, not a failure.
+            if p.make_private(be, 0, n).is_err() {
+                tracing::debug!(rows = n, "kv store: no pages for the stored window");
+                return Ok(0);
+            }
+        }
+        if let Err(e) = DeviceKv::new(id, be, cfg, kv).put(id, 0, rows) {
+            // Some layers may have landed before the failing one; the slot cannot claim a prefix
+            // its rows no longer match.
+            kv.reset();
+            return Err(e);
+        }
+        kv.cached.clear();
+        kv.cached.extend_from_slice(&tokens[..n]);
+        kv.written_end = n;
+        self.hydrated += 1;
+        self.hydrated_tokens += n as u64;
+        tracing::debug!(id, rows = n, "kv store: adopted the stored window");
+        Ok(n)
     }
 
     /// Store block `id`'s rows and index it, replacing any block under the same id.
@@ -506,7 +716,14 @@ impl<S: KvStore> BlockCache<S> {
         if !self.enabled() && self.resident.is_empty() {
             return Ok(0);
         }
+        let started = std::time::Instant::now();
         let (mut p, hits) = self.matched(prompt);
+        tracing::debug!(
+            prompt = prompt.len(),
+            matched = p,
+            blocks = hits.len(),
+            "kv store: restore matched"
+        );
         if p < MIN_PREFIX_TOKENS || self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
             return Ok(0);
         }
@@ -603,6 +820,13 @@ impl<S: KvStore> BlockCache<S> {
         }
         kv.written_end = n;
         kv.cached = prompt[..n].to_vec();
+        tracing::debug!(
+            tokens = n,
+            adopted = first,
+            read = n - first,
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            "kv store: restore filled the window"
+        );
         Ok(n)
     }
 
@@ -830,6 +1054,13 @@ impl<S: KvStore> BlockCache<S> {
         // One download per layer from the first new block; blocks already stored in between are
         // read and dropped, and rows a ring recycled come back absent.
         let from = missing[0].0;
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            from,
+            rows = p - from,
+            blocks = missing.len(),
+            "kv store: capture starts"
+        );
         let mut all = KvRows::default();
         DeviceKv::new(SLOT, be, cfg, kv).get(SLOT, from..p, &mut all)?;
         for (start, len, id) in &missing {
@@ -841,6 +1072,13 @@ impl<S: KvStore> BlockCache<S> {
         }
         self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, all.snap.take())?;
         self.captures += 1;
+        tracing::debug!(
+            rows = p,
+            blocks = missing.len(),
+            bytes = all.bytes(),
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            "kv store: captured a prefix"
+        );
         Ok(p)
     }
 
@@ -932,13 +1170,14 @@ pub(crate) fn prefix_store_for(
         chain = match chain {
             Some(slow) => match opened {
                 Opened::Budgeted(fast) => Some(Box::new(Tiered::new(fast, slow))),
-                Opened::Plain(_) => {
-                    tracing::warn!(
-                        tier = %tier.describe(),
-                        "kv store: a tier that cannot evict must be the last one; dropping it"
-                    );
-                    Some(slow)
-                }
+                // Only a redis tier opens this way, and only when it leads the list with another
+                // store below it. `Config::load` refuses that list; a caller that skipped the
+                // check gets the same answer here rather than a chain the placement does not name.
+                Opened::Plain(_) => anyhow::bail!(
+                    "kv store: tier {i} ({}) cannot hold a chain above it, because it does not \
+                     evict; declare the bounded store first",
+                    tier.describe()
+                ),
             },
             None => Some(match opened {
                 Opened::Budgeted(store) => Box::new(Bounded::new(store)),
@@ -1052,6 +1291,7 @@ fn upload_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seam::kv_tier::live_window_id;
     use crate::seam::kv_tier::{decode_rows, encode_rows, BudgetedStore, LayerRows};
     use crate::seam::rows::{read_rows, write_rows};
     use infr_core::MetaValue;
@@ -2456,5 +2696,382 @@ mod tests {
         let bare = weights_key(&cfg, &m, &tensors);
         assert_ne!(bare, weights_key(&cfg, &meta, &tensors));
         assert_eq!(bare, weights_key(&cfg, &m, &tensors));
+    }
+
+    /// The rows a slot of `n` tokens holds, as its own device download reports them.
+    fn window_of(be: &dyn Backend, cfg: &Config, kv: &SeamKv, id: u64) -> KvRows {
+        let mut out = KvRows::default();
+        assert!(
+            DeviceKv::new(id, be, cfg, kv)
+                .get(id, 0..kv.written_end, &mut out)
+                .unwrap(),
+            "the slot holds its own rows"
+        );
+        out
+    }
+
+    /// Every step moves the whole window out to the store and back: both byte totals advance by
+    /// the window's bytes, the extent in the store is that window, and the slot still holds it.
+    #[test]
+    fn a_mirror_step_round_trips_the_window_every_time() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let mut c = cache();
+        let kv = filled_slot(&be, &cfg, false, 4);
+        let id = live_window_id(0);
+        let window = window_of(&be, &cfg, &kv, id).bytes();
+        assert_eq!(
+            window,
+            4 * 2 * 2 * ROW * 2,
+            "4 rows of 2 layers, k and v, f16"
+        );
+
+        for step in 1..=2u64 {
+            let meta = (step == 1).then_some(&kv.cached[..]);
+            c.mirror_step(&be, &cfg, kv.view(), id, meta).unwrap();
+            assert_eq!(
+                (
+                    c.mirror_steps,
+                    c.mirror_written,
+                    c.mirror_read,
+                    c.mirror_last
+                ),
+                (
+                    step,
+                    window as u64 * step,
+                    window as u64 * step,
+                    window as u64
+                )
+            );
+            let stored = held(&mut c.store, id, 4);
+            assert_eq!(stored.bytes(), window);
+            assert_eq!(window_of(&be, &cfg, &kv, id).layers, stored.layers);
+        }
+
+        // The metadata names the window's tokens, which is what a later process reads to decide
+        // whether the extent applies at all.
+        let blob = c.store.meta(id).unwrap().expect("the window has metadata");
+        let (tokens, snap, bytes) = decode_meta(&blob).unwrap();
+        assert_eq!(tokens, kv.cached);
+        assert_eq!((snap, bytes), (false, window));
+    }
+
+    /// A store that hands back something else than it was given: the slot must end up holding the
+    /// STORE's answer, which is the property that makes the store authoritative.
+    #[derive(Default)]
+    struct Inverting {
+        rows: std::collections::HashMap<u64, KvRows>,
+        metas: std::collections::HashMap<u64, Vec<u8>>,
+    }
+
+    impl KvStore for Inverting {
+        fn get(&mut self, id: u64, rows: std::ops::Range<usize>, out: &mut KvRows) -> Result<bool> {
+            let Some(stored) = self.rows.get(&id) else {
+                return Ok(false);
+            };
+            out.append(stored, rows)?;
+            for layer in &mut out.layers {
+                layer.k.iter_mut().for_each(|b| *b = !*b);
+                layer.v.iter_mut().for_each(|b| *b = !*b);
+            }
+            Ok(true)
+        }
+
+        fn put(&mut self, id: u64, _first: usize, rows: KvRows) -> Result<()> {
+            self.rows.insert(id, rows);
+            Ok(())
+        }
+
+        fn remove(&mut self, id: u64) -> Result<()> {
+            self.rows.remove(&id);
+            self.metas.remove(&id);
+            Ok(())
+        }
+
+        fn contains(&self, id: u64) -> bool {
+            self.rows.contains_key(&id)
+        }
+
+        fn extents(&mut self) -> Result<Vec<u64>> {
+            Ok(self.rows.keys().copied().collect())
+        }
+
+        fn meta(&mut self, id: u64) -> Result<Option<Vec<u8>>> {
+            Ok(self.metas.get(&id).cloned())
+        }
+
+        fn set_meta(&mut self, id: u64, meta: &[u8]) -> Result<()> {
+            self.metas.insert(id, meta.to_vec());
+            Ok(())
+        }
+
+        fn metas(&mut self, ids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
+            Ok(ids.iter().map(|id| self.metas.get(id).cloned()).collect())
+        }
+    }
+
+    /// The read-back half is not decoration: whatever the store answers is written into the slot.
+    #[test]
+    fn a_mirror_step_writes_the_store_answer_back_into_the_slot() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let id = live_window_id(1);
+        let mut c = BlockCache::new(Inverting::default(), true);
+        let kv = filled_slot(&be, &cfg, false, 3);
+        let before = window_of(&be, &cfg, &kv, id);
+
+        c.mirror_step(&be, &cfg, kv.view(), id, None).unwrap();
+        let after = window_of(&be, &cfg, &kv, id);
+        for (l, (was, now)) in before.layers.iter().zip(&after.layers).enumerate() {
+            assert_eq!(now.runs, was.runs, "layer {l} keeps its runs");
+            assert!(
+                now.k.iter().zip(&was.k).all(|(n, w)| *n == !*w),
+                "layer {l} k"
+            );
+            assert!(
+                now.v.iter().zip(&was.v).all(|(n, w)| *n == !*w),
+                "layer {l} v"
+            );
+        }
+    }
+
+    /// A window the store already holds is loaded into a fresh slot instead of being prefilled
+    /// again — and only when the tokens it was written for are a prefix of the new prompt.
+    #[test]
+    fn a_stored_window_hydrates_a_fresh_slot() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let mut c = cache();
+        let kv = filled_slot(&be, &cfg, false, MIN_PREFIX_TOKENS + 4);
+        let id = live_window_id(2);
+        c.mirror_step(&be, &cfg, kv.view(), id, Some(&kv.cached))
+            .unwrap();
+        let stored = window_of(&be, &cfg, &kv, id);
+
+        let mut fresh = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        let mut prompt = kv.cached.clone();
+        prompt.push(9999);
+        let n = c.hydrate(&be, &cfg, &mut fresh, &prompt, id).unwrap();
+        assert_eq!(n, kv.cached.len());
+        assert_eq!(fresh.cached, kv.cached);
+        assert_eq!(fresh.written_end, n);
+        assert_eq!(window_of(&be, &cfg, &fresh, id).layers, stored.layers);
+        assert_eq!((c.hydrated, c.hydrated_tokens), (1, n as u64));
+
+        // A prompt that only shares a short prefix does not take the window.
+        let mut other = prompt.clone();
+        other[MIN_PREFIX_TOKENS / 2] ^= 1;
+        let mut second = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(c.hydrate(&be, &cfg, &mut second, &other, id).unwrap(), 0);
+        assert!(second.cached.is_empty() && second.written_end == 0);
+
+        // Nor a slot that already sits past what the store holds.
+        assert_eq!(c.hydrate(&be, &cfg, &mut fresh, &prompt, id).unwrap(), 0);
+    }
+
+    /// A store that answers with damaged rows: a layer left out, as a wrapped ring's extent does,
+    /// or bytes that are not the ones written. Hydration has to refuse the answer before it
+    /// uploads any of it.
+    #[derive(Default)]
+    struct Damaged {
+        rows: std::collections::HashMap<u64, KvRows>,
+        metas: std::collections::HashMap<u64, Vec<u8>>,
+        drop_layer: Option<usize>,
+        inflate: usize,
+    }
+
+    impl KvStore for Damaged {
+        fn get(&mut self, id: u64, rows: std::ops::Range<usize>, out: &mut KvRows) -> Result<bool> {
+            let Some(stored) = self.rows.get(&id) else {
+                return Ok(false);
+            };
+            out.append(stored, rows)?;
+            if let Some(l) = self.drop_layer {
+                if let Some(layer) = out.layers.get_mut(l) {
+                    *layer = LayerRows::default();
+                }
+            }
+            if self.inflate > 0 {
+                if let Some(layer) = out.layers.last_mut() {
+                    layer.k.extend(vec![0u8; self.inflate]);
+                }
+            }
+            Ok(true)
+        }
+
+        fn put(&mut self, id: u64, _first: usize, rows: KvRows) -> Result<()> {
+            self.rows.insert(id, rows);
+            Ok(())
+        }
+
+        fn remove(&mut self, id: u64) -> Result<()> {
+            self.rows.remove(&id);
+            self.metas.remove(&id);
+            Ok(())
+        }
+
+        fn contains(&self, id: u64) -> bool {
+            self.rows.contains_key(&id)
+        }
+
+        fn extents(&mut self) -> Result<Vec<u64>> {
+            Ok(self.rows.keys().copied().collect())
+        }
+
+        fn meta(&mut self, id: u64) -> Result<Option<Vec<u8>>> {
+            Ok(self.metas.get(&id).cloned())
+        }
+
+        fn set_meta(&mut self, id: u64, meta: &[u8]) -> Result<()> {
+            self.metas.insert(id, meta.to_vec());
+            Ok(())
+        }
+
+        fn metas(&mut self, ids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
+            Ok(ids.iter().map(|id| self.metas.get(id).cloned()).collect())
+        }
+    }
+
+    /// A window whose extent does not cover the rows a layer still attends to is a miss, not an
+    /// adoption: the metadata names the tokens it was written for, the wrapped ring does not hold
+    /// them any more, and returning success would leave the kernel reading rows nobody wrote.
+    #[test]
+    fn a_stored_window_that_drops_a_layer_is_refused() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let kv = filled_slot(&be, &cfg, false, MIN_PREFIX_TOKENS + 4);
+        let id = live_window_id(3);
+        let mut store = Damaged {
+            drop_layer: Some(1),
+            ..Default::default()
+        };
+        let window = window_of(&be, &cfg, &kv, id);
+        let bytes = window.bytes();
+        store.rows.insert(id, window);
+        store
+            .metas
+            .insert(id, encode_meta(&kv.cached, false, bytes));
+        let mut c = BlockCache::new(store, true);
+        let mut fresh = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        let mut prompt = kv.cached.clone();
+        prompt.push(9999);
+
+        assert_eq!(c.hydrate(&be, &cfg, &mut fresh, &prompt, id).unwrap(), 0);
+        assert!(fresh.cached.is_empty() && fresh.written_end == 0);
+        assert_eq!((c.hydrated, c.hydrated_tokens), (0, 0));
+    }
+
+    /// A window written under other KV formats is a layout mismatch, not a stale prefix, and the
+    /// slot must not take any of it.
+    #[test]
+    fn a_stored_window_in_other_kv_formats_is_refused() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let mut c = cache();
+        let kv = filled_slot(&be, &cfg, false, MIN_PREFIX_TOKENS + 4);
+        let id = live_window_id(4);
+        c.mirror_step(&be, &cfg, kv.view(), id, Some(&kv.cached))
+            .unwrap();
+        let mut prompt = kv.cached.clone();
+        prompt.push(9999);
+
+        let mut q8 = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::Q8_0).unwrap();
+        assert_eq!(c.hydrate(&be, &cfg, &mut q8, &prompt, id).unwrap(), 0);
+        assert!(q8.cached.is_empty() && q8.written_end == 0);
+        // The same window still applies to a slot in the formats it was written with.
+        let mut f16 = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(
+            c.hydrate(&be, &cfg, &mut f16, &prompt, id).unwrap(),
+            kv.cached.len()
+        );
+    }
+
+    /// A layer that fails mid-upload leaves the slot claiming a prefix its rows no longer match;
+    /// the claim has to go, or a later request matching the old tokens reuses garbage.
+    #[test]
+    fn a_failed_hydration_clears_the_slots_claim() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let kv = filled_slot(&be, &cfg, false, MIN_PREFIX_TOKENS + 4);
+        let id = live_window_id(5);
+        let mut store = Damaged {
+            inflate: 8,
+            ..Default::default()
+        };
+        let window = window_of(&be, &cfg, &kv, id);
+        let bytes = window.bytes();
+        store.rows.insert(id, window);
+        store
+            .metas
+            .insert(id, encode_meta(&kv.cached, false, bytes));
+        let mut c = BlockCache::new(store, true);
+        let mut stale = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        stale.cached = tokens(9, 5);
+        stale.written_end = 5;
+        let mut prompt = kv.cached.clone();
+        prompt.push(9999);
+
+        assert!(c.hydrate(&be, &cfg, &mut stale, &prompt, id).is_err());
+        assert!(stale.cached.is_empty() && stale.written_end == 0);
+    }
+
+    /// Live windows are exempt from eviction, so one whose slot this engine does not have would
+    /// stay charged to a bounded store for good; opening drops it.
+    #[test]
+    fn a_live_window_no_slot_owns_is_dropped_at_open() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let mut c = cache();
+        let kv = filled_slot(&be, &cfg, false, MIN_PREFIX_TOKENS + 4);
+        for slot in [0usize, 5] {
+            c.mirror_step(&be, &cfg, kv.view(), live_window_id(slot), Some(&kv.cached))
+                .unwrap();
+        }
+
+        assert_eq!(c.reserve_windows(1).unwrap(), 1);
+        assert!(c.store.contains(live_window_id(0)));
+        assert!(!c.store.contains(live_window_id(5)));
+    }
+
+    /// The reserved band only separates live windows from blocks if no hash can reach it.
+    #[test]
+    fn a_block_id_never_lands_on_a_reserved_extent() {
+        for i in 0..1024u64 {
+            let id = block_id(i, &[i as u32, 7]);
+            assert!(id < BLOCK_ID_FLOOR, "{id:x}");
+            assert!(!is_live_window(id), "{id:x}");
+        }
+    }
+
+    /// A step rewrites the extent's metadata when the window's tokens change under the same count:
+    /// a rewind that keeps the length would otherwise leave the metadata naming another
+    /// conversation's tokens, and that is what a later process reads to decide whether to adopt a
+    /// stored window at all.
+    #[test]
+    fn a_step_rewrites_the_metadata_when_the_tokens_change_under_the_same_count() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(BlockCache::new(
+            Box::new(RedbKv::open_memory(0, 1 << 20).unwrap()) as Box<dyn KvStore>,
+            true,
+        )));
+        let window = std::sync::Arc::new(crate::seam::LiveWindow::new(shared.clone()));
+        let mut kv = filled_slot(&be, &cfg, false, 3);
+        let slot = 3;
+        crate::seam::attach_mirror(&mut kv, &window, slot).unwrap();
+        let id = live_window_id(slot);
+        let mirror = kv.mirror.clone().expect("the slot mirrors");
+        let named = || {
+            let mut c = shared.lock().unwrap();
+            let blob = c.store.meta(id).unwrap().expect("the window has metadata");
+            decode_meta(&blob).unwrap().0
+        };
+
+        mirror.step(&be, &cfg, kv.view()).unwrap();
+        assert_eq!(named(), kv.cached, "the first step names the window");
+
+        kv.cached[1] ^= 1;
+        mirror.step(&be, &cfg, kv.view()).unwrap();
+        assert_eq!(named(), kv.cached, "the same count, different tokens");
     }
 }

@@ -1,8 +1,10 @@
 # Plan 19: KV cache as a store, anywhere
 
 Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 done (the `vram` tier: config and sizing,
-then its behaviour under pressure); P3 built and green on the CPU gate, Vulkan checks and
-measurements still owed to hardware; P4 scoped. 18 unified where idle blocks
+then its behaviour under pressure); P3 built and green on the CPU gate plus its Vulkan placement
+tests, `kv.paged` on a real model and the bit-identity/decode numbers still owed to hardware; P4
+built and measured (the store-backed experiment; the cost table in `docs/perf/kv-prefix.md` says it
+is not a speed play). Plan 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
 the default rather than a hard-coded device buffer.
 
@@ -34,7 +36,8 @@ bytes per token times the window. With F16 K/V:
 
 Fair attention over 1 GbE puts the 8B row into seconds per token. So the live window's memory must
 be device-addressable: either device-local VRAM, or host memory the kernels can address. A `redb` or
-`redis` tier backs a restore, never a step. Rows cross the bus between requests, not during one.
+`redis` tier backs a restore, never a step — unless it leads the list, which is P4's experiment and
+pays the numbers above per step.
 
 ## Design
 
@@ -134,18 +137,77 @@ that rounding: leave a few MiB.
     entry it is the device part of the live windows. The legacy flag keeps its old sizing (full
     cache priced in VRAM, the spill as the clamp ladder's last rung, paged window per slot): only
     an explicit `host` entry has a host size, so only it gets the exact fit.
-- **P4** (scoped) the remote-primary experiment: `[[kv.tiers]]` with `redis` (or `redb`) as the
-  first entry, host-resident slot buffers, and the live window synchronised with that store each
-  step — the configuration that proves placement is a property of the list rather than of the
-  engine. Gate: output bit-identical to a vram tier, bytes transferred per step recorded and equal
-  to the window, and the cost published. Expect it to be slow where the table above says it must be
-  (a 4k window at 128 KB/token is ~0.5 GB over loopback per step); the small-model short-context row
-  is the one that stays usable, and both numbers are what close the question for good.
+- **P4** (built and measured) the store-backed experiment: `[[kv.tiers]]` with `redis` (or
+  `redb`) as the first entry, host-resident slot buffers, and the live window synchronised with that
+  store each step — the configuration that proves placement is a property of the list rather than of
+  the engine. Gate: output bit-identical to a vram tier, bytes transferred per step recorded and
+  equal to the window, and the cost published. Expect it to be slow where the table above says it
+  must be (a 4k window at 128 KB/token is ~0.5 GB over loopback per step); the small-model
+  short-context row is the one that stays usable, and both numbers are what close the question for
+  good.
+  - *Built and green on the CPU gate:* `KvCfg::residency` resolves a leading storage entry to
+    `store_backed` with `device_cap = Some(0)` and a host cap (the redb `size`, or unbounded for
+    a redis tier, whose budget belongs to the server), so every live KV allocation already takes
+    the P3 `alloc_kv_host` path — a leading storage tier therefore also implies host-resident slot
+    buffers, and `kv.paged` alongside it is redundant rather than wrong. A window's extent id
+    comes from a reserved range (`LIVE_WINDOW_BASE` down, one per slot, 1024 slots) and content
+    block ids are mapped below it (`BLOCK_ID_FLOOR`), so the two id spaces cannot collide; the block
+    index walks blocks, the mirror walks its own ids, and neither can evict the other (`RedbKv` LRU
+    skips reserved live ids, `BlockCache::load` filters them, and a stored window no slot of this
+    engine owns is dropped at open). A leading `redis` entry cannot have another store below it —
+    the server owns its eviction, so it cannot be the bounded half of a chain — and that is a load
+    error rather than a silent reassignment of the primary. `seam::mirror` holds
+    the per-slot `Mirror`, `LiveWindow` (the shared `BlockCache` behind its lock) and `attach`;
+    `SeamKv.mirror` is `None` by default, so an unmirrored run is unchanged. Six hooks fire after
+    each forward that advances the window (DG denoise, MTP verify, chained prefill chunk, chain
+    accept, per-token decode, and teardown where `cached` becomes the full window); each step
+    downloads rows 0..`written_end` unlocked, takes the cache lock only for the store write and
+    read-back, and writes the store's answer into the slot unlocked — the round trip is what makes
+    the store authoritative, and `steps`, `bytes written`, `bytes read`, `last step bytes` are kept
+    beside the prefix-cache counters (`ParallelSeam::kv_mirror_stats`). The extent's side metadata
+    names the window's tokens, so `ParallelSeam` hydrates a slot from the store on checkout when
+    those tokens prefix the prompt, before the block restore, and skips the re-prefill
+    (`kv_hydrate_stats`). Hydration refuses models whose cache carries state the rows do not
+    (`Config::has_unrewindable_state`: compressor rings, delta nets), and the engine leaves the
+    window in the slot for them with a warning — a store cannot replay state it never held. It also
+    refuses a stored window whose layers do not cover what a wrapped ring still attends to, one
+    saved under other KV formats, and one whose pages cannot be made private without exhausting the
+    pool (a miss, not a failed request); a failed upload resets the slot instead of leaving it
+    claiming rows it lost. The CPU
+    gate shows: leading-tier resolution and its errors naming `kv.tiers[0]`; a mirror step against
+    an in-memory redb moving exactly the window's bytes each way, twice, with the counters
+    accumulating; a store that answers with inverted bytes ending up in the slot; tokens
+    bit-identical to a `vram` tier with `steps == prefills + fed tokens + 1` and the last step equal
+    to `rows x row bytes`; and a fresh slot resuming a stored window with `n_cached == rows - 1` and
+    the same continuation the first run produced.
+  - *Needs hardware:* the decode-rate and bytes/step table
+    (`crates/infr-llama/tests/kv_store_backed.rs`, `#[ignore]`, `INFR_TEST_MODEL` or the HF cache,
+    `INFR_TEST_REDIS_URL` at an empty database) at ~2k and ~8k for `vram`, redb-on-disk and
+    Valkey-over-loopback, and `crates/infr-vulkan/tests/kv_store_backed.rs` for the placement
+    claim on a real device.
+  - *Measured:* Qwen2.5-0.5B q4_k_m, RX 580, decode after a ~2k/~8k prompt: 141.5 tok/s on `vram`
+    against 27.7 with redb on disk and 23.2 with Valkey over loopback; at ~8k, 79.4 against 7.8 and
+    6.1. The window (98 MB at ~8k) moves out and back every step, so the run is 1.5 GB/s of store
+    traffic, and the loopback store lands below a redb file: the experiment answers its own question
+    — the window can live anywhere, and anywhere but the device is one to two orders of magnitude
+    slower. `docs/perf/kv-prefix.md` carries the table, the driver and the Valkey version.
+  - *Still owed:* `kv.paged` beside a leading storage tier (built, redundant, unexercised). The
+    placement claim itself is checked on a device: `crates/infr-vulkan/tests/kv_store_backed.rs`
+    passes on the RX 580 (no device KV allocated for a leading store tier).
+  - *Semantics to know:* a failed step fails the generation, because the store is the authoritative
+    copy under this placement; the store's extent holds stale tail rows after a rewind while the
+    metadata keeps naming only the tokens the rows are known to match; a speculative chain writes
+    rows past `cached` before they are accepted; a recurrent snapshot rides the extent only when it
+    sits exactly at the window's end, and a model with unwindable state is refused outright; and the
+    window counts against the store's own budget like any other extent, so a redb `size` smaller
+    than the window is refused at open rather than mirrored into nothing. The mirror lives where the
+    prefix store is opened (the `ParallelSeam` engine: `infr serve`, `infr multi`); one-shot
+    `infr run` places the window host-side instead and warns that it opens no store.
 
 ## Non-goals
 
 - Serving full attention from a `redb` or `redis` tier as a recommended configuration; P4's
-  remote-primary experiment exists to show the path works, not to make it the default.
+  store-backed experiment exists to show the path works, not to make it the default.
 - Multi-device stores: a tier lives on one device, and the tensor-parallel wrappers stay as they are.
 - Changing what a plain `infr run` does: the implicit `vram` tier is the default, so the default
   stays device-local.

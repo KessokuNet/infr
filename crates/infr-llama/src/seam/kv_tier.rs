@@ -18,7 +18,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use super::{
     kv_row_elems,
     rows::{read_rows, row_bytes, write_rows, RowLayout},
-    weights::{RecurrentSnap, SeamKv},
+    weights::{RecurrentSnap, SeamKv, SlotView},
 };
 use crate::Config;
 
@@ -123,6 +123,18 @@ impl KvRows {
 
     /// Append `src`'s rows `range` after this one's last row. The snapshot becomes `src`'s when
     /// `range` ends at `src`'s end, and none otherwise.
+    /// Empty this back to zero rows, keeping the per-layer buffers' capacity so a reader that
+    /// fills it every step allocates nothing.
+    pub(crate) fn clear(&mut self) {
+        self.rows = 0;
+        self.snap = None;
+        for l in &mut self.layers {
+            l.k.clear();
+            l.v.clear();
+            l.runs.clear();
+        }
+    }
+
     pub(crate) fn append(&mut self, src: &KvRows, range: Range<usize>) -> Result<()> {
         ensure!(
             range.start <= range.end && range.end <= src.rows,
@@ -449,6 +461,30 @@ pub(crate) const FORMATS_META_ID: u64 = u64::MAX;
 /// A second side-metadata id, kept out of the extent namespace.
 pub(crate) const RESERVED_META_ID: u64 = u64::MAX - 1;
 
+/// Slot 0's id for the extent holding its LIVE window when a storage tier leads `[[kv.tiers]]`
+/// (see `crate::seam::LiveWindow`): slot `i` uses `LIVE_WINDOW_BASE - i`. Reserved like the two
+/// ids above, but a real extent: [`BLOCK_ID_FLOOR`] keeps content-addressed block ids below this
+/// band, so the prefix index and the mirror share one store separated only by id space.
+pub(crate) const LIVE_WINDOW_BASE: u64 = u64::MAX - 2;
+
+/// Slots a store can hold live windows for. `--parallel` above this is refused by the engine.
+pub(crate) const LIVE_WINDOW_SLOTS: u64 = 1024;
+
+/// Exclusive upper bound on a content-addressed block id: every hashed id is reduced below it, so
+/// no block can land on a live window's id, on either metadata id, or on the band between them.
+pub(crate) const BLOCK_ID_FLOOR: u64 = LIVE_WINDOW_BASE - LIVE_WINDOW_SLOTS;
+
+/// The extent id of slot `slot`'s live window.
+pub(crate) const fn live_window_id(slot: usize) -> u64 {
+    LIVE_WINDOW_BASE - slot as u64
+}
+
+/// Whether `id` belongs to the live-window range rather than to a content-addressed block. Those
+/// extents are owned by their slot, never indexed as blocks and never evicted as cache.
+pub(crate) const fn is_live_window(id: u64) -> bool {
+    id < LIVE_WINDOW_BASE + 1 && id >= BLOCK_ID_FLOOR
+}
+
 impl<S: KvStore + ?Sized> KvStore for Box<S> {
     fn get(&mut self, id: u64, rows: Range<usize>, out: &mut KvRows) -> Result<bool> {
         (**self).get(id, rows, out)
@@ -525,21 +561,67 @@ pub(crate) struct DeviceKv<'a> {
     id: u64,
     be: &'a dyn Backend,
     cfg: &'a Config,
-    kv: &'a SeamKv,
+    slot: SlotView<'a>,
 }
 
 impl<'a> DeviceKv<'a> {
     pub(crate) fn new(id: u64, be: &'a dyn Backend, cfg: &'a Config, kv: &'a SeamKv) -> Self {
-        Self { id, be, cfg, kv }
+        Self::on(id, be, cfg, kv.view())
+    }
+
+    /// A slot whose fields the caller holds destructured (the runner's per-step mirror hook).
+    pub(crate) fn on(id: u64, be: &'a dyn Backend, cfg: &'a Config, slot: SlotView<'a>) -> Self {
+        Self { id, be, cfg, slot }
     }
 
     fn check(&self, id: u64, end: usize) -> Result<()> {
         ensure!(id == self.id, "kv slot {} has no extent {id}", self.id);
         ensure!(
-            end <= self.kv.max_ctx,
+            end <= self.slot.max_ctx,
             "kv rows up to {end} past a slot of {}",
-            self.kv.max_ctx
+            self.slot.max_ctx
         );
+        Ok(())
+    }
+
+    /// Write `rows` into this slot from `first`, leaving them with the caller so a per-step reader
+    /// reuses its buffers. [`KvStore::put`] is this, taking the rows by value.
+    pub(crate) fn write(&self, id: u64, first: usize, rows: &KvRows) -> Result<()> {
+        self.check(id, first + rows.rows)?;
+        ensure!(
+            rows.layers.is_empty() || rows.layers.len() == self.cfg.n_layer,
+            "kv rows of {} layers written to {}",
+            rows.layers.len(),
+            self.cfg.n_layer
+        );
+        for (l, src) in rows.layers.iter().enumerate() {
+            let Some(d) = self.layer(l) else { continue };
+            let (kb, vb) = (row_bytes(d.k_fmt, d.k_row)?, row_bytes(d.v_fmt, d.v_row)?);
+            let held = src.held();
+            ensure!(
+                src.k.len() == held * kb && (d.v_row == 0 || src.v.len() == held * vb),
+                "kv rows of layer {l} hold the wrong byte count"
+            );
+            let mut at = 0;
+            for run in &src.runs {
+                let span = first + run.start..first + run.end;
+                let k = &src.k[at * kb..(at + run.len()) * kb];
+                write_rows(self.be, d.k, d.k_fmt, d.k_row, &*d.layout, span.clone(), k)?;
+                if d.v_row > 0 {
+                    let v = &src.v[at * vb..(at + run.len()) * vb];
+                    write_rows(self.be, d.v, d.v_fmt, d.v_row, &*d.layout, span, v)?;
+                }
+                at += run.len();
+            }
+        }
+        if let Some(snap) = &rows.snap {
+            for (l, bytes) in &snap.k {
+                self.be.upload(self.slot.kbufs[*l].as_ref(), bytes)?;
+            }
+            for (l, bytes) in &snap.v {
+                self.be.upload(self.slot.vbufs[*l].as_ref(), bytes)?;
+            }
+        }
         Ok(())
     }
 }
@@ -595,8 +677,8 @@ impl KvStore for DeviceKv<'_> {
         }
         out.rows += rows.len();
         out.snap = self
-            .kv
-            .recurrent_snaps
+            .slot
+            .snaps
             .iter()
             .find(|s| s.pos > 0 && s.pos == rows.end)
             .map(|s| Arc::new(s.clone()));
@@ -604,42 +686,7 @@ impl KvStore for DeviceKv<'_> {
     }
 
     fn put(&mut self, id: u64, first: usize, rows: KvRows) -> Result<()> {
-        self.check(id, first + rows.rows)?;
-        ensure!(
-            rows.layers.is_empty() || rows.layers.len() == self.cfg.n_layer,
-            "kv rows of {} layers written to {}",
-            rows.layers.len(),
-            self.cfg.n_layer
-        );
-        for (l, src) in rows.layers.iter().enumerate() {
-            let Some(d) = self.layer(l) else { continue };
-            let (kb, vb) = (row_bytes(d.k_fmt, d.k_row)?, row_bytes(d.v_fmt, d.v_row)?);
-            let held = src.held();
-            ensure!(
-                src.k.len() == held * kb && (d.v_row == 0 || src.v.len() == held * vb),
-                "kv rows of layer {l} hold the wrong byte count"
-            );
-            let mut at = 0;
-            for run in &src.runs {
-                let span = first + run.start..first + run.end;
-                let k = &src.k[at * kb..(at + run.len()) * kb];
-                write_rows(self.be, d.k, d.k_fmt, d.k_row, &*d.layout, span.clone(), k)?;
-                if d.v_row > 0 {
-                    let v = &src.v[at * vb..(at + run.len()) * vb];
-                    write_rows(self.be, d.v, d.v_fmt, d.v_row, &*d.layout, span, v)?;
-                }
-                at += run.len();
-            }
-        }
-        if let Some(snap) = &rows.snap {
-            for (l, bytes) in &snap.k {
-                self.be.upload(self.kv.kbufs[*l].as_ref(), bytes)?;
-            }
-            for (l, bytes) in &snap.v {
-                self.be.upload(self.kv.vbufs[*l].as_ref(), bytes)?;
-            }
-        }
-        Ok(())
+        self.write(id, first, &rows)
     }
 
     fn remove(&mut self, id: u64) -> Result<()> {
@@ -658,14 +705,14 @@ impl DeviceKv<'_> {
             return None;
         }
         let (k_row, v_row) = kv_row_elems(self.cfg, l);
-        let layout = self.kv.row_layout(self.be, self.cfg, l);
+        let layout = self.slot.row_layout(self.be, self.cfg, l);
         // Rows a chain wrote past `cached` still recycled the ring under them.
-        let oldest = layout.oldest_resident(self.kv.written_end.max(self.kv.cached.len()));
+        let oldest = self.slot.oldest(self.be, self.cfg, l);
         Some(DeviceLayer {
-            k: self.kv.kbufs[l].as_ref(),
-            v: self.kv.vbufs[l].as_ref(),
-            k_fmt: self.kv.k_fmt,
-            v_fmt: self.kv.v_fmt,
+            k: self.slot.kbufs[l].as_ref(),
+            v: self.slot.vbufs[l].as_ref(),
+            k_fmt: self.slot.k_fmt,
+            v_fmt: self.slot.v_fmt,
             k_row,
             v_row,
             layout,
@@ -857,6 +904,16 @@ impl<S: BudgetedStore> KvStore for Bounded<S> {
     fn put(&mut self, id: u64, first: usize, rows: KvRows) -> Result<()> {
         self.inner.put(id, first, rows)?;
         while self.inner.used() > self.inner.capacity() && self.inner.drop_lru().is_some() {}
+        // Live windows are exempt from eviction, so a store whose size they have filled cannot get
+        // back under it. Keeping the extent anyway would put the tier over the size its entry
+        // declared and quietly lose blocks later; say so instead.
+        let (used, cap) = (self.inner.used(), self.inner.capacity());
+        ensure!(
+            used <= cap,
+            "kv store: {used} bytes of extents against a {cap}-byte budget, and nothing left that \
+             may be evicted (live windows are never dropped); grow the tier's `size` or use fewer \
+             slots"
+        );
         Ok(())
     }
 
@@ -1210,6 +1267,7 @@ impl BudgetedStore for RedbKv {
         let id = *self
             .extents
             .iter()
+            .filter(|(id, _)| !is_live_window(**id))
             .min_by_key(|(_, e)| e.used)
             .map(|(id, _)| id)?;
         let loaded = self.load(id);
@@ -1244,6 +1302,7 @@ impl BudgetedStore for RedbKv {
         let id = *self
             .extents
             .iter()
+            .filter(|(id, _)| !is_live_window(**id))
             .min_by_key(|(_, e)| e.used)
             .map(|(id, _)| id)?;
         if let Err(e) = self.remove(id) {

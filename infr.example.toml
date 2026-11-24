@@ -131,6 +131,11 @@ ring = true
 #                      restart), unset keeps the same database in memory (faster).
 #   backend = "redis"  `url` required (`redis://`, `rediss://`, `valkey://`); the
 #                      server's maxmemory is its budget, so it goes last.
+# A storage entry may also LEAD the list, and then it is the slot's backing rather
+# than a demotion target: the slot's buffers go host-side and the live window is
+# written to that store and read back after every step that advances it (a redb
+# tier then needs a `size` holding one window; a leading redis tier takes none).
+# An experiment, not a recommendation -- the cost is in docs/perf/kv-prefix.md.
 # Every entry must name its `backend`; a missing or unknown one fails the load.
 # Off by default: the store holds prompt-derived data.
 #

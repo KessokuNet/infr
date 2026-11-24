@@ -304,6 +304,30 @@ part, not a retention reservation. A `paged` pool allocates its pages
 host-side, bounded by the same bytes. Decode reads every row of the window each
 step, so expect PCIe bandwidth to set the pace (`docs/plan/19-kv-anywhere.md`).
 
+A storage entry (`redb` or `redis`) may also lead, and then it is the slot's backing rather than a
+place idle blocks go: the slot's buffers are host-allocated like a `host` tier's, and the live
+window is written to the store and read back after every forward that advances it. A single-entry
+list of either kind therefore changes meaning: `[[kv.tiers]] backend = "redb"` used to be just a
+prefix store with a VRAM window, and keeping that now takes a `vram` or `host` entry first — the
+first entry is where a slot's rows live, whatever backend it names. It is the same
+code path as a `host` entry with the store doing the copying, and an experiment rather than a
+configuration to recommend: a step moves the whole window (rows x row bytes) in each direction, so
+`docs/perf/kv-prefix.md` has the measured cost and `crates/infr-llama/tests/kv_store_backed.rs`
+is the harness that fills it in. Under it a redb `size` must hold one window per slot (the tier's cap
+is the host cap too, and a window larger than the store is refused at open), while a leading `redis`
+entry takes no `size` — its budget is the server's `maxmemory` — and a `path` there, or a `url` on a
+leading `redb` entry, is an error. A leading `redis` entry also cannot have another store below it:
+the server owns its eviction, so it cannot be the bounded half of a chain; declare the `redb` entry
+first. Each slot's window lives under a reserved extent id, so it is never evicted as a cache block,
+and a window whose slot the engine no longer has is dropped when the store opens. The store also
+keeps the window's tokens, so a later request
+whose prompt begins with them resumes without re-prefilling. Only plain K/V models resume that way:
+a cache carrying state the rows do not (compressor rings, delta nets) refuses to hydrate and leaves
+the window in the slot, and `paged` alongside a leading storage tier works but doubles the window's
+bytes for nothing. The mirror itself runs where the prefix store is opened — `infr serve` and
+`infr multi`; one-shot `infr run` never opens it, so it places the window host-side, warns that the
+store is untouched, and leaves the rows in the slot.
+
 `overflow` and `overflow_vram_mb` are deprecated spellings of this: a `vram`
 entry of `overflow_vram_mb` followed by an unbounded `host` entry (a bare `host`
 entry when it is `0`). They keep today's behavior (the fit still prices the whole

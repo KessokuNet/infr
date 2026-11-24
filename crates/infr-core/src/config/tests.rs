@@ -2058,3 +2058,111 @@ fn a_vram_entry_reserves_alone_and_is_the_device_part_before_a_host_entry() {
     assert_eq!(split.spill.unwrap().capacity(), Some(5 << 20));
     assert!(!legacy.spill.unwrap().prices_device_kv());
 }
+
+fn redis(url: Option<&str>, size: Option<crate::SizeSpec>) -> super::KvTier {
+    super::KvTier {
+        backend: Some(super::KvBackend::Redis),
+        url: url.map(Into::into),
+        size,
+        ..super::KvTier::default()
+    }
+}
+
+/// A storage tier that LEADS the list makes the store the authoritative copy of the live window:
+/// no VRAM reserve, no device bytes for the slot's rows, and a host cap equal to the window the
+/// tier can hold (the tier's own size for redb, unbounded for redis, whose budget is the server's).
+#[test]
+fn a_leading_storage_tier_owns_the_live_window() {
+    use super::KvSpill;
+    let redb = residency_of(vec![redb()], None);
+    assert!(redb.store_backed);
+    assert_eq!(redb.vram_reserve, 0);
+    assert_eq!(
+        redb.spill,
+        Some(KvSpill {
+            device_cap: Some(0),
+            host_cap: Some(super::KV_REDB_DEFAULT_BYTES)
+        })
+    );
+
+    let sized = residency_of(vec![redb_entry(bytes(2 << 30))], None);
+    assert_eq!(sized.spill.and_then(|s| s.host_cap), Some(2 << 30));
+
+    let remote = residency_of(vec![redis(Some("redis://127.0.0.1:6379"), None)], None);
+    assert!(remote.store_backed);
+    assert_eq!(
+        remote.spill,
+        Some(KvSpill {
+            device_cap: Some(0),
+            host_cap: Some(u64::MAX)
+        })
+    );
+    // `host_cap: None` would mean "does not price device KV", which re-prices the whole cache in
+    // VRAM — the two must stay distinct.
+    assert!(remote.spill.unwrap().prices_device_kv());
+}
+
+/// Every way to write a leading storage tier wrongly is refused, and the message names the entry.
+#[test]
+fn a_malformed_leading_storage_tier_is_refused_by_entry() {
+    use crate::SizeSpec::Percent;
+    let cases = [
+        (vec![redis(None, None)], "a redis tier needs a `url`"),
+        (
+            vec![redis(Some("redis://x"), bytes(1 << 30))],
+            "budget belongs to the server",
+        ),
+        (
+            vec![redis(Some("redis://x"), Some(Percent(50.0)))],
+            "budget belongs to the server",
+        ),
+        (
+            vec![super::KvTier {
+                path: Some("/tmp/kv".into()),
+                ..redis(Some("redis://x"), None)
+            }],
+            "`path` belongs to a redb tier",
+        ),
+        (
+            vec![super::KvTier {
+                url: Some("redis://x".into()),
+                ..redb()
+            }],
+            "`url` belongs to a redis tier",
+        ),
+        (vec![redb_entry(bytes(0))], "more than zero"),
+        (vec![redb_entry(Some(Percent(50.0)))], "not a share"),
+        (
+            vec![redis(Some("redis://127.0.0.1:6379"), None), redb()],
+            "cannot have another store below it",
+        ),
+    ];
+    for (tiers, why) in cases {
+        let err = residency_of_err(tiers);
+        assert!(err.contains("kv.tiers[0]") && err.contains(why), "{err}");
+    }
+}
+
+/// A storage tier anywhere but first is the plain caching tier it always was: the slot keeps its
+/// rows on the device and nothing is mirrored.
+#[test]
+fn a_trailing_storage_tier_stays_a_plain_store() {
+    for tiers in [
+        vec![vram(bytes(1 << 20)), redb()],
+        vec![vram(bytes(1 << 20)), host(bytes(1 << 20)), redb()],
+        vec![host(bytes(1 << 20)), redb_entry(bytes(1 << 20))],
+    ] {
+        let r = residency_of(tiers, None);
+        assert!(!r.store_backed, "{r:?}");
+    }
+}
+
+fn redb_entry(size: Option<crate::SizeSpec>) -> super::KvTier {
+    super::KvTier { size, ..redb() }
+}
+
+fn residency_of_err(tiers: Vec<super::KvTier>) -> String {
+    let mut kv = Config::default().kv;
+    kv.tiers = tiers;
+    kv.residency().expect_err("the tier list is refused")
+}

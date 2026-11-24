@@ -743,6 +743,11 @@ impl KvTier {
         self.backend == Some(KvBackend::Host)
     }
 
+    /// Whether this entry is a storage backend (`redb`, `redis`) rather than addressable memory.
+    pub fn is_storage(&self) -> bool {
+        matches!(self.backend, Some(KvBackend::Redb | KvBackend::Redis))
+    }
+
     /// Whether this entry holds live slots' rows (`vram`, `host`) rather than storing blocks.
     pub fn is_addressable(&self) -> bool {
         self.is_vram() || self.is_host()
@@ -864,6 +869,46 @@ fn kv_addressable_bytes(tiers: &[KvTier]) -> Result<(Option<u64>, Option<u64>), 
     Ok((vram, host))
 }
 
+/// Validate a storage entry that leads the list and return the bytes of window it can back: the
+/// `redb` `size` (1 GiB when unset), unbounded for `redis`, whose server owns its budget. A `redb`
+/// entry takes no `url` and a byte `size` above zero; a `redis` one needs a `url` and takes no
+/// `path`.
+fn check_leading_store(tier: &KvTier) -> Result<u64, String> {
+    let name = format!("kv.tiers[0] ({})", tier.backend_name());
+    if tier.backend == Some(KvBackend::Redis) {
+        if tier.path.is_some() {
+            return Err(format!(
+                "{name}: a redis tier is named by `url`, and `path` belongs to a redb tier"
+            ));
+        }
+        if tier.url.is_none() {
+            return Err(format!("{name}: a redis tier needs a `url`"));
+        }
+        // A leading tier's size is the cap the slot's staging rows are placed under, and a redis
+        // tier has no such budget: the server owns its memory, and `u64::MAX` is what tells the
+        // host placement not to cap. Accepting a number here would silently ignore it.
+        if tier.size.is_some() {
+            return Err(format!(
+                "{name}: a redis tier's budget belongs to the server, so a leading redis tier takes no `size`"
+            ));
+        }
+        return Ok(u64::MAX);
+    }
+    if tier.url.is_some() {
+        return Err(format!(
+            "{name}: a redb tier keeps its blocks in `path`, and `url` belongs to a redis tier"
+        ));
+    }
+    match tier.size {
+        None => Ok(KV_REDB_DEFAULT_BYTES),
+        Some(SizeSpec::Bytes(b)) if b > 0 => Ok(b),
+        Some(SizeSpec::Bytes(_)) => Err(format!("{name}: `size` has to be more than zero")),
+        Some(SizeSpec::Percent(_)) => {
+            Err(format!("{name}: `size` is bytes, not a share of something"))
+        }
+    }
+}
+
 /// The byte size of the `vram` tier in `tiers`, `None` when the list names none. `vram` is valid
 /// only first, with a byte `size` above zero and no `path` or `url`; anything else is an error
 /// naming the entry.
@@ -876,9 +921,15 @@ pub fn kv_host_tier_bytes(tiers: &[KvTier]) -> Result<Option<u64>, String> {
     kv_addressable_bytes(tiers).map(|(_, host)| host)
 }
 
+/// Bytes a `redb` tier keeps when its entry names no `size`.
+pub const KV_REDB_DEFAULT_BYTES: u64 = 1 << 30;
+
 /// Where a live slot's KV rows sit, resolved from `[[kv.tiers]]` and the legacy `kv.overflow` keys.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvResidency {
+    /// Set when a storage backend leads the list: the slot's rows are host-resident and the live
+    /// window is synchronised with that store every step. An experiment, never a recommendation.
+    pub store_backed: bool,
     /// Device bytes a `vram` tier reserves beside the live windows for retained idle pages; `0`
     /// with no such tier, and with a `host` entry (where `vram` is the device part of the windows).
     pub vram_reserve: u64,
@@ -916,8 +967,30 @@ impl KvCfg {
     /// are the legacy spelling of a `vram` tier of that size followed by an unbounded `host` one.
     pub fn residency(&self) -> Result<KvResidency, String> {
         let (vram, host) = kv_addressable_bytes(&self.tiers)?;
+        if let Some(first) = self.tiers.first().filter(|t| t.is_storage()) {
+            if first.backend == Some(KvBackend::Redis)
+                && self.tiers[1..].iter().any(KvTier::is_storage)
+            {
+                return Err(
+                    "kv.tiers[0] (redis): a leading redis tier cannot have another store below \
+                     it, because the server owns its budget and so it cannot be the bounded half \
+                     of a chain; declare the `redb` entry first"
+                        .to_string(),
+                );
+            }
+            let window = check_leading_store(first)?;
+            return Ok(KvResidency {
+                store_backed: true,
+                vram_reserve: 0,
+                spill: Some(KvSpill {
+                    device_cap: Some(0),
+                    host_cap: Some(window),
+                }),
+            });
+        }
         Ok(match host {
             Some(host_cap) => KvResidency {
+                store_backed: false,
                 vram_reserve: 0,
                 spill: Some(KvSpill {
                     device_cap: Some(vram.unwrap_or(0)),
@@ -925,6 +998,7 @@ impl KvCfg {
                 }),
             },
             None => KvResidency {
+                store_backed: false,
                 vram_reserve: vram.unwrap_or(0),
                 spill: self.overflow.then(|| KvSpill {
                     device_cap: crate::budget::mib_bytes(self.overflow_vram_mb),

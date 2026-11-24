@@ -1803,6 +1803,7 @@ pub(crate) fn generate_dense_backend_bound(
             written_end: 0,
             delta_snapshot_refused: false,
             recurrent_snaps: Vec::new(),
+            mirror: None,
             paged: match &pool {
                 Some(pool) => Some(crate::seam::PagedSlot::new(pool, be)?),
                 None => None,
@@ -1824,8 +1825,8 @@ pub(crate) fn generate_dense_backend_bound(
         kbufs,
         vbufs,
         cbufs,
-        k_fmt: _,
-        v_fmt: _,
+        k_fmt: slot_k_fmt,
+        v_fmt: slot_v_fmt,
         hidden_buf,
         pos_buf,
         ipl_buf,
@@ -1843,14 +1844,48 @@ pub(crate) fn generate_dense_backend_bound(
         mtp_delta_ckpt,
         delta_snapshot_refused,
         recurrent_snaps,
-        // The env-derived local `kv_ring` above is this same value on every call (stable env),
-        // so the struct field is only read by fork/seed (which have no backend caps at hand).
-        kv_ring: _,
+        mirror,
+        // The env-derived local `kv_ring` above is this same value on every call (stable env);
+        // the field is destructured so a slot whose buffers disagree is caught here rather than
+        // mis-addressed by the mirror.
+        kv_ring: slot_ring,
         // The chunk height this slot's rings were sized with — the one source the cache
         // declarations, the rewind guard and fork/seed all read.
         ubatch: ring_ubatch,
     } = state.as_mut().expect("seam state just initialized");
     let ring_ubatch = *ring_ubatch;
+    debug_assert_eq!(
+        *slot_ring, kv_ring,
+        "the slot's ring rows and the env's must agree on every call"
+    );
+    // A store-led list (see `crate::seam::Mirror`): after every forward that advances the
+    // window, the slot's rows go out to the store and come back. A no-op without a mirror, which
+    // is every placement but a storage tier leading `[[kv.tiers]]`. One macro rather than a
+    // helper because the locals it reads are the destructured slot fields, borrowed mutably
+    // further down the loop; it expands INSIDE each site's existing GPU-baton scope.
+    macro_rules! mirror_step {
+        () => {
+            if let Some(m) = mirror.as_ref() {
+                m.step(
+                    be,
+                    c,
+                    crate::seam::SlotView {
+                        kbufs: &kbufs[..],
+                        vbufs: &vbufs[..],
+                        k_fmt: *slot_k_fmt,
+                        v_fmt: *slot_v_fmt,
+                        max_ctx: *max_ctx,
+                        kv_ring: *slot_ring,
+                        ubatch: ring_ubatch,
+                        paged: paged.as_ref(),
+                        snaps: &recurrent_snaps[..],
+                        rows: *written_end,
+                        cached: &cached[..],
+                    },
+                )?;
+            }
+        };
+    }
     let SeamWeights {
         wbufs,
         wspecs,
@@ -5781,6 +5816,7 @@ pub(crate) fn generate_dense_backend_bound(
         *written_end = (*written_end).max(p + cc);
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
+        mirror_step!();
         let exec_secs = t_exec0.elapsed().as_secs_f64();
 
         let t_dl0 = std::time::Instant::now();
@@ -6042,6 +6078,9 @@ pub(crate) fn generate_dense_backend_bound(
         // truncate above); either way it now holds the whole prompt.
         cached.clear();
         cached.extend_from_slice(prompt);
+        // After the extend, so the window's metadata names every row the verify wrote: ahead of it
+        // the meta would stop at `start` and the accepted suffix would never reach the store.
+        mirror_step!();
         return Ok((
             Vec::new(),
             GenStats {
@@ -6539,6 +6578,7 @@ pub(crate) fn generate_dense_backend_bound(
                     *written_end = (*written_end).max(cstart + ch.m);
                     be.execute(pf_plan.as_ref(), &pf_b)
                         .map_err(|e| anyhow!("{e}"))?;
+                    mirror_step!();
                     if let (Some(bufs), Some(tap)) = (&pf_route, route.as_deref_mut()) {
                         bufs.download(be, tap, cstart)?;
                     }
@@ -6910,6 +6950,7 @@ pub(crate) fn generate_dense_backend_bound(
                     .execute_chain(plan.as_ref(), b, n)
                     .map_err(|e| anyhow!("{e}"))?
                 {
+                    mirror_step!();
                     let mut stop = false;
                     let mut fed = 0usize;
                     for &id in &ids {
@@ -7086,6 +7127,7 @@ pub(crate) fn generate_dense_backend_bound(
             be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         }
+        mirror_step!();
         // This step wrote `cur[pos]`'s KV row (a prompt token, a fed generated token, or a fed
         // grammar-forced token — all kept). The final sampled token and any forced tokens queued
         // past the frontier are pushed AFTER this and never re-enter the loop, so they stay
@@ -7283,6 +7325,13 @@ pub(crate) fn generate_dense_backend_bound(
     // grammar-forced tokens queued past the frontier that a break left un-fed. On every run where
     // the old `prompt ++ out[..out.len()-1]` was already correct this is byte-identical to it.
     *cached = resident_after_gen(&cur, last_written);
+    // Last mirror step of the turn: `cached` only becomes the full prompt+output here, so without
+    // this the store would keep the pre-`start` prefix as its metadata and a later process could
+    // not resume the window. Takes its own GPU baton — the loop's was released with its iteration.
+    {
+        let _gp = req.and_then(|r| r.gate_pass());
+        mirror_step!();
+    }
     // The activation reserve is a PREDICTION, and this is the one place the predicted quantity can
     // be compared with what happened: the backend's high-water mark of concurrently-live
     // activation bytes. Nothing else in the tree observes it, so without this a reserve wrong by a
@@ -9334,6 +9383,183 @@ mod tests {
         assert!(vram_rows.iter().any(|r| r.iter().any(|&b| b != 0)));
         assert_eq!(host_bytes, vram_bytes);
         assert!(0 < host_bytes && host_bytes as u64 <= TIER);
+    }
+
+    /// A redb tier that leads `kv.tiers`, and the in-memory store its window is mirrored into.
+    fn leading_redb() -> EngineConfig {
+        let mut ec = EngineConfig::default();
+        ec.sampling.ignore_eos = true;
+        ec.kv.tiers = vec![infr_core::config::KvTier {
+            backend: Some(infr_core::config::KvBackend::Redb),
+            size: Some(infr_core::SizeSpec::Bytes(1 << 20)),
+            ..Default::default()
+        }];
+        ec
+    }
+
+    fn memory_window() -> std::sync::Arc<crate::seam::LiveWindow> {
+        let store: Box<dyn crate::seam::KvStore> = Box::new(
+            crate::seam::kv_tier::RedbKv::open_memory(0, 1 << 22).expect("in-memory store"),
+        );
+        std::sync::Arc::new(crate::seam::LiveWindow::new(std::sync::Arc::new(
+            std::sync::Mutex::new(crate::seam::BlockCache::new(store, true)),
+        )))
+    }
+
+    /// Bytes one row of the synthetic llama's KV cache takes: one layer, two KV heads of 16 f16
+    /// elements, K and V.
+    const LLAMA_ROW_BYTES: u64 = 2 * 2 * 16 * 2;
+
+    /// A storage tier leading `kv.tiers` is authoritative for the live window: every forward that
+    /// advances it writes the rows to the store and reads them back into the slot, and the tokens
+    /// are the ones a `vram` tier produces. The counters are the proof the steps happened at all —
+    /// a mirrored run whose mirror never fired would also be bit-identical.
+    #[test]
+    fn a_leading_storage_tier_mirrors_every_step_and_keeps_the_tokens() {
+        let (g, cfg) = open_synthetic("kv-store-backed", &llama_gguf("llama", None));
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let window = memory_window();
+        let plain = EngineConfig::default();
+        let tiered = leading_redb();
+        let run = |ec: &EngineConfig, slot: &mut Option<SeamKv>, max_new: usize| {
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                &prompt,
+                max_new,
+                |_| {},
+                slot,
+                512,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // paged_blocks
+                1,    // slot_copies
+            )
+            .expect("synthetic generation")
+        };
+
+        let (vram_ids, _) = run(&plain, &mut None, LLAMA_GEN);
+        // The slot has to exist before a mirror can be attached to it. The warm-up prefills and
+        // samples nothing, and the run under test starts from exactly that window either way.
+        let mut slot = None;
+        run(&tiered, &mut slot, 0);
+        let mut kv = slot.take().expect("the warm-up initialized the slot");
+        crate::seam::attach_mirror(&mut kv, &window, 0).expect("mirror attaches");
+        let mut slot = Some(kv);
+        let (ids, _) = run(&tiered, &mut slot, LLAMA_GEN);
+
+        assert_eq!(ids, vram_ids, "a mirrored window changed the tokens");
+        let rows = slot.as_ref().expect("slot").written_end as u64;
+        let (steps, written, read, last) = window.stats().expect("stats");
+        assert_eq!(
+            steps,
+            LLAMA_GEN as u64 + 1,
+            "one step per prefill chunk and per fed decode token, plus the teardown that names the \
+             full window"
+        );
+        assert_eq!(written, read, "the store gave back what it was given");
+        assert_eq!(
+            last,
+            LLAMA_ROW_BYTES * rows,
+            "the last step moved the window"
+        );
+        assert!(
+            written > last,
+            "every step grew the window, so the total exceeds the largest one: {written} vs {last}"
+        );
+    }
+
+    /// A window the store holds is loaded into a fresh slot instead of being prefilled again, and
+    /// the continuation is the one the model produces from that prefix — which is what shows the
+    /// restored rows are the rows the slot had, not merely the right number of bytes.
+    #[test]
+    fn a_stored_window_resumes_a_fresh_slot_without_a_reprefill() {
+        let (g, cfg) = open_synthetic("kv-remote-resume", &llama_gguf("llama", None));
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let window = memory_window();
+        let tiered = leading_redb();
+        let prompt: Vec<u32> = (0..300).map(|i| (i * 7 + 3) % Q35_VOCAB as u32).collect();
+        let run = |slot: &mut Option<SeamKv>, prompt: &[u32], max_new: usize| {
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &tiered,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                max_new,
+                |_| {},
+                slot,
+                512,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // paged_blocks
+                1,    // slot_copies
+            )
+            .expect("synthetic generation")
+        };
+
+        // First turn: prefill the 300-token prompt and sample from it, with the mirror attached so
+        // the store ends up holding the window (through the teardown step, which names it).
+        let mut slot = None;
+        run(&mut slot, &prompt, 0);
+        let mut kv = slot.take().expect("the warm-up initialized the slot");
+        crate::seam::attach_mirror(&mut kv, &window, 0).expect("mirror attaches");
+        let mut slot = Some(kv);
+        let (first, _) = run(&mut slot, &prompt, LLAMA_GEN);
+
+        // Second turn on a slot that never saw this conversation: the prompt extends the first by
+        // part of what it generated, so the stored window covers all but the last token.
+        let mut next = prompt.clone();
+        next.extend_from_slice(&first[..4]);
+        let mut fresh = None;
+        run(&mut fresh, &[1, 2, 3, 4], 0);
+        let mut fresh = fresh.expect("the warm-up initialized the slot");
+        let id = crate::seam::kv_tier::live_window_id(0);
+        let mut cache = window.cache().expect("cache");
+        let n = cache
+            .hydrate(&be, &cfg, &mut fresh, &next, id)
+            .expect("hydrate");
+        assert_eq!(
+            n,
+            next.len() - 1,
+            "the whole stored window but the frontier"
+        );
+        assert_eq!(fresh.cached_len(), n);
+        drop(cache);
+
+        let mut slot = Some(fresh);
+        let (second, stats) = run(&mut slot, &next, LLAMA_GEN - 4);
+        assert_eq!(
+            stats.n_cached, n,
+            "the turn prefilled again instead of continuing the restored window"
+        );
+        assert_eq!(
+            second,
+            first[4..],
+            "the restored window changed the continuation"
+        );
+        assert_eq!(window.hydrated().expect("stats"), (1, n as u64));
     }
 
     /// The multi-device one-shot sizes its prefill chunk from the backend it runs on, not from the
