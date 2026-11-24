@@ -117,6 +117,6 @@ and collapsed draft acceptance.
 ## Status and plans
 
 Tracked on the fork's project board. Next up: Q4_0 support in the `kq_fma`
-kernels (Gemma QAT quants are Q4_0), single-pass sliding-window attention for
-decode, KV shifting for rolling chat windows, and speculative decoding on
-Vulkan.
+decode GEMV (the prefill GEMM already has it; Gemma QAT quants are Q4_0),
+single-pass sliding-window attention for decode, KV shifting for rolling chat
+windows, and speculative decoding on Vulkan.
