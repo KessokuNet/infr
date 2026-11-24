@@ -57,9 +57,9 @@ not come back, each for its own reason:
    `446eb403`'s input-unchanged fix) are gone with upstream's pattern. Restoring
    it needs a Vulkan (and Metal) planner again.
 
-The GCN tiers that landed (`kq_fma_gemv`, `wave64_native`, `kq_fma` prefill)
-still owe the RX 580 run `docs/legacy-gpus.md` describes — the first two have
-been spot-checked there, the prefill GEMM has not.
+The GCN tiers that landed (`kq_fma_gemv`, `wave64_native`, `kq_fma` prefill) have
+now been re-measured on the RX 580 on the current tree, three sweeps in
+`docs/legacy-gpus.md`; the prefill GEMM is ahead of llama.cpp there.
 
 ### B-DSV2-NONYARN-SCALE — deepseek2 ignores a non-YaRN `rope.scaling.factor` (2026-11-16)
 
