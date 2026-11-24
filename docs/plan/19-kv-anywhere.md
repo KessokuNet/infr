@@ -2,7 +2,7 @@
 
 Status: P1 shipped (`258a6e5f`, review fixes `ada1ebe4`); P2 done (the `vram` tier: config and sizing,
 then its behaviour under pressure); P3 built and green on the CPU gate plus its Vulkan placement
-tests, `kv.paged` on a real model and the bit-identity/decode numbers still owed to hardware; P4
+tests, the bit-identity and decode numbers measured on the RX 580; P4
 built and measured (the store-backed experiment; the cost table in `docs/perf/kv-prefix.md` says it
 is not a speed play). Plan 18 unified where idle blocks
 are kept; this makes the memory a slot's rows live in a tier like any other, with a `vram` tier as
@@ -130,9 +130,12 @@ that rounding: leave a few MiB.
     released when the buffer drops); the lifetime tally only feeds the report line. The fit and
     the open-time refusal walk the buffers in allocation order, and the pool cap leaves room
     for each slot's page table and private layers.
-  - *Needs hardware:* a host-first `kv.paged` session on a real model
-    (pool pages host-side, the page-table buffers included); output bit-identical to a `vram` tier
-    on a GGUF; the 2k and 8k decode measurements.
+  - *Measured:* on the RX 580 with Qwen2.5-0.5B q4_k_m (q8_0 K/V), `--ctx` fixed per row so only
+    the placement differs: 137.8 tok/s on a `vram` tier against 116.4 on a leading `host` tier at
+    depth 2048, and 75.8 against 54.5 at depth 8192 — a 15% and a 28% cost, from reading the
+    window's rows over PCIe every step. The same 64-token greedy continuation is byte-identical
+    under `vram`, under `host`, and under `host` with `kv.paged = true`, which is the placement
+    claim on a real GGUF. `docs/perf/kv-prefix.md` carries the table.
   - *Semantics to know:* a `vram` entry alone stays P2's retention reservation, but before a `host`
     entry it is the device part of the live windows. The legacy flag keeps its old sizing (full
     cache priced in VRAM, the spill as the clamp ladder's last rung, paged window per slot): only

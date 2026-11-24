@@ -156,6 +156,27 @@ rest is the upload. Cheap next to the 38.5 s prefill it replaces.
 So: keep the store for chat-shaped workloads, and finish the table so a slot can
 stop being a contiguous buffer.
 
+## A host tier: what the placement costs
+
+A leading `host` entry puts the slot's K/V in system RAM and attention reads it over PCIe by device
+address; nothing is copied per step, but every row of the window is fetched every step. Measured with
+128 greedy tokens at depth on the RX 580, `--ctx` fixed per row so only the placement differs
+(Qwen2.5-0.5B q4_k_m, q8_0 K/V, 5.1 KiB per token, from the tier's own report):
+
+| Tier | Depth | Rows read per step | Bytes per step | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| `vram` (default) | 2048 | 2048 | 0 | 137.8 |
+| `host`, 2g | 2048 | 2048 | 10.7 MB | 116.4 |
+| `vram` (default) | 8192 | 8192 | 0 | 75.8 |
+| `host`, 2g | 8192 | 8192 | 43 MB | 54.5 |
+
+The same 64-token greedy continuation is byte-identical under `vram`, under `host`, and under
+`host` with `kv.paged = true`: the placement changes where the rows live, not what attention reads.
+The gap grows with the window (15% at 2k, 28% at 8k) because the read is a strided gather, one
+device address per row, so 43 MB per step at 8k costs more per byte than 10.7 MB — 2.3 GB/s of
+traffic at 8k against 1.2 GB/s at 2k. A model with bigger K/V pays in proportion to its rows, and a
+card with a wider link pays less.
+
 ## A store-backed window: what a step costs when the store holds the live rows
 
 A storage entry that leads `[[kv.tiers]]` makes the store the authoritative copy of the live window:
