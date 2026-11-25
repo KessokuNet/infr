@@ -29,6 +29,19 @@
   push cancels the run before it, so let a run finish before pushing the next
   slice when its verdict is still owed.
 
+## Upstream sync
+
+- This is a fork of `kryptic-sh/infr` (`git remote kryptic`). Work that is not
+  specific to older Vulkan GPUs belongs upstream.
+- Every session re-runs the downstream-feature inventory against that issue:
+  KessokuNet task #52, https://tasks.cappuchino.xyz/projects/7/tasks/52. Closing
+  notes say whether a new fork-only feature appeared that needs a sync issue.
+- `git diff kryptic/main...HEAD --stat` is the remaining delta. Commits already
+  upstream reappear there under a different hash, so the diff is the truth, not
+  `git cherry`.
+- Do not open upstream PRs or issues from this repository; record the unit on #52
+  and let the board carry it.
+
 ## How work is run
 
 - The main agent orchestrates. Each slice goes through a coder agent, then a
