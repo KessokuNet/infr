@@ -41,6 +41,9 @@
   `git cherry`.
 - Do not open upstream PRs or issues from this repository; record the unit on #52
   and let the board carry it.
+- Classify each unit (a) ours and worth a PR, (b) absorbed upstream — name the
+  commit — or (c) deliberately fork-only. Verify the claim against `kryptic/main`:
+  the `docs/plan/reland-fork-features.md` sections and identifiers go stale.
 
 ## How work is run
 
