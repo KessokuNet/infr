@@ -36,9 +36,42 @@
   conclude; the orchestrator re-checks both reports against the tree before
   committing.
 - While sub-agents are working, the orchestrator plans what comes next rather
-  than waiting: plans under `docs/plan/`, findings in `docs/backlog.md`.
-- When the backlog's actionable items run out, have a reviewer read a part of
-  the codebase no earlier pass covered and record what it finds in the backlog.
+  than waiting: plans under `docs/plan/`, findings as tasks on the Vikunja
+  board.
+- When the board's actionable items run out, have a reviewer read a part of the
+  codebase no earlier pass covered and file what it finds as tasks.
+
+## Where findings go
+
+The tracker is Vikunja, project `Kessoku` → sub-project `infr` (id 7, instance
+`https://tasks.cappuchino.xyz`, MCP server `vikunja`). File every finding, gap
+and deferred piece of work there, assigned to `bot-agent`.
+
+`docs/backlog.md` is **upstream's** file and this fork does not write to it. It
+stays as inherited history: read it for context, and keep an existing `B###` id
+in a task's body as the pointer back (`docs/backlog.md B245`), but new findings
+do not get a `B###` and rarely get an entry. The review-leftover sections are
+upstream's triage, not ours.
+
+`docs/plan/*.md` stays in the repo — a plan records design and measurements, not
+tasks — and a plan's phases are closed there as well as reflected on the board.
+
+A task from this repository says, in its body: what is wrong or missing with the
+numbers that make it worth doing, the file it lives in, the upstream `B###` or
+`docs/plan/NN` pointer if one exists, and the test or measurement that closes
+it. Its title is a plain imperative (“Warm the request path's pipelines at
+load”), and the domain is a **label**: `kv`, `serve`, `vulkan`, `config`,
+`cache`, `vram`, `sampling`, `tests`, `sync`, `tracker`, plus `decision` for
+work blocked on a choice rather than on code. Relate tasks that move together
+(`related`, `precedes`, `blocked`), so a thread that picks one sees the rest.
+
+The MCP `vikunja` surface cannot create or list labels or task relations, only
+attach existing ones, so the REST API is the way and the token is already in
+`~/.config/vikunja/mcp-token`: `GET /api/v2/labels`, `POST /api/v2/labels`,
+`POST /api/v2/tasks/{id}/labels` with `{"label_id": N}`, and
+`POST /api/v2/tasks/{id}/relations` with
+`{"other_task_id": N, "relation_kind": "related"}`. The v2 instance answers
+`405` to `PUT` on those paths — creation is `POST`.
 
 ## What to work on
 

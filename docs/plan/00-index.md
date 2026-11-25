@@ -1,8 +1,10 @@
 # Plans
 
 One line per phase, in build order within each track. A phase file says what the
-phase builds and how it is verified; what was raised and not done lives in
-[`../backlog.md`](../backlog.md). The whole-system description, the recipe for
+phase builds and how it is verified; what was raised and not done is a task on
+the Vikunja board (project `Kessoku` → `infr`), which is the tracker this fork
+uses — `../backlog.md` is upstream's file and is read, not written. The
+whole-system description, the recipe for
 adding an architecture and the larger candidates (DeepSeek V4, Nemotron-H) are
 in [`../plan.md`](../plan.md).
 
@@ -47,7 +49,7 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 
 | Phase | What                                                                               | Status                                                                  |
 | ----- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| 21    | [A reasoning budget the engine enforces](21-reasoning-budget.md)                   | scoped                                                                   |
+| 21    | [A reasoning budget the engine enforces](21-reasoning-budget.md)                   | P1–P3 done; P4 open                                                      |
 
 ## Numerics
 
