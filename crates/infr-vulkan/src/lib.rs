@@ -27,6 +27,7 @@ pub mod paged;
 pub mod pager;
 mod pcache;
 pub mod pipeline;
+mod pool;
 mod recorder;
 mod spirv;
 pub mod tp;
@@ -68,12 +69,12 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
+    backend::{Bindings, Buffer, BufferUsage, Capabilities, KvAllocCost, Plan},
     budget::{spill_report_line, KvClaim, KvMemory, SpillNouns, SpillTally},
     config::Config,
     error::Result,
     graph::Graph,
-    Backend,
+    Backend, SizeSpec,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -94,17 +95,12 @@ use infr_core::error::backend as be;
 ///     numbers, so a typo must fail loudly. `device_names` (`"Vulkan0=<name>"`, …) feeds the
 ///     "no such device" message.
 fn resolve_infr_dev_index(spec: Option<&str>, device_names: &[String]) -> Result<Option<usize>> {
-    let Some(spec) = spec else {
+    // Which specs name a Vulkan device at all is `vulkan_dev_spec`'s to say, shared with the
+    // test kit's skip policy.
+    let (Some(spec), Some(s)) = (spec, infr_core::config::vulkan_dev_spec(spec)) else {
         return Ok(None);
     };
-    let s = spec.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
     let lower = s.to_ascii_lowercase();
-    if lower == "metal" || lower == "cpu" {
-        return Ok(None);
-    }
     let idx_str = lower.strip_prefix("vulkan").unwrap_or(&lower);
     let idx: usize = idx_str.parse().map_err(|_| {
         be(format!(
@@ -178,43 +174,17 @@ fn check_extent(op: &str, role: &str, bytes: usize, size: usize) -> Result<()> {
     Ok(())
 }
 
-// ── device class (process-global) ─────────────────────────────────────────────
-
-/// The class of the Vulkan device this PROCESS opened — see [`device_class`].
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceClass {
-    /// `deviceType == INTEGRATED_GPU` (see [`Capabilities::integrated`]).
-    pub integrated: bool,
-    /// Compute units, or 0 = unknown (see [`Capabilities::compute_units`]).
-    pub compute_units: u32,
-}
-
-/// Set ONCE by the first [`VulkanBackend::new`] in the process.
-static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new();
-
-/// The class of the Vulkan device this process opened, or `None` when no Vulkan backend has been
-/// constructed (a CPU/Metal run, or a GPU-less box).
-///
-/// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
-/// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
-/// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
-/// lifetime as the seam's existing `PINNED_UBATCH`. It is the FIRST device's class, so it speaks
-/// for a single-device process only: the multi-device wrappers ([`TensorParallelBackend`],
-/// [`ExpertParallelBackend`], [`PipelineBackend`]) report their ranks' most conservative class from
-/// `capabilities()`, and the seam sizes their prefill chunk from that instead of from here.
-pub fn device_class() -> Option<DeviceClass> {
-    DEVICE_CLASS.get().copied()
-}
+// ── descriptor range ceiling (process-global) ─────────────────────────────────
 
 /// The SMALLEST `maxStorageBufferRange` any device opened in this process reported — the real
 /// ceiling on one descriptor binding's reach, which used to be assumed at 4 GiB and checked only in
 /// debug builds.
 ///
-/// Process-global for the same reason as [`DEVICE_CLASS`]: its consumer is `Recorder::vkb`, the
-/// single choke point every descriptor binding goes through, which is reached from ~360 expression
-/// positions that hold no backend handle. Taking the MINIMUM keeps it conservative if a process
-/// ever opens two devices with different limits (a multi-GPU run) — a bind that fits the smallest
-/// device's limit fits every device's.
+/// Process-global because its consumer is `Recorder::vkb`, the single choke point every descriptor
+/// binding goes through, which is reached from ~360 expression positions that hold no backend
+/// handle. Taking the MINIMUM keeps it conservative if a process ever opens two devices with
+/// different limits (a multi-GPU run) — a bind that fits the smallest device's limit fits every
+/// device's.
 static MAX_STORAGE_BUFFER_RANGE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// See [`MAX_STORAGE_BUFFER_RANGE`]. `u32::MAX` before any device has been opened, i.e. the check
@@ -251,42 +221,85 @@ fn check_bindable_size(bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Why [`VulkanBackend::pick_queue_family`] chose the family it did.
+/// Why [`VulkanBackend::pick_queue_family`] chose the family it did. Each outcome fixes the kind
+/// of family that was taken, so [`QueueOutcome::reason`] cannot describe another one than the
+/// family printed beside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueOutcome {
     /// A COMPUTE-only family that writes timestamps, as `auto` or `compute` asked.
     ComputeOnly,
-    /// The setting is `graphics`.
+    /// The setting is `graphics`, and the universal family was taken.
     GraphicsAsked,
-    /// `auto` or `compute`, but the device has no COMPUTE-only family.
+    /// The setting is `graphics`, but the device has no universal family: a COMPUTE-only one was
+    /// taken.
+    NoUniversalFamily,
+    /// `auto` or `compute`, but the device has no COMPUTE-only family: the universal one was
+    /// taken.
     NoComputeFamily,
-    /// `auto` or `compute`, but no COMPUTE-only family writes timestamps.
+    /// `auto` or `compute`, but no COMPUTE-only family writes timestamps: the universal one was
+    /// taken.
     NoTimestamps,
+    /// `auto` or `compute`, no COMPUTE-only family writes timestamps and the device has no
+    /// universal family either: a COMPUTE-only family without timestamps was taken.
+    OnlyUntimed,
 }
 
+/// What reads timestamps from the submit queue, for the outcomes that turn on them.
+const QUEUE_TIMESTAMP_READERS: &str =
+    "the submit splitter, the work bound, the dropped-work check and the per-op profile";
+
 impl QueueOutcome {
-    /// The outcome in words, for the startup log and `infr tune show`.
-    fn reason(self) -> &'static str {
+    /// Whether the family taken under this outcome is the universal one (GRAPHICS and COMPUTE)
+    /// rather than a COMPUTE-only one.
+    fn takes_universal(self) -> bool {
         match self {
-            QueueOutcome::ComputeOnly => "a compute-only family that writes timestamps",
-            QueueOutcome::GraphicsAsked => "the universal family, as set",
-            QueueOutcome::NoComputeFamily => {
-                "the universal family: this device has no compute-only family"
-            }
-            QueueOutcome::NoTimestamps => {
-                "the universal family: the compute-only family writes no timestamps \
-                 (timestampValidBits 0), which the submit splitter, the work bound, the \
-                 dropped-work check and the per-op profile need"
-            }
+            QueueOutcome::GraphicsAsked
+            | QueueOutcome::NoComputeFamily
+            | QueueOutcome::NoTimestamps => true,
+            QueueOutcome::ComputeOnly
+            | QueueOutcome::NoUniversalFamily
+            | QueueOutcome::OnlyUntimed => false,
         }
     }
 
-    /// Whether the fallback is worth a warning under `setting`: always when a family was refused
-    /// for its timestamps, and for a missing family only when `compute` asked for one by name.
+    /// The outcome in words, for the startup log and `infr tune show`: the kind of family taken
+    /// ([`Self::takes_universal`]), then why.
+    fn reason(self) -> String {
+        let family = if self.takes_universal() {
+            "the universal family"
+        } else {
+            "a compute-only family"
+        };
+        match self {
+            QueueOutcome::ComputeOnly => format!("{family} that writes timestamps"),
+            QueueOutcome::GraphicsAsked => format!("{family}, as set"),
+            QueueOutcome::NoUniversalFamily => {
+                format!("{family}: this device has no universal family to take as set")
+            }
+            QueueOutcome::NoComputeFamily => {
+                format!("{family}: this device has no compute-only family")
+            }
+            QueueOutcome::NoTimestamps => format!(
+                "{family}: no compute-only family writes timestamps (timestampValidBits 0), \
+                 which {QUEUE_TIMESTAMP_READERS} need"
+            ),
+            QueueOutcome::OnlyUntimed => format!(
+                "{family} that writes no timestamps (timestampValidBits 0), which \
+                 {QUEUE_TIMESTAMP_READERS} need: no family of this device that can compute \
+                 writes them"
+            ),
+        }
+    }
+
+    /// Whether the fallback is worth a warning under `setting`: always when timestamps were the
+    /// reason, and for a missing COMPUTE-only family only when `compute` asked for one by name.
+    /// `graphics` never warns, whichever family it ends on.
     fn warns(self, setting: tuning::QueueFamily) -> bool {
         match self {
-            QueueOutcome::ComputeOnly | QueueOutcome::GraphicsAsked => false,
-            QueueOutcome::NoTimestamps => true,
+            QueueOutcome::ComputeOnly
+            | QueueOutcome::GraphicsAsked
+            | QueueOutcome::NoUniversalFamily => false,
+            QueueOutcome::NoTimestamps | QueueOutcome::OnlyUntimed => true,
             QueueOutcome::NoComputeFamily => setting == tuning::QueueFamily::Compute,
         }
     }
@@ -326,6 +339,14 @@ pub struct VramInfo {
     /// True when this snapshot counted every heap because the device has unified memory (see
     /// [`Capabilities::unified_memory`]) — only affects how the guard words its error.
     pub uma: bool,
+    /// The device's own `total` when `kernels.vulkan.vram_limit` (`INFR_VRAM_LIMIT`) capped this
+    /// snapshot below it; `None` when nothing was capped. [`VramInfo::limit_note`] labels the
+    /// figures where this crate prints them (the allocation guard's refusal, the `prof.vram`
+    /// post-load line) and where `infr-llama` prints them (the `ctx clamp` warning and the "no
+    /// usable KV cache fits" refusal); the startup log and `infr devices` name the limit
+    /// themselves. `infr serve`'s `/status` passes the capped figures on unlabelled
+    /// (docs/backlog.md B-PRELOAD-CLAMP lists it).
+    pub limited_from: Option<u64>,
 }
 
 impl VramInfo {
@@ -345,11 +366,59 @@ impl VramInfo {
     pub fn alloc_room(&self) -> u64 {
         self.available.saturating_sub(GUARD_HEADROOM)
     }
+
+    /// This snapshot as a device with `limit` bytes would report it: `total` becomes the limit and
+    /// `available` the limit less what is already in use, so the bytes in use are unchanged and
+    /// the free figure only ever drops. A limit at or above `total`, or none, returns the snapshot
+    /// unchanged.
+    fn capped(self, limit: Option<SizeSpec>) -> VramInfo {
+        let Some(cap) = vram_cap(limit, self.total) else {
+            return self;
+        };
+        let used = self.total.saturating_sub(self.available);
+        VramInfo {
+            total: cap,
+            available: cap.saturating_sub(used),
+            limited_from: Some(self.total),
+            ..self
+        }
+    }
+
+    /// `" (limited from <device total> by INFR_VRAM_LIMIT)"` when this snapshot was capped, else
+    /// empty: the label a message printing this snapshot's figures appends to them.
+    pub fn limit_note(&self) -> String {
+        match self.limited_from {
+            Some(real) => format!(" (limited from {} by INFR_VRAM_LIMIT)", fmt_bytes(real)),
+            None => String::new(),
+        }
+    }
+}
+
+/// Refuse a `kernels.vulkan.vram_limit` of zero bytes, from any layer (the environment layer
+/// already refuses it with its own message): a limit of nothing is never meant, and it would turn
+/// every allocation into a refusal rather than switching the limit off.
+fn check_vram_limit(limit: Option<SizeSpec>) -> Result<()> {
+    match limit {
+        Some(SizeSpec::Bytes(0)) => Err(be(
+            "kernels.vulkan.vram_limit is 0 bytes: a limit must leave the device some memory \
+             (unset it to run without one)"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The bytes `limit` (`kernels.vulkan.vram_limit`, a percentage of `total`) leaves a device whose
+/// guard counts `total` bytes: `None` when there is no limit or it is at or above `total`, where it
+/// changes nothing. A limit never raises a figure.
+fn vram_cap(limit: Option<SizeSpec>, total: u64) -> Option<u64> {
+    let cap = limit?.resolve(total);
+    (cap < total).then_some(cap)
 }
 
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
-    // Rust drops struct fields in *declaration order*.  We keep `allocator`
+    // Rust drops struct fields in *declaration order*.  We keep `pool`
     // in a `ManuallyDrop` so we can drop it explicitly before calling
     // `destroy_device` in the `Drop` impl.
     _entry: ash::Entry,
@@ -364,17 +433,40 @@ struct VulkanShared {
     /// driving one backend from two threads at once — under `infr serve` that is the per-step GPU
     /// baton (`StepGate`).
     cmd_pool: Mutex<vk::CommandPool>,
-    /// Must be dropped before the device is destroyed.
-    allocator: ManuallyDrop<Mutex<Allocator>>,
+    /// gpu-allocator and the ledger of its shared blocks (see `pool`), the only way to reach
+    /// gpu-allocator, which tells the VRAM guard whether a pooled buffer opens a block or lands in
+    /// one already open. Must be dropped before the device is destroyed.
+    pool: ManuallyDrop<pool::Pool>,
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// `kernels.vulkan.vram_limit`, copied off the backend's `Config` at construction: the cap
+    /// [`vram_info`] puts on every snapshot (see [`VramInfo::capped`]).
+    vram_limit: Option<SizeSpec>,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
     /// (`VkPhysicalDeviceMaintenance3Properties`, ~4 GiB on RADV). The weight arena
     /// (`reserve_weights`) splits its up-front reservation into blocks no larger than this, since a
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
+    /// [`Backend::kv_alloc_cost`], with whether any of it was measured: probed when the backend is
+    /// built ([`probe_kv_alloc_cost`]), which needs the rest of this struct to exist first.
+    kv_alloc_cost: OnceLock<(KvAllocCost, bool)>,
+    /// `maxMemoryAllocationCount`: how many `VkDeviceMemory` objects may exist at once. Every KV
+    /// cache buffer is one, so a KV allocation that would pass it is refused by name
+    /// ([`admit_memory_allocation`]) instead of failing inside the driver.
+    max_memory_allocations: u64,
+    /// The device's memory type count: gpu-allocator keeps at most one emptied shared block per
+    /// memory type, which [`VulkanBackend::memory_allocations_bound`] has to count.
+    memory_type_count: u64,
+    /// Live `VkDeviceMemory` objects this backend allocated itself rather than through
+    /// gpu-allocator (`alloc_vram_mapped`: the UMA spill and `INFR_KV_OVERFLOW`'s host KV).
+    raw_memory_allocations: AtomicU64,
+    /// Live gpu-allocator allocations with a dedicated block of their own (`make_buf_ex`).
+    dedicated_allocations: AtomicU64,
+    /// Live gpu-allocator allocations placed in a shared block (`make_buf_ex`): each lies in one
+    /// block, so there are no more non-empty shared blocks than these.
+    pooled_allocations: AtomicU64,
     /// `maxPushConstantsSize` and the compute workgroup limits — every kernel's push block and
     /// `LocalSize` are checked against THESE rather than against the floors Vulkan merely
     /// guarantees (see `ops::try_make_compute_kernel`, which refuses an oversize kernel by name
@@ -543,6 +635,11 @@ struct VulkanShared {
     /// split; the actual budgeting is `device_used` alone. All 0 when no window is declared. The
     /// bookkeeping (and the cumulative-cap gate) is the shared [`SpillTally`].
     kv_spill: SpillTally,
+    /// The device memory `INFR_KV_OVERFLOW`'s VRAM-first placement leaves free below the guard's
+    /// budget: a KV buffer goes to device memory only when at least this much is left after it
+    /// ([`kv_stays_in_vram`]). Set by the runner before it allocates a session's cache
+    /// (`Backend::set_kv_spill_reserve`); `0` until then.
+    kv_spill_reserve: AtomicU64,
     /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
     /// the first staged weight upload of a load and torn down with the weight scope.
     staging_ring: Mutex<Option<StagingRing>>,
@@ -601,6 +698,12 @@ impl VulkanShared {
             pc.maybe_save(&self.device, self.pipeline_cache);
         }
     }
+
+    /// [`Backend::kv_alloc_cost`] and whether any of it was measured, probing if it has not been
+    /// yet ([`probe_kv_alloc_cost`]; the backend's construction does it first).
+    fn kv_alloc_cost(&self) -> (KvAllocCost, bool) {
+        *self.kv_alloc_cost.get_or_init(|| probe_kv_alloc_cost(self))
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -647,7 +750,7 @@ impl Drop for VulkanShared {
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
             // Drop the allocator *before* destroying the device.
-            ManuallyDrop::drop(&mut self.allocator);
+            ManuallyDrop::drop(&mut self.pool);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -811,13 +914,21 @@ impl Drop for VkBuffer {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
+                    if alloc.is_dedicated() {
+                        &self.shared.dedicated_allocations
+                    } else {
+                        &self.shared.pooled_allocations
+                    }
+                    .fetch_sub(1, Ordering::Relaxed);
                     // Keep the budget guard's fallback accounting balanced.
                     if self.location == MemoryLocation::GpuOnly {
                         self.shared
                             .device_used
                             .fetch_sub(alloc.size(), Ordering::Relaxed);
                     }
-                    self.shared.allocator.lock().unwrap().free(alloc).ok();
+                    if let Err(e) = self.shared.pool.free(alloc) {
+                        tracing::warn!("[infr] gpu_allocator::free on a buffer's drop: {e}");
+                    }
                 }
                 // A dedicated VkDeviceMemory we own outright — today only the UMA overflow spill
                 // (`spilled: true`). Only a device-local mapped buffer (`spilled: false`) is charged
@@ -833,6 +944,9 @@ impl Drop for VkBuffer {
                     }
                     self.shared.device.unmap_memory(*memory);
                     self.shared.device.free_memory(*memory, None);
+                    self.shared
+                        .raw_memory_allocations
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
                 // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
                 // and the block's own keepalive copy — this handle owns NEITHER the buffer object
@@ -963,6 +1077,24 @@ fn kv_spill_plan(cfg: &infr_core::config::Config) -> Result<Option<infr_core::co
         .map_err(|e| be(format!("kv window: {e}")))
 }
 
+/// Whether `INFR_KV_OVERFLOW` can spill on a device: the flag is on, the device is not
+/// unified-memory, and the driver reports a live memory budget (`VK_EXT_memory_budget`).
+///
+/// - On a unified-memory device the system RAM a spilled buffer takes is counted in the same
+///   budget as its device memory (`vram_info` sums every heap there), so a spill frees nothing.
+/// - Without a live budget, the room the context ladder measures after the load
+///   (`VramInfo::alloc_room`, the whole heap then) does not see what this backend has allocated,
+///   while the allocation guard counts it: a cache the ladder judged to fit could leave the
+///   activations nothing, and the spill's reserve could not be kept. Without the flag such a cache
+///   is refused cleanly when it is allocated, so the spill stays off there.
+///
+/// Where it is not armed the flag places no KV buffer in system RAM and decides no context. The
+/// one definition this backend's KV placement and, through `Backend::kv_spill_armed`, the seam's
+/// context ladder read.
+pub fn kv_spill_armed(overflow: bool, unified_memory: bool, live_budget: bool) -> bool {
+    overflow && !unified_memory && live_budget
+}
+
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
 /// skeleton every spill class shares). The spill clause is Vulkan-specific twice over: the host
 /// bytes are ordinary host-visible memory (not page-locked) and attention reaches them
@@ -976,15 +1108,241 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
 };
 
 /// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
-/// ([`VulkanBackend::check_vram_budget`]) and the non-erroring probe
-/// ([`VulkanBackend::vram_budget_fits`]) so VRAM-first KV spill and the guard agree to the byte on
-/// where "full" is. Absorbs allocation slop (alignment, gpu-allocator block rounding) and
-/// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
+/// ([`VulkanBackend::check_vram_budget`]) and the VRAM-first KV spill's placement
+/// ([`VulkanBackend::kv_stays_in_vram`]) so the two agree to the byte on where "full" is. Absorbs
+/// allocation slop (alignment; on a device without a live budget, gpu-allocator's block rounding,
+/// which a live budget charges in full — see `pool`) and driver-internal allocations (descriptor
+/// pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
-/// Smallest device-local allocation the VRAM budget guard checks: anything below it
-/// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
-/// seam's KV refuse rung) can count exactly the allocations the guard will see.
+/// Smallest buffer [`VulkanBackend::make_buf_ex`] gives its own dedicated `VkDeviceMemory`; a
+/// smaller one is sub-allocated from one of gpu-allocator's shared blocks. KV cache buffers are
+/// dedicated whatever their size (see `make_alloc`).
+const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
+
+/// The size from which a KV buffer is in the large class of [`KvAllocCost`]: 2 MiB, the large
+/// page GPU MMUs map big allocations with. The probes measure each class separately
+/// ([`KV_COST_PROBES`]), so a driver that maps large allocations with large pages does not have
+/// that step charged to every small buffer.
+const KV_LARGE_FROM: u64 = 2 * 1024 * 1024;
+
+/// The probe whose size is an exact multiple of every page up to its own size, so what it commits
+/// past its size is a cost per allocation rather than rounding ([`kv_alloc_cost_from`]).
+const KV_PROBE_EXACT: u64 = 64 * 1024;
+
+/// The dedicated allocations [`probe_kv_alloc_cost`] measures, chosen so each size class has a
+/// one-word buffer past a page boundary and the small class an exact page multiple: a word (the
+/// placeholder's size), [`KV_PROBE_EXACT`] and a word past it, and a word past [`KV_LARGE_FROM`].
+/// Kept small on purpose: on a unified-memory device the pages a probe frees stay counted as in
+/// use by the live budget for a while, so every probed byte is room the context fit does not see
+/// (a probe a word past `DEDICATED_MIN` cost about 80 MiB of reported room on the integrated GPU
+/// here). A driver that rounds only allocations larger than the largest probe further is not
+/// seen; sizes between probes are priced by the step their class measured.
+const KV_COST_PROBES: [u64; 4] = [4, KV_PROBE_EXACT, KV_PROBE_EXACT + 4, KV_LARGE_FROM + 4];
+
+/// Allocations [`dedicated_commit`] makes per probe size; odd, so the median is one of them.
+const KV_COST_PROBE_ROUNDS: usize = 3;
+
+/// The small-class step [`kv_alloc_cost_from`] assumes where it measured none (no
+/// `VK_EXT_memory_budget`, a heap usage that does not move, or probes the device refused):
+/// D3D12's default resource placement alignment, taken as a plausible driver granule. A guess, not
+/// a figure measured on any device here.
+const KV_SMALL_STEP_UNMEASURED: u64 = 64 * 1024;
+
+/// The large-class step [`kv_alloc_cost_from`] assumes where it measured none: the large page
+/// itself ([`KV_LARGE_FROM`]), the most a driver mapping large allocations with large pages
+/// would round one up by. A guess, not a figure measured on any device here.
+const KV_LARGE_STEP_UNMEASURED: u64 = KV_LARGE_FROM;
+
+/// What this process has allocated on every heap, as `VK_EXT_memory_budget` reports it, or `None`
+/// on a device without the extension (`has_mem_budget`), whose usage figures are not filled in.
+fn process_heap_usage(s: &VulkanShared) -> Option<u64> {
+    if !s.has_mem_budget {
+        return None;
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let heaps = props2.memory_properties.memory_heap_count as usize;
+    Some(budget.heap_usage[..heaps].iter().sum())
+}
+
+/// What the driver commits for a dedicated allocation of `buffer`'s memory requirements `req`,
+/// measured as the process heap usage it adds: the median of [`KV_COST_PROBE_ROUNDS`] allocations
+/// made one after the other, each freed before the next, so neither memory the driver sets up on
+/// its first allocation nor another thread allocating or freeing meanwhile (the usage is the whole
+/// process's) decides it alone. Made in the first device-local type the buffer accepts, the one
+/// gpu-allocator picks for `MemoryLocation::GpuOnly`, with the flags a KV buffer's memory carries.
+/// `None` without a heap usage to read, when the usage does not move, or when the device refuses
+/// the allocation.
+fn dedicated_commit(
+    s: &VulkanShared,
+    buffer: vk::Buffer,
+    req: &vk::MemoryRequirements,
+) -> Option<u64> {
+    let mp = unsafe {
+        s.instance
+            .get_physical_device_memory_properties(s.physical_device)
+    };
+    let ty = (0..mp.memory_type_count).find(|&i| {
+        req.memory_type_bits & (1 << i) != 0
+            && mp.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    })?;
+    let mut added = Vec::with_capacity(KV_COST_PROBE_ROUNDS);
+    for _ in 0..KV_COST_PROBE_ROUNDS {
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(ty)
+            .push_next(&mut flags)
+            .push_next(&mut dedicated);
+        let before = process_heap_usage(s)?;
+        let memory = unsafe { s.device.allocate_memory(&info, None) }.ok()?;
+        let after = process_heap_usage(s);
+        unsafe { s.device.free_memory(memory, None) };
+        added.push(after?.saturating_sub(before));
+    }
+    added.sort_unstable();
+    Some(added[KV_COST_PROBE_ROUNDS / 2]).filter(|&c| c > 0)
+}
+
+/// The smallest power of two, at least `floor`, that rounds `size` up to at least `committed`
+/// bytes: the step an estimate must round `size` by so that it is never below what a dedicated
+/// allocation of it was measured to commit.
+fn rounding_that_covers(size: u64, floor: u64, committed: u64) -> u64 {
+    let mut step = floor.max(1).next_power_of_two();
+    while size.next_multiple_of(step) < committed {
+        step *= 2;
+    }
+    step
+}
+
+/// One measured probe of [`KV_COST_PROBES`]: its size, its memory-requirements alignment, and
+/// what a dedicated allocation of it committed (`None` when that could not be measured).
+#[derive(Clone, Copy, Debug)]
+struct KvProbe {
+    size: u64,
+    alignment: u64,
+    committed: Option<u64>,
+}
+
+/// The [`KvAllocCost`] the probes support. The per-allocation overhead is what the exact-multiple
+/// probe ([`KV_PROBE_EXACT`]) committed past its size (0 if it was not measured). Each class's
+/// step is the smallest power of two, at least the class's memory-requirements alignment, that
+/// prices every measured probe of the class, overhead added, at no less than it committed; a class
+/// with no measured probe takes its unmeasured guess. Returns whether anything was measured.
+fn kv_alloc_cost_from(probes: &[KvProbe]) -> (KvAllocCost, bool) {
+    let overhead = probes
+        .iter()
+        .find(|p| p.size == KV_PROBE_EXACT)
+        .and_then(|p| p.committed)
+        .map_or(0, |c| c.saturating_sub(KV_PROBE_EXACT));
+    let step = |large: bool, unmeasured: u64| {
+        let class = || {
+            probes
+                .iter()
+                .filter(move |p| (p.size >= KV_LARGE_FROM) == large)
+        };
+        let floor = class()
+            .map(|p| p.alignment)
+            .fold(fill_span(1), u64::max)
+            .next_power_of_two();
+        let measured = class()
+            .filter_map(|p| {
+                let c = p.committed?;
+                Some(rounding_that_covers(
+                    p.size,
+                    floor,
+                    c.saturating_sub(overhead),
+                ))
+            })
+            .max();
+        (
+            measured.unwrap_or(unmeasured).max(floor),
+            measured.is_some(),
+        )
+    };
+    let (small, small_measured) = step(false, KV_SMALL_STEP_UNMEASURED);
+    let (large, large_measured) = step(true, KV_LARGE_STEP_UNMEASURED);
+    (
+        KvAllocCost::new(small, large, KV_LARGE_FROM, overhead),
+        small_measured || large_measured,
+    )
+}
+
+/// [`Backend::kv_alloc_cost`] for this device, measured off dedicated allocations of
+/// [`KV_COST_PROBES`] with the KV usage ([`dedicated_commit`], [`kv_alloc_cost_from`]). Every KV
+/// buffer has its own `VkDeviceMemory` (`make_alloc`), and Vulkan reports neither the driver's
+/// rounding of one nor any cost per allocation, so they are measured. Run once, when the backend
+/// is built and before anything reads its memory budget: on a unified-memory device the probes'
+/// freed pages lower the live budget for a while, and a probe run between two budget reads of one
+/// sizing decision (as running it on first use did) moved a run on the integrated GPU from an
+/// f16 to a q8_0 cache at the same limit. About 0.1 ms there. Logged at debug level.
+fn probe_kv_alloc_cost(s: &VulkanShared) -> (KvAllocCost, bool) {
+    let probes: Vec<KvProbe> = KV_COST_PROBES
+        .iter()
+        .filter_map(|&size| {
+            let ci = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = match unsafe { s.device.create_buffer(&ci, None) } {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("KV allocation probe of {size} B: create_buffer: {e}");
+                    return None;
+                }
+            };
+            let req = unsafe { s.device.get_buffer_memory_requirements(buffer) };
+            let committed = dedicated_commit(s, buffer, &req);
+            unsafe { s.device.destroy_buffer(buffer, None) };
+            Some(KvProbe {
+                size,
+                alignment: req.alignment,
+                committed,
+            })
+        })
+        .collect();
+    let (cost, measured) = kv_alloc_cost_from(&probes);
+    tracing::debug!(?probes, ?cost, measured, "KV allocation cost");
+    (cost, measured)
+}
+
+/// `Ok` when one more `VkDeviceMemory` fits under the device's `limit`
+/// (`maxMemoryAllocationCount`), else the error a KV allocation is refused with: every KV cache
+/// buffer is its own allocation, so the count grows with layers times slots. `bound` is an upper
+/// bound on the live count kept by counters (`VulkanBackend::memory_allocations_bound`); only when
+/// it reaches the limit is the exact count (`exact`, a walk of the allocator) taken, so the check
+/// costs a few atomic loads everywhere but near the limit.
+fn admit_memory_allocation(bound: u64, exact: impl FnOnce() -> u64, limit: u64) -> Result<()> {
+    if bound < limit {
+        return Ok(());
+    }
+    let live = exact();
+    if live < limit {
+        return Ok(());
+    }
+    Err(be(format!(
+        "KV cache allocation refused: it would be device memory allocation {} of the {limit} this \
+         device allows at once (maxMemoryAllocationCount), and every KV cache buffer takes its \
+         own. Lower --parallel or INFR_KV_SLOTS (each slot allocates its own KV buffers), or run \
+         a model with fewer layers.",
+        live + 1,
+    )))
+}
+
+/// Smallest device-local commitment the VRAM budget guard checks: an allocation of its own (every
+/// KV buffer is one) below it is let through unasked, as is a pooled buffer that lands in a shared
+/// block already open, which commits nothing; a pooled buffer that opens a block is checked for
+/// the whole block. Public so a caller proving that an allocation set MUST be refused (the seam's
+/// KV refuse rung) can count exactly the allocations the guard will see.
 pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
 
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
@@ -1105,6 +1463,11 @@ pub struct DeviceInfo {
     pub vram_bytes: u64,
     /// True for the device `VulkanBackend::new()` would bind today (INFR_DEV, else discrete, else 0).
     pub is_default_pick: bool,
+    /// The memory a backend on this device budgets against under `kernels.vulkan.vram_limit`
+    /// (`INFR_VRAM_LIMIT`), and the device's own figure it caps — the device-local heaps on a
+    /// discrete device, every heap on an integrated one (see `vram_info`). `None` when no limit is
+    /// set or it is at or above the device's figure.
+    pub vram_limit: Option<(u64, u64)>,
     pub external_memory: bool,
     pub external_memory_fd: bool,
     pub external_memory_dma_buf: bool,
@@ -1215,6 +1578,23 @@ struct BdaBlockHandle {
     /// `vkGetBufferDeviceAddress(buf.buffer)` — this block's byte-0 device address. A sub-tensor's
     /// `Buffer::device_addr` is `base_addr + sub_offset`.
     base_addr: u64,
+}
+
+/// How a resident weight load is charged against the device's budget beyond its tensors' bytes,
+/// from [`VulkanBackend::weight_load_cost`]. The arena rounds each upload up to `align` and places
+/// it first-fit in a block; an upload of at least `block_min` bytes gets a block of exactly its
+/// size, and a smaller one shares blocks of `block_min` bytes, so the blocks the small uploads open
+/// are never fewer than their rounded total divided by `block_min`, rounded up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeightLoadCost {
+    /// The byte alignment of every upload within its block.
+    pub align: u64,
+    /// The size of a block opened by an upload smaller than it.
+    pub block_min: u64,
+    /// The upload staging ring's bytes where the memory it is allocated in counts against the
+    /// budget [`VulkanBackend::vram`] reports, else `0`. It is allocated at the first weight upload
+    /// and freed when the weight-load scope (`Backend::weight_progress`) ends.
+    pub staging: u64,
 }
 
 /// One [`BdaWeightArena`] block: the shared keepalive handle plus its live bump cursor. Split apart
@@ -1375,7 +1755,9 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         available,
         live: s.has_mem_budget,
         uma,
+        limited_from: None,
     }
+    .capped(s.vram_limit)
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -1406,9 +1788,10 @@ impl Drop for WeightProgress {
         if self.vram_log {
             let v = vram_info(&self.shared);
             tracing::info!(
-                "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
+                "post-load vram in use: {:.2} GiB of {:.2} GiB{} ({})",
                 v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
                 v.total as f64 / (1u64 << 30) as f64,
+                v.limit_note(),
                 if v.live { "live" } else { "tracked" },
             );
         }
@@ -1697,9 +2080,11 @@ impl VulkanBackend {
     /// valid timestamp bits is never taken while another family can compute: the submit
     /// splitter's segment timing, the work bound, the dropped-work check and the per-op profile
     /// all read timestamps written on the submit queue. Without a usable one, and under
-    /// `graphics`, the universal (GRAPHICS and COMPUTE) family is taken, then any family that
-    /// can compute. The two settings differ only in whether a fallback warns
-    /// ([`QueueOutcome::warns`]). `None` = the device cannot compute at all.
+    /// `graphics`, the universal (GRAPHICS and COMPUTE) family is taken; a device with no
+    /// universal family is left with COMPUTE-only ones, a timed one first and an untimed one as
+    /// the last resort, which only `auto` and `compute` warn about. `auto` and `compute` differ
+    /// only in whether a fallback warns ([`QueueOutcome::warns`]). `None` = the device cannot
+    /// compute at all.
     fn pick_queue_family(
         families: &[vk::QueueFamilyProperties],
         setting: tuning::QueueFamily,
@@ -1711,7 +2096,7 @@ impl VulkanBackend {
         };
         let compute_only = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
         let timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
-        let outcome = if setting == tuning::QueueFamily::Graphics {
+        let asked = if setting == tuning::QueueFamily::Graphics {
             QueueOutcome::GraphicsAsked
         } else if let Some(i) = families.iter().position(|p| compute_only(p) && timed(p)) {
             return Some((i as u32, QueueOutcome::ComputeOnly));
@@ -1720,12 +2105,21 @@ impl VulkanBackend {
         } else {
             QueueOutcome::NoComputeFamily
         };
+        if let Some(i) = families.iter().position(universal) {
+            return Some((i as u32, asked));
+        }
+        // No universal family: every family left that can compute is COMPUTE-only, and the
+        // outcome has to say so.
+        let last_resort = if setting == tuning::QueueFamily::Graphics {
+            QueueOutcome::NoUniversalFamily
+        } else {
+            QueueOutcome::OnlyUntimed
+        };
         families
             .iter()
-            .position(universal)
-            .or_else(|| families.iter().position(|p| compute(p) && timed(p)))
+            .position(|p| compute(p) && timed(p))
             .or_else(|| families.iter().position(compute))
-            .map(|i| (i as u32, outcome))
+            .map(|i| (i as u32, last_resort))
     }
 
     /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
@@ -1768,6 +2162,16 @@ impl VulkanBackend {
                     })
                     .map(|h| mp.memory_heaps[h].size)
                     .sum();
+                // The figure the guard counts on this device (`vram_info`): every heap on a
+                // unified-memory part, which is every integrated one.
+                let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                let budgeted = if integrated {
+                    (0..mp.memory_heap_count as usize)
+                        .map(|h| mp.memory_heaps[h].size)
+                        .sum()
+                } else {
+                    vram_bytes
+                };
                 let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
                     .unwrap_or_default();
                 let has = |name: &CStr| {
@@ -1778,9 +2182,11 @@ impl VulkanBackend {
                     index,
                     name,
                     device_type: device_type_str(p.device_type),
-                    integrated: p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    integrated,
                     vram_bytes,
                     is_default_pick: default_pick == Some(pd),
+                    vram_limit: vram_cap(cfg.kernels.vulkan.vram_limit, budgeted)
+                        .map(|cap| (cap, budgeted)),
                     external_memory: has(c"VK_KHR_external_memory"),
                     external_memory_fd: has(c"VK_KHR_external_memory_fd"),
                     external_memory_dma_buf: has(c"VK_EXT_external_memory_dma_buf"),
@@ -1867,6 +2273,7 @@ impl VulkanBackend {
         // tier. Borrowed, never cloned (R6); `cfg` itself moves onto the backend at the bottom of
         // this function.
         let vkcfg = &cfg.kernels.vulkan;
+        check_vram_limit(vkcfg.vram_limit)?;
 
         // ── entry ──────────────────────────────────────────────────────────────
         let entry =
@@ -2838,14 +3245,6 @@ impl VulkanBackend {
         MAX_STORAGE_BUFFER_RANGE
             .fetch_min(props.limits.max_storage_buffer_range, Ordering::Relaxed);
 
-        // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam
-        // reads this in `ubatch_rows`, which runs on the first session/KV allocation — strictly
-        // after `VulkanBackend::new` returns).
-        let _ = DEVICE_CLASS.set(DeviceClass {
-            integrated: caps.integrated,
-            compute_units: caps.compute_units,
-        });
-
         // One-line device banner (stderr) — the first thing to check on a portability bug report:
         // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
         // subgroup range + shared-mem budget. Printed on every `VulkanBackend::new()` (no
@@ -2968,10 +3367,14 @@ impl VulkanBackend {
             }
             tracing::info!(
                 "[infr] GPU: UNIFIED MEMORY — budgeting against all {} heaps ({}), not the \
-                 device-local slice alone ({}); this GPU's memory IS system RAM",
+                 device-local slice alone ({}); this GPU's memory IS system RAM{}",
                 mp.memory_heap_count,
                 fmt_bytes(all),
                 fmt_bytes(dev_local),
+                match vram_cap(cfg.kernels.vulkan.vram_limit, all) {
+                    Some(cap) => format!("; INFR_VRAM_LIMIT caps that at {}", fmt_bytes(cap)),
+                    None => String::new(),
+                },
             );
         }
 
@@ -3039,6 +3442,7 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
+        let vram_limit = cfg.kernels.vulkan.vram_limit;
         let backend = Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
@@ -3053,10 +3457,23 @@ impl VulkanBackend {
                 queue,
                 queue_family_index,
                 cmd_pool: Mutex::new(cmd_pool),
-                allocator: ManuallyDrop::new(Mutex::new(allocator)),
+                pool: ManuallyDrop::new(pool::Pool::new(
+                    allocator,
+                    mem_props.memory_types[..mem_props.memory_type_count as usize]
+                        .iter()
+                        .map(|t| t.property_flags)
+                        .collect(),
+                )),
                 caps,
                 has_mem_budget,
+                vram_limit,
                 max_mem_alloc_size,
+                kv_alloc_cost: OnceLock::new(),
+                max_memory_allocations: u64::from(props.limits.max_memory_allocation_count),
+                memory_type_count: u64::from(mem_props.memory_type_count),
+                raw_memory_allocations: AtomicU64::new(0),
+                dedicated_allocations: AtomicU64::new(0),
+                pooled_allocations: AtomicU64::new(0),
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
@@ -3100,10 +3517,35 @@ impl VulkanBackend {
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
+                kv_spill_reserve: AtomicU64::new(0),
                 staging_ring: Mutex::new(None),
                 gpu_wait,
             }),
         };
+
+        // Before anything reads the memory budget: see `probe_kv_alloc_cost`.
+        backend.shared.kv_alloc_cost();
+
+        // `kernels.vulkan.vram_limit`: say what every budget on this device will be measured
+        // against, beside the device's own figure, so a limited run's numbers are not read as the
+        // device's — and say so too when the limit is set but changes nothing.
+        if let Some(limit) = vram_limit {
+            let v = vram_info(&backend.shared);
+            match v.limited_from {
+                Some(real) => tracing::warn!(
+                    "[infr] GPU: VRAM LIMIT — budgeting against {} of this device's {} \
+                     (INFR_VRAM_LIMIT / kernels.vulkan.vram_limit); the context fit, placement \
+                     and the allocation guard all see the limit",
+                    fmt_bytes(v.total),
+                    fmt_bytes(real),
+                ),
+                None => tracing::info!(
+                    "[infr] GPU: VRAM LIMIT {} is at or above this device's {}: no effect",
+                    fmt_bytes(limit.resolve(v.total)),
+                    fmt_bytes(v.total),
+                ),
+            }
+        }
 
         // Before any other kernel is built: every f16 kernel compiled from here on is patched or not
         // according to what this finds.
@@ -3736,6 +4178,83 @@ impl VulkanBackend {
         self.vram().alloc_room()
     }
 
+    /// [`kv_spill_armed`] for this backend: whether a `[[kv.window]]` is declared at all (the
+    /// only thing that arms a spill), whether it is unified-memory, and whether its driver
+    /// reports a live budget.
+    fn spill_armed(&self) -> bool {
+        kv_spill_armed(
+            matches!(kv_spill_plan(&self.cfg), Ok(Some(_))),
+            self.shared.caps.unified_memory,
+            self.shared.has_mem_budget,
+        )
+    }
+
+    /// Where `kv.overflow`'s VRAM-first placement has put this backend's KV buffers so far: how
+    /// many, and how many bytes, in device memory and in system RAM. All zero with the flag off.
+    pub fn kv_spill_counts(&self) -> infr_core::budget::SpillCounts {
+        self.shared.kv_spill.counts()
+    }
+
+    /// What a resident weight load takes from [`alloc_room`](Self::alloc_room) besides the
+    /// tensors' own bytes, as this backend can say before the load: how the resident-BDA arena
+    /// places them (see [`WeightLoadCost`]) and the upload staging ring live while they are copied.
+    pub fn weight_load_cost(&self) -> WeightLoadCost {
+        let mp = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        // The ring is `MemoryLocation::CpuToGpu`, which gpu-allocator places in a host-visible,
+        // coherent, device-local type when the device has one with room, else in a host heap.
+        // `vram_info` counts every heap on a unified-memory part and the device-local ones on a
+        // discrete card, so either way a ring in that type is charged against the budget and is
+        // priced here; one sent to a host heap by a full device-local type is not foreseen.
+        let staging_type = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let counted = self.shared.caps.unified_memory
+            || mp.memory_types[..mp.memory_type_count as usize]
+                .iter()
+                .any(|t| t.property_flags.contains(staging_type));
+        WeightLoadCost {
+            align: BDA_WEIGHT_ALIGN,
+            block_min: BDA_BLOCK_MIN.min(self.shared.max_mem_alloc_size),
+            staging: if counted {
+                (RING_SLOTS * RING_SLOT_BYTES) as u64
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Live `VkDeviceMemory` objects this backend holds, exactly: every gpu-allocator block
+    /// (shared and dedicated) plus those it allocated itself. A P2P export or import (`p2p.rs`)
+    /// is not counted. Built off gpu-allocator's report, which clones a name per live allocation
+    /// under the allocator lock: for a test or the near-limit path of the KV allocation-count
+    /// check (`admit_memory_allocation`), never per allocation.
+    pub fn device_memory_allocations(&self) -> u64 {
+        self.shared.pool.blocks() + self.shared.raw_memory_allocations.load(Ordering::Relaxed)
+    }
+
+    /// An upper bound on [`device_memory_allocations`](Self::device_memory_allocations), from
+    /// counters kept where allocations are made and freed: exact for this backend's own
+    /// allocations and gpu-allocator's dedicated ones, and for its shared blocks the number of
+    /// live allocations in them (each lies in one block) plus one emptied block per memory type,
+    /// which gpu-allocator may keep. A few atomic loads.
+    fn memory_allocations_bound(&self) -> u64 {
+        let s = &self.shared;
+        s.raw_memory_allocations.load(Ordering::Relaxed)
+            + s.dedicated_allocations.load(Ordering::Relaxed)
+            + s.pooled_allocations.load(Ordering::Relaxed)
+            + s.memory_type_count
+    }
+
+    /// `maxMemoryAllocationCount`, read at construction: how many `VkDeviceMemory` objects this
+    /// device allows at once.
+    pub fn max_device_memory_allocations(&self) -> u64 {
+        self.shared.max_memory_allocations
+    }
+
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
     /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
     /// accepts the allocation and then evicts, which on a discrete card means reading weights back
@@ -3753,37 +4272,63 @@ impl VulkanBackend {
     ///
     /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
     /// individually blow the budget and stay covered by the next large allocation's check).
+    ///
+    /// This is the guard for an allocation of its own of `want` bytes; `make_buf_ex` asks
+    /// [`check_vram_commit`](Self::check_vram_commit) with what a pooled buffer commits.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
-        if want < VRAM_GUARD_MIN_ALLOC || self.cfg.kernels.vulkan.no_vram_guard {
+        self.check_vram_commit(pool::Commit::Own(want))
+    }
+
+    /// [`check_vram_budget`](Self::check_vram_budget) for what an allocation commits (see
+    /// [`pool::Commit`]). The live budget counts every gpu-allocator block whole from the moment
+    /// it is opened, so a pooled buffer that lands in an open block's free space is charged
+    /// nothing, and is let through unasked, while one that opens a block is charged the whole
+    /// block, whatever its own size. Exact as far as the ledger of shared blocks (`pool`) is
+    /// exact; `make_buf_ex` runs it under the pool's lock, so no other allocation can take the
+    /// free range it counted on. The live budget it reads can still move between the check and
+    /// the allocation: with other processes, and with this process's own allocations that do not
+    /// go through the pool and so do not wait for its lock — the unified-memory spill and
+    /// `INFR_KV_OVERFLOW`'s host KV (`alloc_vram_mapped`), and P2P exports and imports (`p2p.rs`)
+    /// — made on another thread.
+    fn check_vram_commit(&self, commit: pool::Commit) -> Result<()> {
+        if self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
-        // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
-        // the VRAM-first KV spill can never disagree (the guard errors iff the probe says it won't
-        // fit). Only build the detailed error — and re-query the driver for its fields — on failure.
-        if self.vram_budget_fits(want) {
+        // The decision is `pool::admits`, over the same snapshot arithmetic as `kv_stays_in_vram`
+        // (`budget_snapshot`, `pool::fits_budget`), so the hard guard here and the VRAM-first KV
+        // spill can never disagree. The driver is asked only for a commitment the guard checks.
+        let mut seen = None;
+        let admitted = pool::admits(commit, || {
+            let snapshot = self.budget_snapshot();
+            seen = Some(snapshot);
+            (snapshot.1, snapshot.2)
+        });
+        if admitted {
             return Ok(());
         }
-        let v = self.vram();
-        let used = if v.live {
-            v.total.saturating_sub(v.available)
-        } else {
-            self.shared.device_used.load(Ordering::Relaxed)
-        };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        let pool = if v.uma {
+        let (v, used, budget) = seen.expect("a refused commitment was checked against a reading");
+        let want = commit.bytes();
+        let heaps = if v.uma {
             "unified memory (all heaps — this GPU shares system RAM)"
         } else {
             "device-local"
         };
+        let requested = match commit {
+            pool::Commit::NewBlock { block, request } => format!(
+                "{} requested (the new shared block a {} buffer opens)",
+                fmt_bytes(block),
+                fmt_bytes(request),
+            ),
+            _ => format!("{} requested", fmt_bytes(want)),
+        };
         Err(be(format!(
-            "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool} \
+            "{} budget exceeded: {requested} + {} already in use ({}) > {} budget ({} {heaps}{} \
                  minus 256 MiB headroom). Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
                  (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
             if v.uma { "Unified-memory" } else { "VRAM" },
-            fmt_bytes(want),
             fmt_bytes(used),
             if v.live {
                 "live driver budget"
@@ -3792,6 +4337,7 @@ impl VulkanBackend {
             },
             fmt_bytes(budget),
             fmt_bytes(v.total),
+            v.limit_note(),
         )))
     }
 
@@ -3804,14 +4350,21 @@ impl VulkanBackend {
     /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
     /// decision, not a safety gate, so it always reports the honest budget answer.
     fn vram_budget_fits(&self, want: u64) -> bool {
+        let (_, used, budget) = self.budget_snapshot();
+        used.saturating_add(want) <= budget
+    }
+
+    /// The device memory snapshot the guard decides against, with the bytes it counts as used
+    /// (the live figure, or this backend's own tally without a live budget) and its budget (the
+    /// total less `GUARD_HEADROOM`).
+    fn budget_snapshot(&self) -> (VramInfo, u64, u64) {
         let v = self.vram();
         let used = if v.live {
             v.total.saturating_sub(v.available)
         } else {
             self.shared.device_used.load(Ordering::Relaxed)
         };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        used.saturating_add(want) <= budget
+        (v, used, v.total.saturating_sub(GUARD_HEADROOM))
     }
 
     /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
@@ -3892,6 +4445,11 @@ impl VulkanBackend {
             return Err(be(format!("rebar bind_buffer_memory: {e}")));
         }
 
+        // Count the `VkDeviceMemory` this owns outside gpu-allocator (balanced in
+        // `VkBuffer::drop`).
+        self.shared
+            .raw_memory_allocations
+            .fetch_add(1, Ordering::Relaxed);
         // Charge the device-local budget tally — UNLESS this is a UMA/host spill, which lives off
         // the device-local heap and must not count against it (balanced in `VkBuffer::drop`).
         if !spilled {
@@ -4169,8 +4727,9 @@ impl VulkanBackend {
     /// block exists in the same memory type (`active_general_blocks > 1` in its `free()`), and
     /// exposes no purge/trim API — so the last 64 MiB host-visible block (and a 256 MiB
     /// device-local one) would sit empty in the ReBAR heap for the whole session. Used by the
-    /// weight-upload staging path below; never on a per-token path (a dedicated allocation costs
-    /// a `vkAllocateMemory`, fine once per tensor at load, wrong per token).
+    /// weight-upload staging path below and by every KV cache buffer (`make_alloc`); never on a
+    /// per-token path (a dedicated allocation costs a `vkAllocateMemory`, fine once per tensor at
+    /// load or per KV buffer at a slot's allocation, wrong per token).
     fn make_buf_ex(
         &self,
         size: usize,
@@ -4208,21 +4767,12 @@ impl VulkanBackend {
         // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
         // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
         // transient buffers stay sub-allocated (cheap, pooled).
-        const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
-        let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
+        let dedicated = force_dedicated || requirements.size >= DEDICATED_MIN;
+        let scheme = if dedicated {
             AllocationScheme::DedicatedBuffer(buffer)
         } else {
             AllocationScheme::GpuAllocatorManaged
         };
-        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
-        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
-        // protects VRAM only).
-        if location == MemoryLocation::GpuOnly {
-            if let Err(e) = self.check_vram_budget(requirements.size) {
-                unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        }
 
         // ── UMA spill: device-local heap full, put this on the other heap ─────────────────────
         // UNIFIED-MEMORY PARTS ONLY (`uma_overflow_type` is `None` on every discrete GPU, so a
@@ -4230,9 +4780,10 @@ impl VulkanBackend {
         // before). Once the synthetic device-local heap is full, gpu-allocator would keep resolving
         // GpuOnly to it and RADV would keep saying yes, right up until the kernel can't validate
         // the buffer list and the SUBMIT dies. Place the overflow on the non-device-local heap
-        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`.
-        if location == MemoryLocation::GpuOnly {
-            if let Some(ty) = self.shared.uma_overflow_type {
+        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`. Decided
+        // before the guard, which charges a spilled buffer the memory of its own it takes.
+        let spill = match (location, self.shared.uma_overflow_type) {
+            (MemoryLocation::GpuOnly, Some(ty)) => {
                 // Leave the device-local heap a little slack rather than filling it to the last
                 // byte: the driver makes its own internal allocations there (descriptor pools,
                 // pipeline/shader memory, the command buffers themselves), and a heap with zero
@@ -4241,57 +4792,75 @@ impl VulkanBackend {
                 let dl_avail = device_local_room(&self.shared);
                 let fits_device_local =
                     dl_avail >= requirements.size.saturating_add(UMA_SPILL_MARGIN);
-                if !fits_device_local && requirements.memory_type_bits & (1 << ty) != 0 {
-                    // Both heaps are out if this fails, so report it rather than retrying on the
-                    // device-local heap we just established has no room (that path would recurse
-                    // straight back to here, and RADV would accept the allocation anyway and hand
-                    // the failure to the next submit as a device-lost — the exact thing this
-                    // spill exists to prevent).
-                    return match self.alloc_vram_mapped(
-                        buffer,
-                        size,
-                        &requirements,
-                        ty,
-                        true,
-                        device_address,
-                        // budget_check=false: the identical `check_vram_budget(requirements.size)`
-                        // at the top of `make_buf_ex` already ran for this GpuOnly buffer — don't
-                        // repeat it (and its memory-property driver round-trip) here.
-                        false,
-                    ) {
-                        Ok(b) => Ok(b),
-                        Err(e) => {
-                            // `alloc_vram_mapped` leaves the buffer to us on failure.
-                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                            Err(be(format!(
-                                "unified memory exhausted: {} for {label} did not fit the \
-                                 device-local heap ({} free) and the overflow heap rejected it \
-                                 too ({e})",
-                                fmt_bytes(requirements.size),
-                                fmt_bytes(dl_avail),
-                            )))
-                        }
-                    };
-                }
+                (!fits_device_local && requirements.memory_type_bits & (1 << ty) != 0)
+                    .then_some((ty, dl_avail))
             }
+            _ => None,
+        };
+
+        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
+        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
+        // protects VRAM only). A spilled buffer is charged its size here; a gpu-allocator one is
+        // checked by `pool.allocate` under its lock, charged what it commits: nothing inside a
+        // block already open, the whole block when it opens one.
+        if let Some((ty, dl_avail)) = spill {
+            if let Err(e) = self.check_vram_commit(pool::Commit::Own(requirements.size)) {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+            // Both heaps are out if this fails, so report it rather than retrying on the
+            // device-local heap we just established has no room (that path would recurse
+            // straight back to here, and RADV would accept the allocation anyway and hand
+            // the failure to the next submit as a device-lost — the exact thing this
+            // spill exists to prevent).
+            return match self.alloc_vram_mapped(
+                buffer,
+                size,
+                &requirements,
+                ty,
+                true,
+                device_address,
+                // budget_check=false: the guard above already charged this GpuOnly buffer
+                // its size — don't repeat it (and its memory-property driver round-trip)
+                // here.
+                false,
+            ) {
+                Ok(b) => Ok(b),
+                Err(e) => {
+                    // `alloc_vram_mapped` leaves the buffer to us on failure.
+                    unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                    Err(be(format!(
+                        "unified memory exhausted: {} for {label} did not fit the \
+                         device-local heap ({} free) and the overflow heap rejected it \
+                         too ({e})",
+                        fmt_bytes(requirements.size),
+                        fmt_bytes(dl_avail),
+                    )))
+                }
+            };
         }
 
-        let allocation = {
-            let mut alloc = self.shared.allocator.lock().unwrap();
-            alloc
-                .allocate(&AllocationCreateDesc {
-                    name: label,
-                    requirements,
-                    location,
-                    linear: true,
-                    allocation_scheme: scheme,
-                })
-                .map_err(|e| {
-                    // Clean up the buffer we created if allocation fails.
-                    unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                    be(format!("gpu_allocator::allocate: {e}"))
-                })?
+        let desc = AllocationCreateDesc {
+            name: label,
+            requirements,
+            location,
+            // `pool` assumes every allocation is linear: gpu-allocator then never moves one off its
+            // alignment for the buffer-image granularity.
+            linear: true,
+            allocation_scheme: scheme,
         };
+        let admit = |commit| match location {
+            MemoryLocation::GpuOnly => self.check_vram_commit(commit),
+            _ => Ok(()),
+        };
+        let allocation = self
+            .shared
+            .pool
+            .allocate(&desc, self.shared.has_mem_budget, admit)
+            .inspect_err(|_| {
+                // Clean up the buffer we created if the guard or the allocation refuses it.
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            })?;
 
         let bound = unsafe {
             self.shared
@@ -4302,7 +4871,7 @@ impl VulkanBackend {
             // Nothing owns the buffer or its memory yet, so release both here, as the allocation
             // failure above does for the buffer.
             unsafe { self.shared.device.destroy_buffer(buffer, None) };
-            let freed = self.shared.allocator.lock().unwrap().free(allocation);
+            let freed = self.shared.pool.free(allocation);
             return Err(be(match freed {
                 Ok(()) => format!("bind_buffer_memory: {e}"),
                 Err(fe) => {
@@ -4310,6 +4879,14 @@ impl VulkanBackend {
                 }
             }));
         }
+
+        // Count the allocation for `memory_allocations_bound` (balanced by `VkBuffer::drop`).
+        if allocation.is_dedicated() {
+            &self.shared.dedicated_allocations
+        } else {
+            &self.shared.pooled_allocations
+        }
+        .fetch_add(1, Ordering::Relaxed);
 
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
@@ -4429,10 +5006,20 @@ impl VulkanBackend {
         // kernel reads this address yet (every attention/store/dequant dispatch still binds these
         // buffers exactly as before `vkb`). Unlike `Weights`, this is deliberately NOT an arena
         // sub-allocation: each `kbufs[l]`/`vbufs[l]` (and its fork/checkpoint/MTP-draft twins)
-        // stays its OWN dedicated-or-pooled buffer object via the ordinary `make_buf_ex` path — the
-        // per-layer/per-side structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage +
-        // an `own_addr`. Smallest blast radius: only KV buffers get an address, not every
-        // `Activations` scratch/partial/logits allocation in the engine.
+        // stays its OWN buffer object via the ordinary `make_buf_ex` path — the per-layer/per-side
+        // structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage + an `own_addr`.
+        // Smallest blast radius: only KV buffers get an address, not every `Activations`
+        // scratch/partial/logits allocation in the engine.
+        //
+        // Every KV buffer also gets its own DEDICATED `VkDeviceMemory`, whatever its size. A pooled
+        // one could open a whole gpu-allocator block that neither the context fit nor the VRAM
+        // guard prices; dedicated, the device commits what `Backend::kv_alloc_cost` prices, as far
+        // as it was measured. KV buffers are allocated at a slot's cold init, at a fork and at its
+        // first recurrent-state snapshot, never per token, so the `vkAllocateMemory` each costs
+        // stays off the decode path. Each one counts against `maxMemoryAllocationCount`, checked
+        // here first. Best-effort near the limit: the check and the allocation are not atomic
+        // (another thread may allocate between them), and only KV allocations are admitted this
+        // way — any other class past the limit still fails inside the driver.
         if usage == BufferUsage::KvCache {
             // Opt-in overflow (issue: KV-in-system-RAM), VRAM-FIRST: keep this KV buffer resident in
             // device-local VRAM while it fits the guard's budget; once VRAM is full, place it — and,
@@ -4444,7 +5031,7 @@ impl VulkanBackend {
             if let Some(plan) = kv_spill_plan(&self.cfg)? {
                 return self.alloc_kv_planned(bytes, plan);
             }
-            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
+            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", true, true);
         }
         let (location, label) = match usage {
             BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
@@ -4732,6 +5319,10 @@ impl Backend for VulkanBackend {
 
     fn capabilities(&self) -> Capabilities {
         self.shared.caps.clone()
+    }
+
+    fn kv_alloc_cost(&self) -> KvAllocCost {
+        self.shared.kv_alloc_cost().0
     }
 
     fn weight_progress(
@@ -5063,6 +5654,14 @@ impl Backend for VulkanBackend {
     /// footprint has a term for).
     fn device_alloc_room(&self) -> Option<u64> {
         Some(self.alloc_room())
+    }
+
+    fn kv_spill_armed(&self) -> bool {
+        self.spill_armed()
+    }
+
+    fn set_kv_spill_reserve(&self, bytes: u64) {
+        self.shared.kv_spill_reserve.store(bytes, Ordering::Relaxed);
     }
 
     fn activation_peak(&self) -> Option<u64> {
@@ -5755,9 +6354,10 @@ mod tests {
     }
 
     /// The segment timing, the work bound, the dropped-work check and the per-op profile read
-    /// timestamps from the submit queue, so a COMPUTE-only family that writes none is not taken
-    /// under any setting, and the fallback warns under `auto` and `compute` alike; a second one
-    /// that does write them is taken.
+    /// timestamps from the submit queue, so a COMPUTE-only family that writes none is passed over
+    /// while the device has a universal family, and the fallback warns under `auto` and `compute`
+    /// alike; a second one that does write them is taken. (With no universal family it is the
+    /// last resort: `an_untimed_compute_only_family_is_the_last_resort`.)
     #[test]
     fn a_compute_only_family_without_timestamps_is_refused() {
         use tuning::QueueFamily::{Auto, Compute, Graphics};
@@ -5781,13 +6381,149 @@ mod tests {
         three[0].queue_flags = vk::QueueFlags::GRAPHICS;
         assert_eq!(
             VulkanBackend::pick_queue_family(&three, Graphics),
-            Some((2, QueueOutcome::GraphicsAsked))
+            Some((2, QueueOutcome::NoUniversalFamily))
         );
-        for quiet in [QueueOutcome::ComputeOnly, QueueOutcome::GraphicsAsked] {
+        for quiet in [
+            QueueOutcome::ComputeOnly,
+            QueueOutcome::GraphicsAsked,
+            QueueOutcome::NoUniversalFamily,
+        ] {
             for setting in [Auto, Compute, Graphics] {
                 assert!(!quiet.warns(setting), "{quiet:?} under {setting:?}");
             }
         }
+    }
+
+    /// Every outcome, each reached from the one before it. The match has no wildcard, so a new
+    /// variant does not compile until it is given a place in the chain.
+    fn every_queue_outcome() -> Vec<QueueOutcome> {
+        use QueueOutcome::*;
+        let next = |o: &QueueOutcome| match o {
+            ComputeOnly => Some(GraphicsAsked),
+            GraphicsAsked => Some(NoUniversalFamily),
+            NoUniversalFamily => Some(NoComputeFamily),
+            NoComputeFamily => Some(NoTimestamps),
+            NoTimestamps => Some(OnlyUntimed),
+            OnlyUntimed => None,
+        };
+        std::iter::successors(Some(ComputeOnly), next).collect()
+    }
+
+    /// The reason printed beside the picked family describes that family and that device: over
+    /// every ordered choice of up to three families out of every kind, and every setting, the
+    /// outcome's family kind is the picked family's, its words start with that kind, and what
+    /// the outcome says about the device (which kinds of family it has, which write timestamps)
+    /// holds for the family list. Every outcome is reached.
+    #[test]
+    fn the_reason_describes_the_family_that_was_picked() {
+        use tuning::QueueFamily::Graphics;
+        let can_compute =
+            |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
+        let is_universal = |p: &vk::QueueFamilyProperties| {
+            can_compute(p) && p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        };
+        let is_compute_only = |p: &vk::QueueFamilyProperties| can_compute(p) && !is_universal(p);
+        let is_timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
+        let kinds: Vec<vk::QueueFamilyProperties> = [
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+            vk::QueueFlags::COMPUTE,
+            vk::QueueFlags::GRAPHICS,
+            vk::QueueFlags::TRANSFER,
+        ]
+        .into_iter()
+        .flat_map(|flags| {
+            let timed = queue_family(flags);
+            let untimed = vk::QueueFamilyProperties {
+                timestamp_valid_bits: 0,
+                ..timed
+            };
+            [timed, untimed]
+        })
+        .collect();
+        let mut devices: Vec<Vec<vk::QueueFamilyProperties>> = Vec::new();
+        for a in &kinds {
+            devices.push(vec![*a]);
+            for b in &kinds {
+                devices.push(vec![*a, *b]);
+                for c in &kinds {
+                    devices.push(vec![*a, *b, *c]);
+                }
+            }
+        }
+        let mut reached = Vec::new();
+        for families in &devices {
+            let has_universal = families.iter().any(is_universal);
+            let has_compute_only = families.iter().any(is_compute_only);
+            let has_timed_compute_only = families.iter().any(|p| is_compute_only(p) && is_timed(p));
+            for (_, setting) in tuning::QueueFamily::ALL {
+                let Some((i, outcome)) = VulkanBackend::pick_queue_family(families, setting) else {
+                    assert!(
+                        !families.iter().any(can_compute),
+                        "{setting:?} on {families:?}"
+                    );
+                    continue;
+                };
+                let picked = &families[i as usize];
+                let what = format!("{setting:?} on {families:?}: family {i}, {outcome:?}");
+                assert!(can_compute(picked), "{what}");
+                assert_eq!(outcome.takes_universal(), is_universal(picked), "{what}");
+                let reason = outcome.reason();
+                let kind = if is_universal(picked) {
+                    "the universal family"
+                } else {
+                    "a compute-only family"
+                };
+                assert!(reason.starts_with(kind), "{what}: {reason}");
+                // What each outcome says about the setting and the device, held to both.
+                let graphics = setting == Graphics;
+                let holds = match outcome {
+                    QueueOutcome::ComputeOnly => !graphics && is_timed(picked),
+                    QueueOutcome::GraphicsAsked => graphics,
+                    QueueOutcome::NoUniversalFamily => graphics && !has_universal,
+                    QueueOutcome::NoComputeFamily => !graphics && !has_compute_only,
+                    QueueOutcome::NoTimestamps => {
+                        !graphics && has_compute_only && !has_timed_compute_only
+                    }
+                    QueueOutcome::OnlyUntimed => {
+                        !graphics
+                            && !is_timed(picked)
+                            && !families.iter().any(|p| can_compute(p) && is_timed(p))
+                    }
+                };
+                assert!(holds, "{what}: {reason}");
+                if !reached.contains(&outcome) {
+                    reached.push(outcome);
+                }
+            }
+        }
+        for outcome in every_queue_outcome() {
+            assert!(reached.contains(&outcome), "{outcome:?} was never reached");
+        }
+    }
+
+    /// A device whose only families that can compute are COMPUTE-only without timestamps takes
+    /// one as the last resort: `auto` and `compute` warn, `graphics` does not.
+    #[test]
+    fn an_untimed_compute_only_family_is_the_last_resort() {
+        use tuning::QueueFamily::{Auto, Compute, Graphics};
+        let mut families = [
+            queue_family(vk::QueueFlags::GRAPHICS),
+            queue_family(vk::QueueFlags::COMPUTE),
+        ];
+        families[1].timestamp_valid_bits = 0;
+        for setting in [Auto, Compute] {
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&families, setting),
+                Some((1, QueueOutcome::OnlyUntimed)),
+                "{setting:?}"
+            );
+            assert!(QueueOutcome::OnlyUntimed.warns(setting), "{setting:?}");
+        }
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&families, Graphics),
+            Some((1, QueueOutcome::NoUniversalFamily))
+        );
+        assert!(!QueueOutcome::NoUniversalFamily.warns(Graphics));
     }
 
     #[test]
@@ -5914,7 +6650,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn buffers_bound_whole_are_refused_past_the_storage_range() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         const LIMIT: usize = 1 << 20;
@@ -5942,7 +6678,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn tp_copies_reject_out_of_bounds_extents() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let small = be_.alloc(256, BufferUsage::Activations).unwrap();
@@ -6218,6 +6954,113 @@ mod tests {
         );
     }
 
+    /// `kernels.vulkan.vram_limit` as a snapshot sees it: below the device's figure it becomes the
+    /// total, the bytes in use stay what they were, and the free figure shrinks by what the limit
+    /// took (to nothing when the limit is below what is in use); a percentage is of the device's
+    /// figure; at or above that figure, or unset, nothing changes. Pure, so no GPU.
+    #[test]
+    fn vram_limit_caps_a_snapshot_and_never_raises_it() {
+        const GIB: u64 = 1 << 30;
+        let snap = VramInfo {
+            total: 24 * GIB,
+            available: 20 * GIB,
+            live: true,
+            uma: false,
+            limited_from: None,
+        };
+        let capped = |limit: SizeSpec| snap.capped(Some(limit));
+
+        let six = capped(SizeSpec::Bytes(6 * GIB));
+        assert_eq!(
+            (six.total, six.available, six.limited_from),
+            (6 * GIB, 2 * GIB, Some(24 * GIB)),
+            "the 4 GiB in use stay in use under the limit"
+        );
+        assert_eq!(six.alloc_room(), 2 * GIB - GUARD_HEADROOM);
+        assert_eq!((six.live, six.uma), (snap.live, snap.uma));
+
+        let half = capped(SizeSpec::Percent(0.5));
+        assert_eq!((half.total, half.available), (12 * GIB, 8 * GIB));
+
+        let under_use = capped(SizeSpec::Bytes(3 * GIB));
+        assert_eq!((under_use.total, under_use.available), (3 * GIB, 0));
+
+        for no_op in [
+            Some(SizeSpec::Bytes(24 * GIB)),
+            Some(SizeSpec::Bytes(64 * GIB)),
+            Some(SizeSpec::Percent(1.5)),
+            None,
+        ] {
+            let same = snap.capped(no_op);
+            assert_eq!(
+                (same.total, same.available, same.limited_from),
+                (snap.total, snap.available, None),
+                "{no_op:?} must change nothing"
+            );
+        }
+    }
+
+    /// A zero-byte limit is refused before any device work; every other spelling is accepted.
+    #[test]
+    fn a_zero_vram_limit_is_refused() {
+        let err = check_vram_limit(Some(SizeSpec::Bytes(0))).expect_err("a 0-byte limit");
+        assert!(err.to_string().contains("vram_limit is 0 bytes"), "{err}");
+        for ok in [None, Some(SizeSpec::Bytes(1)), Some(SizeSpec::Percent(0.5))] {
+            assert!(check_vram_limit(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// On real hardware: `kernels.vulkan.vram_limit` reaches the figures every budget reads and the
+    /// guard that enforces them. A limit leaving the guard 1 GiB above what is in use refuses an
+    /// allocation of that size, with an error naming the device's own figure, where the same
+    /// device without the limit lets it through; a limit above the device's memory changes
+    /// nothing. Drives `check_vram_budget` and an `alloc` the guard refuses, so it commits nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_vram_limit_caps_the_budget_and_the_guard() {
+        const GIB: u64 = 1 << 30;
+        let build = |limit: Option<SizeSpec>| {
+            let mut cfg = test_config();
+            cfg.kernels.vulkan.vram_limit = limit;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let free = build(None);
+        let real = free.vram();
+        assert_eq!(real.limited_from, None);
+        let used = real.total - real.available;
+        assert!(
+            free.check_vram_budget(GIB).is_ok(),
+            "the device must have 1 GiB to spare for this test: {real:?}"
+        );
+        drop(free);
+
+        let limit = used + GIB;
+        let limited = build(Some(SizeSpec::Bytes(limit)));
+        let v = limited.vram();
+        assert_eq!((v.total, v.limited_from), (limit, Some(real.total)));
+        assert!(
+            limited.alloc_room() < GIB,
+            "the fit's ceiling under the limit: {}",
+            limited.alloc_room()
+        );
+        let refused = limited
+            .check_vram_budget(GIB)
+            .expect_err("the guard must refuse what the limit forbids");
+        assert!(
+            refused.to_string().contains("limited from"),
+            "the refusal must say the budget is limited: {refused}"
+        );
+        assert!(limited
+            .alloc(GIB as usize, BufferUsage::Activations)
+            .is_err());
+        drop(limited);
+
+        let above = build(Some(SizeSpec::Bytes(real.total.saturating_mul(2))));
+        let v = above.vram();
+        assert_eq!((v.total, v.limited_from), (real.total, None));
+        assert!(above.check_vram_budget(GIB).is_ok());
+    }
+
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
     /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated, slow)`.
     /// A configured 0 is also a kill switch: a forward that would arm the splitter does not.
@@ -6398,12 +7241,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn resident_bda_weight_arena_roundtrip() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let sizes = [1000usize, 4096, 300_000];
         let mut addrs = Vec::new();
@@ -6459,6 +7298,220 @@ mod tests {
         );
     }
 
+    /// The rounding an estimate needs to cover a measured commitment, on the figures RADV gave on
+    /// the integrated GPU here (each dedicated allocation rounded up to a 4 KiB page) and on a
+    /// driver that would round a large allocation to a 2 MiB page.
+    #[test]
+    fn rounding_covers_what_was_committed() {
+        const PAGE: u64 = 4096;
+        const LARGE_PAGE: u64 = 2 << 20;
+        // Already covered by the alignment: no page rounding measured.
+        assert_eq!(rounding_that_covers(PAGE, 16, PAGE), 16);
+        // A 4-byte buffer committing a page needs the page.
+        assert_eq!(rounding_that_covers(4, 16, PAGE), PAGE);
+        // One word past 2 MiB committing a page more: a page.
+        assert_eq!(
+            rounding_that_covers(LARGE_PAGE + 4, 16, LARGE_PAGE + PAGE),
+            PAGE
+        );
+        // The same buffer committing two large pages: a large page.
+        assert_eq!(
+            rounding_that_covers(LARGE_PAGE + 4, 16, 2 * LARGE_PAGE),
+            LARGE_PAGE
+        );
+        // A floor that is not a power of two is raised to one.
+        assert_eq!(rounding_that_covers(4, 12, 4), 16);
+    }
+
+    /// The cost the probes support, on hand-made drivers, each probe at memory-requirements
+    /// alignment 16. Every measured probe is priced at no less than it committed, and:
+    /// - the figures RADV gave on the integrated GPU (every allocation rounded up to 4 KiB) price
+    ///   both classes at 4 KiB with no overhead;
+    /// - a driver mapping large allocations with 2 MiB pages charges that step to the large class
+    ///   only, so a placeholder still costs a page, not 2 MiB;
+    /// - a driver using 64 KiB pages past 64 KiB charges that step to the whole small class, a
+    ///   placeholder included: the classes are no finer than the probes;
+    /// - a fixed cost per allocation is read off the exact-multiple probe and added to every
+    ///   buffer, an exact page multiple included;
+    /// - nothing measured takes the guesses.
+    #[test]
+    fn kv_alloc_cost_prices_every_probe_by_its_class() {
+        const KIB: u64 = 1 << 10;
+        const MIB: u64 = 1 << 20;
+        let probes = |committed: [Option<u64>; 4]| -> Vec<KvProbe> {
+            KV_COST_PROBES
+                .iter()
+                .zip(committed)
+                .map(|(&size, committed)| KvProbe {
+                    size,
+                    alignment: 16,
+                    committed,
+                })
+                .collect()
+        };
+        // In `KV_COST_PROBES` order: 4 B, 64 KiB, 64 KiB + 4, 2 MiB + 4.
+        let cases = [
+            (
+                "4 KiB pages",
+                [4 * KIB, 64 * KIB, 68 * KIB, 2 * MIB + 4 * KIB],
+                KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 0),
+            ),
+            (
+                "2 MiB pages from 2 MiB",
+                [4 * KIB, 64 * KIB, 68 * KIB, 4 * MIB],
+                KvAllocCost::new(4 * KIB, 2 * MIB, 2 * MIB, 0),
+            ),
+            (
+                "64 KiB pages past 64 KiB",
+                [4 * KIB, 64 * KIB, 128 * KIB, 2 * MIB + 64 * KIB],
+                KvAllocCost::new(64 * KIB, 64 * KIB, 2 * MIB, 0),
+            ),
+            (
+                "512 B per allocation",
+                [
+                    4 * KIB + 512,
+                    64 * KIB + 512,
+                    68 * KIB + 512,
+                    2 * MIB + 4 * KIB + 512,
+                ],
+                KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 512),
+            ),
+        ];
+        for (name, committed, want) in cases {
+            let (cost, measured) = kv_alloc_cost_from(&probes(committed.map(Some)));
+            assert!(measured, "{name}");
+            assert_eq!(cost, want, "{name}");
+            for (&size, c) in KV_COST_PROBES.iter().zip(committed) {
+                assert!(
+                    cost.committed(size) >= c,
+                    "{name}: {size} B priced {} under the {c} committed",
+                    cost.committed(size)
+                );
+            }
+        }
+        assert_eq!(
+            KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 512).committed(64 * KIB),
+            64 * KIB + 512
+        );
+        assert_eq!(
+            kv_alloc_cost_from(&probes([None; 4])),
+            (
+                KvAllocCost::new(
+                    KV_SMALL_STEP_UNMEASURED,
+                    KV_LARGE_STEP_UNMEASURED,
+                    KV_LARGE_FROM,
+                    0
+                ),
+                false
+            )
+        );
+    }
+
+    /// A KV allocation is refused by name, with the count and the limit, at the device's
+    /// `maxMemoryAllocationCount` (4096 is the minimum Vulkan guarantees), and admitted below it.
+    /// The exact count is taken only once the counters' bound reaches the limit.
+    #[test]
+    fn kv_allocation_past_the_allocation_count_is_refused() {
+        const LIMIT: u64 = 4096;
+        assert!(admit_memory_allocation(
+            LIMIT - 1,
+            || panic!("the exact count is not taken below the limit"),
+            LIMIT
+        )
+        .is_ok());
+        assert!(admit_memory_allocation(LIMIT + 7, || LIMIT - 1, LIMIT).is_ok());
+        for live in [LIMIT, LIMIT + 1] {
+            let msg = admit_memory_allocation(live + 7, || live, LIMIT)
+                .expect_err("an allocation past the limit must be refused")
+                .to_string();
+            assert!(
+                msg.contains(&format!("allocation {} of the {LIMIT}", live + 1))
+                    && msg.contains("maxMemoryAllocationCount"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// Every KV buffer has its own allocation, and what the device commits for it is never above
+    /// what `Backend::kv_alloc_cost` prices it at — at sizes the probes do not use, in both
+    /// classes: a short word, an exact page multiple, an exact multiple the size of a small
+    /// recurrent state, a size off any page boundary, an exact 3 MiB, one off a boundary above
+    /// 2 MiB, and one past the largest probe. Measured off the process heap usage
+    /// (`VK_EXT_memory_budget`), so skipped, saying so, on a device where the cost could not be
+    /// measured; where it was, a buffer must move the usage. Before KV buffers were dedicated, the
+    /// first small one opened a shared block of gpu-allocator's, far past its price, and several
+    /// shared one allocation.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_buffers_commit_no_more_than_their_price() {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
+        };
+        let (cost, measured) = be.shared.kv_alloc_cost();
+        if !measured {
+            eprintln!(
+                "skip: this device reports no usable heap usage, so the KV commitment is \
+                 unmeasured (priced by the guess {cost:?})"
+            );
+            return;
+        }
+        const N: u64 = 8;
+        const ROUNDS: usize = 5;
+        let usage = || process_heap_usage(&be.shared).expect("measured, so the usage is read");
+        // Memory the driver sets up on a first allocation is not this test's subject.
+        drop(
+            be.make_alloc(16, BufferUsage::KvCache)
+                .expect("KvCache alloc"),
+        );
+        for size in [
+            16usize,
+            4096,
+            73_728,
+            100_000,
+            3 << 20,
+            (5 << 20) + 12,
+            (48 << 20) + 8,
+        ] {
+            // The heap usage is the whole process's: under nextest (the gate's runner) that is
+            // this test alone, but a test thread allocating or freeing beside it under
+            // `cargo test` lands in the figure, so the median of a few rounds is taken.
+            let mut rounds = Vec::with_capacity(ROUNDS);
+            let mut allocs = 0;
+            for _ in 0..ROUNDS {
+                let (before, allocs_before) = (usage(), be.device_memory_allocations());
+                let bufs: Vec<VkBuffer> = (0..N)
+                    .map(|_| {
+                        be.make_alloc(size, BufferUsage::KvCache)
+                            .expect("KvCache alloc")
+                    })
+                    .collect();
+                rounds.push(usage().saturating_sub(before));
+                allocs = be.device_memory_allocations() - allocs_before;
+                drop(bufs);
+            }
+            rounds.sort_unstable();
+            let committed = rounds[ROUNDS / 2];
+            let priced = N * cost.committed(size as u64);
+            eprintln!(
+                "{N} KV buffers of {size} B: {allocs} allocations, committed {committed} B \
+                 ({} B per buffer past its size), priced {priced} B by {cost:?}",
+                (committed / N).saturating_sub(size as u64)
+            );
+            assert_eq!(
+                allocs, N,
+                "{size} B: every KV buffer must be its own allocation"
+            );
+            assert!(
+                committed >= N * size as u64,
+                "{size} B: {N} KV buffers moved the heap usage by only {committed} B"
+            );
+            assert!(
+                committed <= priced,
+                "{size} B: {N} KV buffers committed {committed} B, past the {priced} B priced"
+            );
+        }
+    }
+
     /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a
     /// `BufferUsage::KvCache` allocation (the exact usage class `infr-llama`'s `kbufs[l]`/
     /// `vbufs[l]`, their `fork()`/MTP-checkpoint/MTP-draft twins all route through as of this
@@ -6469,17 +7522,13 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn kv_cache_buffer_reports_device_addr() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         // Two independent buffers, mirroring a K/V pair for one layer. UNLIKE the resident-weight
-        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block in this
-        // slice (see `make_alloc`'s `KvCache` arm) — each stays its own dedicated-or-pooled
-        // object, so their addresses must be distinct, non-null VkDeviceAddress values.
+        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block (see
+        // `make_alloc`'s `KvCache` arm) — each is its own object with its own dedicated
+        // allocation, so their addresses must be distinct, non-null VkDeviceAddress values.
         let kbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
         let vbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
         let kaddr = kbuf
@@ -6533,12 +7582,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn backend_drop_frees_device_after_moe_pager() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         be.init_moe_pager(crate::pager::MoePagerLayout {
             n_blocks: 4,
@@ -6690,12 +7735,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn softcap_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (n, cap) = (100usize, 30.0f32);
         let x = det(n, 0.5);
@@ -6713,12 +7754,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn deltanet_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (nv, nk, kd, vd) = (4usize, 2usize, 8usize, 8usize);
         let eps = 1e-6f32;
@@ -6809,12 +7846,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn conv1d_silu_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (cc, kconv) = (40usize, 4usize);
         let qkv = det(cc, 0.2);

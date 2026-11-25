@@ -1913,6 +1913,30 @@ fn lower_op(
             rows,
             n,
         } => rec.mul_vec(r(*x)?, r(*vec)?, r(*dst)?, *rows as usize, *n as usize),
+        Op::AttnTemp {
+            x,
+            dst,
+            rows,
+            n,
+            pos,
+            floor_scale,
+            scale,
+            offset,
+        } => {
+            if *floor_scale == 0 {
+                return Err(be("vulkan Op::AttnTemp: floor_scale 0".to_string()));
+            }
+            rec.attn_temp(
+                r(*x)?,
+                r(*dst)?,
+                *rows as usize,
+                *n as usize,
+                *pos,
+                *floor_scale,
+                *scale,
+                *offset,
+            )?;
+        }
         Op::MoeSharedExpertAdd {
             moe,
             shexp,
@@ -4435,8 +4459,19 @@ fn lower_op(
             // integer dot product falls through to the small-m path unconditionally instead (its
             // `linear_native_id_multi` id-indexed GEMVs are plain dequant-in-shader, no dp4a) —
             // correct for any `rows`, just without the batched path's cross-token weight-bank
-            // reuse (a real perf cost for large-batch MoE prefill on such hardware).
-            if rows > moe_small_m_threshold(be_) && be_.caps().i8_dot {
+            // reuse (a real perf cost for large-batch MoE prefill on such hardware). A gate/up or
+            // down width the expert GEMMs' column tile does not divide takes it too
+            // (`infr_core::tensor::moe_expert_gemm_widths_ok`: they cover whole tiles only and
+            // would leave the rest of the output unwritten). The small-m path is correct at any
+            // row count but was measured only up to `infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`
+            // rows, and a full default chunk through it can hang the GPU (see
+            // `moe_small_m_threshold`), so the seam caps such a model's prefill chunk at that
+            // height; this arm does not bound `rows` itself.
+            let gu_width = if *fused_gate_up { 2 * nff } else { nff };
+            if rows > moe_small_m_threshold(be_)
+                && be_.caps().i8_dot
+                && infr_core::tensor::moe_expert_gemm_widths_ok(gu_width, ne)
+            {
                 // `matmul_mmq_experts` is dtype-generic (dp4a mmq kernels exist for every dtype in
                 // `infr_core::tensor::MOE_MMQ_DTYPES` — that's why `down_ok` already covered the
                 // wider set) and role-agnostic (gate/up/down all call the SAME function, just with
@@ -4510,7 +4545,6 @@ fn lower_op(
                 // Packed scratch, POOLED — one set serves every MoE layer in the graph. `gu_width`
                 // is the fused gate|up GEMM's output width (2*nff) vs split's (nff); `ue` (the
                 // split path's separate up-projection buffer) is unused/unallocated when fused.
-                let gu_width = if *fused_gate_up { 2 * nff } else { nff };
                 let qa = pooled(pool, be_, "moe_qa", npad * ne)?;
                 let qda = pooled(pool, be_, "moe_qda", npad * (ne / 32) * 2)?;
                 let qsa = pooled(pool, be_, "moe_qsa", npad * (ne / 32) * 2)?;
@@ -6508,10 +6542,6 @@ fn nc_gemm_choice(
     }
 }
 
-/// The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already spend `.y` on
-/// the expert id of the batched-MoE twin), so their flat tile grid cannot take `dispatch_wide`'s
-/// 2-D split. A grid past the guaranteed x limit would be rejected or truncated by a driver that
-/// enforces it (ANV), so refuse it by name.
 fn check_nc_gemm_grid(dt: infr_core::DType, m: usize, out_f: usize) -> Result<()> {
     let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
     if !nc_gemm_grid_fits(m, out_f, crate::recorder::Recorder::split_point_x()) {
@@ -6557,8 +6587,8 @@ struct QuantWeight<'a> {
 ///    (the non-coopmat tier where `_cm8` would run);
 ///  • the narrow Q4_K dp4a GEMM reads the slot through the arena-addressed build of the same
 ///    shader (`matmul_mmq_at`);
-///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap, a non-coopmat grid past
-///    the device's x limit) keeps the per-row GEMV, where the resident Linear fails loudly.
+///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap) keeps the per-row GEMV,
+///    where the resident Linear fails loudly.
 ///
 /// The quantised-activation memo (`mmv_memo`, see `lower_op`) holds `quant_q8(x)` only, keyed by
 /// the activation tensor and shape, so it is independent of the weight and of where it lives.
@@ -6649,7 +6679,7 @@ fn quant_linear(
         }
     }
     // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
-    // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
+    // addressing cap leaves this tier for the chunked per-row GEMV (see `bda_weight_breaches` below).
     if (in_band(MROW_BAND) || mrow16)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_mrow_kernel_name(dt).is_some()
@@ -6785,19 +6815,10 @@ fn quant_linear(
     // 64-row weight tile that can't be split into single input rows, so a breach on this
     // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
     // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-    // The nc GEMMs' grid is also capped (`check_nc_gemm_grid`).
     let vk = &be_.cfg().kernels.vulkan;
     let tiled = is_gemm || nc.is_some();
     if tiled
-        && !tiled_gemm_fits(
-            dt,
-            m,
-            in_f,
-            out_f,
-            nc.is_some(),
-            vk,
-            Recorder::split_point_x(),
-        )
+        && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
         && (w.buffer.is_none() || m <= MROW_BANDS[MROW16_BAND].max_m)
     {
         // The chunked per-row GEMV instead of failing: it chunks a breaching weight and has no
@@ -6807,9 +6828,6 @@ fn quant_linear(
         // that band stays loud.
         rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
         return Ok(());
-    }
-    if nc.is_some() {
-        check_nc_gemm_grid(dt, m, out_f)?;
     }
     if tiled && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk) {
         return Err(be(format!(
@@ -7241,24 +7259,6 @@ fn quant_linear(
         )));
     }
     Ok(())
-}
-
-/// Can a prefill Linear at `(dt, m, in_f, out_f)` that `quant_linear` routed to a tiled GEMM take
-/// it? The tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab
-/// lm_head at m > 1: all-position logits, speculative verify), and the non-coopmat ones (`nc`)
-/// index their grid in one dimension capped at `max_groups_x`. Where it cannot, `quant_linear`
-/// takes the chunked per-row GEMV or fails loudly.
-fn tiled_gemm_fits(
-    dt: infr_core::DType,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-    nc: bool,
-    vk: &infr_core::config::VulkanCfg,
-    max_groups_x: u32,
-) -> bool {
-    (!nc || nc_gemm_grid_fits(m, out_f, max_groups_x))
-        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
 }
 
 /// Record one tiled dp4a-mmq or fma-warptile prefill GEMM reading the weight at the 64-bit address
@@ -7950,7 +7950,10 @@ fn execute_paged_moe<'a>(
     // fits); buckets with count 0 never read the window. Gated on the exact dtype set that has
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
-    // support; anything else stays on the id-GEMV arm below, which is shape-general.
+    // support, at widths the GEMMs' column tile divides
+    // (`infr_core::tensor::moe_expert_gemm_widths_ok`); anything else stays on the id-GEMV arm
+    // below, which is shape-general (the seam caps such a model's prefill chunk, as for the
+    // resident arm).
     {
         let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
         let act_ok = if *fused_gate_up {
@@ -7966,6 +7969,7 @@ fn execute_paged_moe<'a>(
             && paged_mmq_ok(gdt)
             && paged_mmq_ok(udt)
             && paged_mmq_ok(ddt)
+            && infr_core::tensor::moe_expert_gemm_widths_ok(gu_width, ne)
         {
             let n_pairs = n_slots;
             // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row
@@ -8528,7 +8532,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn replay_follows_rebound_buffers() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd) = (2usize, 1usize, 128usize);
@@ -8661,7 +8665,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn mla_oversized_dims_are_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         // One token, one head, a 2-wide nope/value part so only the latent dims vary.
@@ -9167,7 +9171,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_strided_gate_errors() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, nff) = (1usize, 4usize);
@@ -9210,7 +9214,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn cross_dtype_copy_src_off_errors() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let mut g = Graph::new();
@@ -9497,7 +9501,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn rmsnorm_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim, eps) = (2usize, 8usize, 1e-6f32);
@@ -9546,6 +9550,49 @@ mod tests {
         }
     }
 
+    /// `Op::AttnTemp` against an f64 reference of `llm_graph_input_attn_temp`'s factor, out of
+    /// place and in place, on every shared case. The device logarithm is the GLSL `log`, a few f32
+    /// ulps from the reference's f64 one, hence the looser bound than the CPU's.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn attn_temp_matches_the_reference_factor() {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return; // no GPU — self-skip
+        };
+        for case in infr_testkit::attn_temp_cases() {
+            infr_testkit::check_attn_temp(&be_, case, f64::ln, 4e-6);
+        }
+    }
+
+    /// A graph holding an `Op::AttnTemp` never replays: the op's factor is computed from the
+    /// position baked into it at record time.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn attn_temp_refuses_decode_replay() {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return; // no GPU — self-skip
+        };
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![4], DType::F32));
+        g.push(Op::AttnTemp {
+            x,
+            dst: x,
+            rows: 1,
+            n: 4,
+            pos: 9,
+            floor_scale: 8,
+            scale: 0.1,
+            offset: 0,
+        });
+        assert!(matches!(
+            decode_refusal(&be_, &g),
+            Some(DecodeRefusal::NoDynKernel {
+                op: 0,
+                kind: "AttnTemp"
+            })
+        ));
+    }
+
     /// A one-op `GatedRmsNorm` graph (fused per-head RMSNorm + SiLU gate, qwen35 DeltaNet z-gate)
     /// through the seam must match `rmsnorm(x,w) * silu(z)` computed in two host passes — i.e.
     /// the SAME thing the split `QkNorm`→`GatedAct` pair produces. Multi-head (n_head=2) shape so
@@ -9553,7 +9600,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_rmsnorm_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, n_head, head_dim, eps) = (2usize, 2usize, 8usize, 1e-6f32);
@@ -9631,7 +9678,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn linear_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (in_f, out_f) = (16usize, 4usize);
@@ -9681,7 +9728,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn linear_gemm_k_odd_32_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         if !crate::test_has_f16_coopmat(&be_, "linear_gemm_k_odd_32_matches_host") {
@@ -9758,7 +9805,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let nff = 8usize;
@@ -9808,7 +9855,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_rope_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, hd, pos) = (2usize, 8usize, 3usize);
@@ -9891,7 +9938,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_f16_inplace_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, hd, eps) = (2usize, 8usize, 1e-6f32);
@@ -9964,7 +10011,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn copy_f32_to_f16_cast_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let n = 37usize; // not a multiple of the dispatch's local size — exercises the tail
@@ -10015,7 +10062,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn attention_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd, pos) = (2usize, 1usize, 8usize, 2usize);
@@ -10117,7 +10164,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn softmax_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim, scale) = (3usize, 300usize, 1.3f32);
@@ -10178,7 +10225,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn softmax_dyn_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim) = (3usize, 300usize);
@@ -10254,7 +10301,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn diffusion_gemma_sc_subgraph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (cc, vocab, ne, nff) = (4usize, 512usize, 128usize, 256usize);
@@ -10490,7 +10537,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_small_m_split_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd) = (4usize, 2usize, 64usize);
@@ -10630,8 +10677,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_canvas_long_span_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
@@ -10746,7 +10792,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn attention_q8_kv_prefill_off_tile_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         if !crate::test_has_f16_coopmat(&be_, "attention_q8_kv_prefill_off_tile_matches_host") {
@@ -11022,7 +11068,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         // ne/nff = 32 is the native-block K floor, not an arbitrary small number: the expert
@@ -11173,7 +11219,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn discarded_segment_forgets_staged_expert() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (slot_bytes, n_expert, buf_id) = (256usize, 2usize, 1usize);
@@ -11240,7 +11286,10 @@ mod tests {
     #[test]
     #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
     fn ep_matches_single_device_synthetic() {
-        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
+        let Some(devs) = infr_testkit::gpu_devices_or_skip_noted(
+            VulkanBackend::enumerate_devices_from_env(),
+            |d| d.is_default_pick,
+        ) else {
             return; // no Vulkan — self-skip
         };
         if devs.len() < 2 {
@@ -11572,8 +11621,7 @@ mod tests {
                 y
             })
         };
-        let Ok(single) = VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(single) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         let ep = crate::ep::ExpertParallelBackend::new(
@@ -11624,7 +11672,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_fused_scaled_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
@@ -11754,7 +11802,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_llama4_small_m_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 1usize, 32usize);
@@ -11878,7 +11926,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_llama4_batched_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 1usize, 256usize);
@@ -12588,7 +12636,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_fused_scaled_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -12741,7 +12789,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q5k_down_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -12887,7 +12935,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q5k_gate_up_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -13026,7 +13074,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_fused_q5_1_down_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -13167,7 +13215,7 @@ mod tests {
         dequant_down: fn(&[u8]) -> Vec<f32>,
         label: &str,
     ) {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -13342,7 +13390,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q2_k_q3_k_scout_shape_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -13777,7 +13825,9 @@ mod tests {
     fn f16_linear_add_stays_unfused_without_shader_float16() {
         let mut cfg = crate::test_config();
         cfg.kernels.vulkan.f16 = false;
-        let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+        let Some(be_) =
+            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+        else {
             return; // no GPU — self-skip
         };
         assert!(!be_.caps().f16, "`f16 = false` must clear caps.f16");
@@ -13860,7 +13910,9 @@ mod tests {
         for (name, knob, dt) in cases {
             let mut cfg = crate::test_config();
             knob(&mut cfg.kernels.vulkan);
-            let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+            let Some(be_) =
+                infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+            else {
                 return; // no GPU — self-skip
             };
             if !be_.caps().i8_dot {
@@ -13947,7 +13999,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_rope_unservable_shapes_are_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let run = |hd: usize, strided: bool, ff: bool| {
@@ -13990,7 +14042,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn record_once_rope_into_a_ring_cache_is_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
@@ -14109,7 +14161,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn op_limits_are_refused_by_name() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let f32d = |d: Vec<usize>| TensorDesc::new(d, DType::F32);
@@ -14257,23 +14309,15 @@ mod tests {
         refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
     }
 
-    /// `tiled_gemm_fits` refuses exactly the two shapes the tiled GEMMs cannot run — a
-    /// non-coopmat grid past the x limit, a weight past the u32 addressing cap — and accepts the
-    /// rest; the grid cap applies only to the non-coopmat GEMMs.
+    /// The one shape `quant_linear` keeps off the tiled GEMMs: a weight at the u32 addressing cap
+    /// (`bda_weight_breaches`, lowered here through `bda_chunk_elems`). A grid past the x limit is
+    /// not one of them any more: those GEMMs record through `dispatch_wide`.
     #[test]
-    fn tiled_gemm_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
-        let (dt, m, in_f, out_f) = (DType::Q8_0, 40, 256, 128);
+    fn tiled_gemms_refuse_only_a_breaching_weight() {
+        let (dt, in_f, out_f) = (DType::Q8_0, 256, 128);
         let mut vk = infr_core::config::Config::default().kernels.vulkan;
-        let x_limit = crate::recorder::Recorder::split_point_x();
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
-
-        let groups = crate::recorder::nc_gemm_groups(m, out_f) as u32;
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups));
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups - 1));
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, groups - 1));
-
+        assert!(!crate::recorder::bda_weight_breaches(dt, in_f, out_f, &vk));
         vk.bda_chunk_elems = Some((in_f * out_f) as u64);
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, x_limit));
+        assert!(crate::recorder::bda_weight_breaches(dt, in_f, out_f, &vk));
     }
 }

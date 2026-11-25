@@ -252,11 +252,17 @@ fn open_backend(
     dev: Option<usize>,
     cfg: std::sync::Arc<crate::EngineConfig>,
 ) -> Result<infr_vulkan::VulkanBackend> {
-    match dev {
+    let vk = match dev {
         Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, cfg)
-            .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}")),
-        None => infr_vulkan::VulkanBackend::new_with(cfg).map_err(|e| anyhow!("vulkan init: {e}")),
-    }
+            .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+        None => {
+            infr_vulkan::VulkanBackend::new_with(cfg).map_err(|e| anyhow!("vulkan init: {e}"))?
+        }
+    };
+    // The un-pinned prefill chunk default needs one process-wide device class
+    // (`seam::default_ubatch_rows`); a multi-device run sizes every wrapper from its own caps.
+    crate::seam::record_device_class(&infr_core::backend::Backend::capabilities(&vk));
+    Ok(vk)
 }
 
 /// A persistent seam session: the backend it owns, the conversation `SlotPool`, and the context

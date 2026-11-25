@@ -25,7 +25,7 @@
 //! What is deliberately NOT here (device facts that only look shared):
 //!
 //! - The placement itself. Whether VRAM has room is a device question (Vulkan's live
-//!   `VK_EXT_memory_budget` heap probe minus a guard headroom, in `vram_budget_fits`). Only the
+//!   `VK_EXT_memory_budget` heap probe minus a guard headroom, in `kv_stays_in_vram`). Only the
 //!   cumulative *cap* gate ([`SpillTally::admits`]), which is pure arithmetic over the tally, is
 //!   shared.
 //! - The human-readable byte formatter. Vulkan prints MiB to one decimal; unifying the spellings

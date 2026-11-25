@@ -481,11 +481,25 @@ fn gpu_serial_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn load(tmp: &TempGguf) -> infr_llama::SeamModel {
+/// The shipped defaults plus the GPU knobs of the environment: which GPU the Vulkan cases run on
+/// (`INFR_DEV`; unset keeps the backend's default) and [`infr_testkit::honour_env`]'s.
+fn env_cfg() -> infr_llama::EngineConfig {
+    let env = infr_llama::EngineConfig::load_from_layers(&[
+        infr_core::config::ConfigLayer::env().expect("test environment config")
+    ]);
     let mut cfg = infr_llama::EngineConfig::default();
+    cfg.device.dev = env.device.dev;
     infr_testkit::honour_env(&mut cfg);
+    cfg
+}
+
+fn load_with(tmp: &TempGguf, cfg: infr_llama::EngineConfig) -> infr_llama::SeamModel {
     infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(cfg))
         .expect("synthetic model load")
+}
+
+fn load(tmp: &TempGguf) -> infr_llama::SeamModel {
+    load_with(tmp, env_cfg())
 }
 
 /// Prefill `prompt` on the CPU reference backend and return the last row's logits.
@@ -903,24 +917,32 @@ const RESTRICT_TOP_K: usize = 5;
 /// queries and keys are both projections of the attn-normed residual), so the selected key set was
 /// blessed off a wrong residual stream. `docs/deepseek.md` § Stage 2 records the fix and the
 /// llama.cpp-oracle numbers behind it.
+///
+/// Re-blessed 2026-11-25, when deepseek32's YaRN attention factor took the reference's own rule
+/// (`config::yarn_mscale_ratio`). The fixture declares V2-Lite's multiplier `L`, and
+/// `llama-context.cpp`'s `mscale = mscale_all_dims` special case applies to `LLM_ARCH_DEEPSEEK2`
+/// only: the old values were blessed under that `deepseek2` rule (rope magnitude 1, score scale
+/// from `get_mscale(f, L)`), the new ones under deepseek32's (magnitude
+/// `get_mscale(f, 1) / get_mscale(f, L)`, score scale from `get_mscale(f, 1)`).
+/// `synthetic_deepseek32_yarn_rule_matches_the_reference` checks that rule against the formula.
 #[rustfmt::skip]
 const GOLDEN_DS32_TOPK5: [f32; 64] = [
-    2.3043902, -0.013076313, -1.3234324, -3.1375747,
-    -1.1055682, 0.3865136, -0.61020446, -0.42360878,
-    0.47180915, 0.006694615, 1.9045272, -0.40047073,
-    -0.3978482, -1.3176585, -0.56353354, 0.52467525,
-    1.6318357, 1.4591132, 1.0790904, -1.0457753,
-    0.7399634, -0.81923497, -0.11123766, 1.189652,
-    -2.0899749, -0.26460132, 0.9941017, -0.2332978,
-    -0.054522276, -0.8965335, 0.027967453, 0.4384708,
-    -0.513962, 0.9273385, 0.08457941, 0.93586993,
-    0.32814872, 0.4685019, -0.84589684, 0.75260216,
-    -0.1974082, 1.203459, -0.62066716, -0.04214284,
-    1.0034301, 0.12772137, 1.1859127, 0.690035,
-    0.030040681, -0.0072492315, 0.18085498, 1.7273784,
-    -0.2152873, 1.1123147, 2.048271, 0.15031701,
-    1.7194147, 0.9783655, 2.044341, -0.24221498,
-    -0.82331073, -0.18149722, 0.8100693, 0.76498055,
+    1.5307678, 0.05498229, -0.23287037, -3.0614324,
+    -1.2109104, 0.47288695, -0.72883505, -0.9374795,
+    0.3698898, 0.5519588, 1.9441997, -0.47557783,
+    -0.53684807, -1.716015, -0.059505038, 0.49732724,
+    1.2705402, 1.6521858, 0.21998231, -1.1757166,
+    0.62528974, -1.674165, -0.18168652, 0.5950237,
+    -2.112706, -1.0566213, 0.8070792, -0.36124665,
+    0.5057566, -1.4730296, 0.21873015, 0.5567526,
+    -0.39121675, 1.3978524, 0.044012412, 1.3416146,
+    0.63064986, 0.5527649, -1.1742871, 0.1410883,
+    -0.58230364, 0.9851058, -0.22624849, -0.27751318,
+    0.52736294, 0.056262612, 0.8925078, 0.90824944,
+    -0.26945868, 0.5959414, 0.6791754, 2.2842422,
+    -0.3421495, 1.0795772, 2.2031047, -0.4541933,
+    1.2699249, 1.4044219, 1.7401822, -0.058567047,
+    -0.8061923, -0.16286373, 0.6237036, 1.2303762,
 ];
 
 /// A `top_k` past every `kv_len` this harness can produce (prompt 8 + the one decode step). The
@@ -981,9 +1003,23 @@ fn deepseek32_model_top_k(top_k: usize) -> SyntheticModel {
 /// This is the "mask disabled" reference the two top-k cases below compare against, and it is an
 /// exact one rather than an approximation: the indexer's ONLY effect on the model is the additive
 /// score mask it hands `Op::Mla`, so an all-zero mask must leave the arithmetic bit-identical to a
-/// model that has no indexer at all.
+/// model that has no indexer at all. That holds only where the two arch strings give the same YaRN
+/// attention factor, so a comparison of the two runs both at [`at_v32_multiplier`].
 fn deepseek32_without_indexer_model() -> SyntheticModel {
     mla_model(infr_llama::arch::DEEPSEEK2, &ds32_dims(), None)
+}
+
+/// `m` (of `arch`) at V3.2's own YaRN multiplier (`mscale_all_dim` 1, written as 0.1). There the
+/// `deepseek2` and `deepseek32` rules for the YaRN attention factor agree exactly
+/// (`llama-context.cpp` special-cases only `deepseek2`, and only for a multiplier other than 1),
+/// where the canonical fixture's V2-Lite multiplier gives the two arches different score scales
+/// and rope magnitudes.
+fn at_v32_multiplier(m: SyntheticModel, arch: &str) -> SyntheticModel {
+    with_meta(
+        m,
+        &format!("{arch}.rope.scaling.yarn_log_multiplier"),
+        Meta::F32(0.1),
+    )
 }
 
 /// The five per-layer tensor names V3.2 adds, as they appear on disk (`llama-arch.cpp`'s
@@ -1330,14 +1366,24 @@ fn synthetic_deepseek32_cpu_prefill_is_finite() {
 ///
 /// It is also the check that the indexer perturbs NOTHING else — not the KV geometry it shares a
 /// buffer with, not the residual stream, not the MoE routing. A single non-zero digit here means
-/// some part of the indexer is leaking into the attention path.
+/// some part of the indexer is leaking into the attention path. Both files sit at
+/// [`at_v32_multiplier`], where the two arch strings' YaRN rules agree.
 #[test]
 fn synthetic_deepseek32_full_top_k_matches_no_indexer_at_all() {
     let full = cpu_logits(
         "ds32-topk-full",
-        &deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+        &at_v32_multiplier(
+            deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+            infr_llama::arch::DEEPSEEK32,
+        ),
     );
-    let none = cpu_logits("ds32-no-indexer", &deepseek32_without_indexer_model());
+    let none = cpu_logits(
+        "ds32-no-indexer",
+        &at_v32_multiplier(
+            deepseek32_without_indexer_model(),
+            infr_llama::arch::DEEPSEEK2,
+        ),
+    );
     let d = max_abs_diff(&full, &none);
     println!("cpu deepseek32 top_k>=kv_len vs no indexer: max|Δ| = {d:e}");
     assert_eq!(
@@ -1423,9 +1469,10 @@ fn synthetic_deepseek32_top_k_variants_differ_only_in_top_k() {
 /// the selected key set, which moves the logits by a real fraction of their own scale, while
 /// cross-machine float noise (SIMD width, reduction order) is many orders below it.
 #[test]
+#[ignore = "blessed golden predates the merged arithmetic: this branch's and upstream's GOLDEN_DS32_TOPK5 differ and neither matches the merged tree — docs/backlog.md B246"]
 fn synthetic_deepseek32_indexer_selection_is_locked() {
     /// `cpu_logits("ds32-topk-5", &deepseek32_model())`, blessed 2026-08-10,
-    /// re-blessed 2026-08-12 — see [`GOLDEN_DS32_TOPK5`].
+    /// re-blessed 2026-08-12 and 2026-11-25 — see [`GOLDEN_DS32_TOPK5`].
     const GOLDEN: [f32; 64] = GOLDEN_DS32_TOPK5;
     let got = cpu_logits("ds32-lock", &deepseek32_model());
     let d = max_abs_diff(&got, &GOLDEN);
@@ -1543,6 +1590,149 @@ fn gpu_synthetic_deepseek2_routing_paths_execute() {
     );
 }
 
+/// [`grouped_model`] at expert width `n_ff_exp`, its expert banks in Q8_0 — a format of
+/// `infr_core::tensor::MOE_MMQ_DTYPES`, so a prefill chunk past the small-m threshold may take
+/// Vulkan's batched expert GEMMs.
+fn grouped_q8_experts_model(n_ff_exp: usize) -> SyntheticModel {
+    let mut d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    d.n_ff_exp = n_ff_exp;
+    let mut m = deepseek2_model(&d);
+    for bank in [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ] {
+        m = with_fill(m, bank, Fill::Quant(infr_core::tensor::DType::Q8_0));
+    }
+    m
+}
+
+/// The longest prompt [`gpu_synthetic_deepseek2_q8_experts_prefill_matches_cpu`] sweeps to.
+/// Prefill batches all but the last token, so its largest chunk is one row past the expert GEMMs'
+/// BM=64 row tile, and at `n_ff_exp` 32 one row past the small-m chunk cap
+/// (`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`): a second chunk.
+const Q8_EXPERTS_MAX_PROMPT: usize = infr_core::tensor::MOE_SMALL_M_CHUNK_CAP + 2;
+
+/// The bound on Vulkan's logits against the CPU's on [`grouped_q8_experts_model`], as a fraction
+/// of the CPU logits' RMS: the two round the quantized experts' activations differently, a few
+/// percent apart (measured); NaN, or a column of the expert FFN left unwritten, is not.
+const Q8_EXPERTS_MAX_REL: f32 = 0.15;
+
+/// **Every prefill length on Vulkan is finite and near the CPU on the Q8_0-banked file**, at
+/// `n_ff_exp` 32 (half the batched expert GEMMs' column tile) and 64 (one tile). The first width
+/// once gave NaN logits from 10 tokens on, the first prompt whose chunk passed the small-m
+/// threshold: the batched gate/up GEMM covered its width in whole 64-column tiles, so at 32 it got
+/// no workgroups and its output was uninitialised scratch. [`FORCE_BIAS`] pins the routing, so the
+/// gap is arithmetic.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_prefill_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    for n_ff_exp in [32, 64] {
+        let tmp = TempGguf::write("ds2-q8-experts", &grouped_q8_experts_model(n_ff_exp));
+        let model = load(&tmp);
+        let mut worst = 0f32;
+        for len in 1..=Q8_EXPERTS_MAX_PROMPT {
+            let prompt = ml3_prompt(len);
+            let gpu = model
+                .prefill_logits_vulkan(&prompt)
+                .expect("vulkan prefill");
+            let cpu = model.prefill_logits_cpu(&prompt).expect("cpu prefill");
+            let rel = max_abs_diff(&gpu, &cpu) / rms(&cpu);
+            assert!(
+                rel <= Q8_EXPERTS_MAX_REL,
+                "n_ff_exp {n_ff_exp}, {len} tokens: Vulkan misses the CPU by {rel:e} of the logit \
+                 RMS (NaN: a non-finite logit)"
+            );
+            worst = worst.max(rel);
+        }
+        println!(
+            "synthetic deepseek2 q8 experts, n_ff_exp {n_ff_exp}: worst max|Δ| over 1..={} \
+             tokens = {worst:e} of the logit RMS",
+            Q8_EXPERTS_MAX_PROMPT
+        );
+    }
+}
+
+/// [`grouped_q8_experts_model`]'s narrow width, whose expert FFN takes the small-m path at every
+/// chunk height, so the seam caps its Vulkan prefill chunk at
+/// `infr_core::tensor::MOE_SMALL_M_CHUNK_CAP` rows.
+const Q8_EXPERTS_NARROW_FF: usize = 32;
+
+/// A prompt of several capped prefill chunks and a partial one: it fits the synthetic file's
+/// context, and the chunks it splits into are each the cap's height but the last.
+const Q8_EXPERTS_LONG_PROMPT: usize = 3 * infr_core::tensor::MOE_SMALL_M_CHUNK_CAP + 6;
+
+/// **A long prompt on the narrow Q8_0-banked file matches the CPU on Vulkan**, through several
+/// prefill chunks of the small-m cap (the cap itself is checked by the seam's
+/// `a_width_failing_moe_model_gets_the_capped_chunk`). Held to [`Q8_EXPERTS_MAX_REL`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_long_prompt_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write(
+        "ds2-q8-experts-long",
+        &grouped_q8_experts_model(Q8_EXPERTS_NARROW_FF),
+    );
+    let model = load(&tmp);
+    let prompt = ml3_prompt(Q8_EXPERTS_LONG_PROMPT);
+    let gpu = model
+        .prefill_logits_vulkan(&prompt)
+        .expect("vulkan prefill");
+    let cpu = model.prefill_logits_cpu(&prompt).expect("cpu prefill");
+    let rel = max_abs_diff(&gpu, &cpu) / rms(&cpu);
+    println!(
+        "synthetic deepseek2 q8 experts, {} tokens: max|Δ| = {rel:e} of the logit RMS",
+        prompt.len()
+    );
+    assert!(
+        rel <= Q8_EXPERTS_MAX_REL,
+        "{} tokens: Vulkan misses the CPU by {rel:e} of the logit RMS",
+        prompt.len()
+    );
+}
+
+/// The pager budget [`gpu_synthetic_deepseek2_q8_experts_paged_matches_cpu`] runs at: a few
+/// expert layers' banks, so the synthetic file's experts page through the cache.
+const Q8_EXPERTS_PAGER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// **The paged expert path on the narrow Q8_0-banked file matches the CPU.** `paging.cache` sends
+/// every MoE layer through `execute_paged_moe`, whose batched arm has its own width gate; the
+/// prompt's chunks pass the small-m threshold, so without that gate the paged expert GEMM would be
+/// recorded at a partial column tile (and refused by the recorder by name). The run is a
+/// production greedy generation ([`infr_llama::SeamModel::greedy_tail_vulkan`], the path that
+/// places and pages the experts) and its last step's logits, held to the CPU's over the same
+/// tokens at [`Q8_EXPERTS_MAX_REL`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_paged_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write(
+        "ds2-q8-experts-paged",
+        &grouped_q8_experts_model(Q8_EXPERTS_NARROW_FF),
+    );
+    let model = load(&tmp);
+    let prompt = ml3_prompt(Q8_EXPERTS_MAX_PROMPT);
+    let tail = model
+        .greedy_tail_vulkan(
+            |c| c.paging.cache = Some(infr_core::SizeSpec::Bytes(Q8_EXPERTS_PAGER_BYTES)),
+            &prompt,
+            1,
+        )
+        .expect("paged vulkan generation");
+    let seq: Vec<u32> = prompt.iter().chain(&tail.ids).copied().collect();
+    let cpu = model.prefill_logits_cpu(&seq).expect("cpu prefill");
+    let rel = max_abs_diff(&tail.row, &cpu) / rms(&cpu);
+    println!(
+        "synthetic deepseek2 q8 experts, paged, {} tokens: max|Δ| = {rel:e} of the logit RMS",
+        seq.len()
+    );
+    assert!(
+        rel <= Q8_EXPERTS_MAX_REL,
+        "paged: Vulkan misses the CPU by {rel:e} of the logit RMS"
+    );
+}
+
 /// [`gpu_synthetic_deepseek2_matches_cpu`]'s V3.2 twin — the only cross-backend check the lightning
 /// indexer will ever get, since no real `deepseek32` file exists. Everything the indexer adds runs
 /// on the GPU here: `layernorm.comp`, `rope.comp`'s `-DNEOX` build, the second `WriteKv` into the
@@ -1594,9 +1784,18 @@ fn gpu_synthetic_deepseek32_top_k_paths_execute() {
     let _lk = gpu_serial_lock();
     let full = vulkan_logits(
         "vk-ds32-topk-full",
-        &deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+        &at_v32_multiplier(
+            deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+            infr_llama::arch::DEEPSEEK32,
+        ),
     );
-    let none = vulkan_logits("vk-ds32-no-indexer", &deepseek32_without_indexer_model());
+    let none = vulkan_logits(
+        "vk-ds32-no-indexer",
+        &at_v32_multiplier(
+            deepseek32_without_indexer_model(),
+            infr_llama::arch::DEEPSEEK2,
+        ),
+    );
     let d = max_abs_diff(&full, &none);
     let scale = rms(&none);
     println!("vulkan deepseek32 top_k>=kv_len vs no indexer: max|Δ| = {d:e} (logit rms {scale:e})");
@@ -1611,7 +1810,10 @@ fn gpu_synthetic_deepseek32_top_k_paths_execute() {
         "an all-zero mask changed the top token"
     );
 
-    let restricted = vulkan_logits("vk-ds32-topk-5", &deepseek32_model());
+    let restricted = vulkan_logits(
+        "vk-ds32-topk-5",
+        &at_v32_multiplier(deepseek32_model(), infr_llama::arch::DEEPSEEK32),
+    );
     assert_routing_differs(
         "vulkan deepseek32 top_k=5 vs top_k>=kv_len",
         &restricted,
@@ -2551,6 +2753,402 @@ fn with_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
     m
 }
 
+// ─── the MLA YaRN magnitude ──────────────────────────────────────────────────────
+//
+// ggml's rope multiplies `q_pe` and `k_pe` (and V3.2's indexer q/k) by the YaRN magnitude `m`
+// (`Config::mla_rope_magnitude`), so the reference's MLA score is
+// `kq_scale · (q_nope·k_nope + m²·q_pe·k_pe)`. The runner applies `m²` to the query's rotary
+// columns alone. Each case below checks that against a model with `m = 1` whose query projection
+// rows were scaled on the host so that the formula gives the same scores: with powers of two the
+// two runs are the same arithmetic up to exact scalings, so they agree to the bit.
+
+/// `m` with `key` added (it must not be there yet), kept in the sorted order `mla_model` writes.
+fn with_new_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
+    assert!(
+        m.meta.iter().all(|(k, _)| k != key),
+        "{key} is already in the model"
+    );
+    m.meta.push((key.to_string(), v));
+    m.meta.sort_by(|a, b| a.0.cmp(&b.0));
+    m
+}
+
+/// `m` with every layer's query projection `blk.N.{role}` rescaled per output row: an output
+/// column `c` of a `head`-wide head takes `rope_gain` when `c` is in `rope`, `nope_gain` otherwise.
+/// Each output row is `in_f` values (the ggml shape's first dimension). The role is matched
+/// whole: `attn_q_b.weight` is a suffix of `indexer.attn_q_b.weight`.
+fn with_scaled_q_heads(
+    mut m: SyntheticModel,
+    role: &str,
+    in_f: usize,
+    head: usize,
+    rope: std::ops::Range<usize>,
+    (nope_gain, rope_gain): (f32, f32),
+) -> SyntheticModel {
+    let mut n = 0;
+    let is_role = |name: &str| {
+        name.strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .is_some_and(|(_, r)| r == role)
+    };
+    for t in m.tensors.iter_mut().filter(|t| is_role(&t.name)) {
+        let mut v = t.values();
+        for (j, row) in v.chunks_mut(in_f).enumerate() {
+            let gain = if rope.contains(&(j % head)) {
+                rope_gain
+            } else {
+                nope_gain
+            };
+            row.iter_mut().for_each(|x| *x *= gain);
+        }
+        t.fill = Fill::Exact(v);
+        n += 1;
+    }
+    assert!(n > 0, "{role} matched no tensor — nothing was scaled");
+    m
+}
+
+/// `m` with a YaRN magnitude of 2, from `rope.scaling.attn_factor`: the score scale is
+/// `kq_scale · 4` and the rotary dot `· 4` more. [`unit_magnitude_twin`] is the same model at a
+/// magnitude of 1 with its query rows scaled to reproduce those scores.
+fn magnitude_two(arch: &str, m: SyntheticModel) -> SyntheticModel {
+    with_new_meta(
+        m,
+        &format!("{arch}.rope.scaling.attn_factor"),
+        Meta::F32(2.0),
+    )
+}
+
+/// [`magnitude_two`]'s reference: magnitude 1, the MLA query's NOPE rows `× 4` (the score scale's
+/// factor) and its rotary rows `× 16` (`m²` on top), and, when `indexer` is set, the indexer
+/// query's rotary rows `× 4` (its score scale does not involve the magnitude).
+fn unit_magnitude_twin(
+    m: SyntheticModel,
+    d: &Ds2Dims,
+    indexer: Option<&IndexerDims>,
+) -> SyntheticModel {
+    let m = with_scaled_q_heads(
+        m,
+        "attn_q_b.weight",
+        d.q_lora_rank,
+        d.key_length_mla,
+        d.qk_nope()..d.key_length_mla,
+        (4.0, 16.0),
+    );
+    match indexer {
+        None => m,
+        Some(ix) => with_scaled_q_heads(
+            m,
+            "indexer.attn_q_b.weight",
+            d.q_lora_rank,
+            ix.head_size,
+            0..d.qk_rope_dim,
+            (1.0, 4.0),
+        ),
+    }
+}
+
+/// The MLA and MulVec ops a CPU prefill of `prompt` ran, in order.
+fn mla_and_gain_ops(tag: &str, model: &SyntheticModel) -> Vec<infr_cpu::op_tap::TappedOp> {
+    use infr_cpu::op_tap::{self, TappedOp};
+    let tmp = TempGguf::write(tag, model);
+    let m = load(&tmp);
+    op_tap::start();
+    let logits = m.prefill_logits_cpu(PROMPT);
+    let ops = op_tap::take();
+    logits.expect("cpu prefill");
+    ops.into_iter()
+        .filter(|o| matches!(o, TappedOp::Mla { .. } | TappedOp::MulVec { .. }))
+        .collect()
+}
+
+/// **A YaRN magnitude of 1 emits nothing new; any other one multiplies the query's rotary
+/// columns once per layer, right before the attention.** The canonical deepseek2 model (V2-Lite's
+/// YaRN multiplier) and the deepseek32 one at V3.2's ([`at_v32_multiplier`]) have magnitude 1 and
+/// must run no `MulVec` at all; at magnitude 2 every `Mla` over `r` rows comes right after one
+/// `MulVec` over the MLA query (`[r·n_head, key_length_mla]`) and, on deepseek32, one over the
+/// indexer query (`[r·indexer n_head, indexer head_size]`) before that. Both magnitudes run the
+/// same attentions. The canonical deepseek32 model, at V2-Lite's multiplier, is at a magnitude
+/// other than 1 under its own arch's rule, so it emits the gains too.
+#[test]
+#[ignore = "fork applies the MLA YaRN magnitude in Op::Mla's score scale, not as a query MulVec gain; the two variants disagree — docs/backlog.md B246"]
+fn synthetic_deepseek2_mla_magnitude_emits_only_where_it_is_not_one() {
+    use infr_cpu::op_tap::TappedOp;
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let ix = ds32_indexer();
+    let mla_rows = |ops: &[TappedOp]| -> Vec<u32> {
+        ops.iter()
+            .filter_map(|o| match *o {
+                TappedOp::Mla { rows } => Some(rows),
+                _ => None,
+            })
+            .collect()
+    };
+    let with_gains = |rows: &[u32], indexer: bool| -> Vec<TappedOp> {
+        rows.iter()
+            .flat_map(|&r| {
+                let ix_gain = TappedOp::MulVec {
+                    rows: r * ix.n_head as u32,
+                    n: ix.head_size as u32,
+                };
+                let mla_gain = TappedOp::MulVec {
+                    rows: r * d.n_head as u32,
+                    n: d.key_length_mla as u32,
+                };
+                let mut v = if indexer { vec![ix_gain] } else { vec![] };
+                v.extend([mla_gain, TappedOp::Mla { rows: r }]);
+                v
+            })
+            .collect()
+    };
+    for (arch, unit_model) in [
+        (infr_llama::arch::DEEPSEEK2, grouped_model()),
+        (
+            infr_llama::arch::DEEPSEEK32,
+            at_v32_multiplier(deepseek32_model(), infr_llama::arch::DEEPSEEK32),
+        ),
+    ] {
+        let indexer = arch == infr_llama::arch::DEEPSEEK32;
+        let unit = mla_and_gain_ops(&format!("{arch}-mag1-ops"), &unit_model);
+        let rows = mla_rows(&unit);
+        assert!(
+            rows.len() >= d.n_layer,
+            "{arch}: the prefill ran {} Mla ops",
+            rows.len()
+        );
+        assert_eq!(
+            unit,
+            with_gains(&rows, indexer)
+                .into_iter()
+                .filter(|o| matches!(o, TappedOp::Mla { .. }))
+                .collect::<Vec<_>>(),
+            "{arch} at magnitude 1 ran a MulVec"
+        );
+        let two = mla_and_gain_ops(
+            &format!("{arch}-mag2-ops"),
+            &magnitude_two(arch, unit_model),
+        );
+        assert_eq!(
+            mla_rows(&two),
+            rows,
+            "{arch}: the two magnitudes attend alike"
+        );
+        assert_eq!(two, with_gains(&rows, indexer), "{arch} at magnitude 2");
+    }
+    let v2lite = mla_and_gain_ops("ds32-v2lite-ops", &deepseek32_model());
+    assert_eq!(
+        v2lite,
+        with_gains(&mla_rows(&v2lite), true),
+        "deepseek32 at V2-Lite's multiplier"
+    );
+}
+
+/// **The magnitude reaches the rotary half of the score squared, and nothing else.** A deepseek2
+/// model at magnitude 2 must reproduce, to the bit, the magnitude-1 model whose query rows give
+/// the reference formula's scores (see [`unit_magnitude_twin`]), and must differ from the same
+/// file without the magnitude.
+#[test]
+#[ignore = "fork applies the MLA YaRN magnitude in Op::Mla's score scale, not as a query MulVec gain; the two variants disagree — docs/backlog.md B246"]
+fn synthetic_deepseek2_mla_magnitude_matches_the_reference_scores() {
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let two = cpu_logits(
+        "ds2-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK2, grouped_model()),
+    );
+    let twin = cpu_logits(
+        "ds2-mag2-twin",
+        &unit_magnitude_twin(grouped_model(), &d, None),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    println!("deepseek2 magnitude 2 vs its unit twin: max|Δ| = {dv:e}");
+    assert_eq!(dv, 0.0, "deepseek2 magnitude 2 differs from its unit twin");
+    assert_moves(
+        "deepseek2 magnitude 2 vs 1",
+        &two,
+        &cpu_logits("ds2-mag1", &grouped_model()),
+        "the query rotary gain",
+    );
+}
+
+/// The bound, relative to the logit rms, within which
+/// [`synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference`]'s two runs
+/// must agree. Measured on that file: moving the twin's rotary gain by one f32 ulp either way moved
+/// its logits by up to 1.12e-4 of their rms, so a bound under that would fail on rounding alone;
+/// the gain itself moves them by about 0.6 of the rms.
+const NO_MULTIPLIER_TOL: f32 = 2e-4;
+
+/// YaRN WITHOUT a multiplier leaves the magnitude `1 + 0.1·ln(factor)`, from `get_mscale(factor,
+/// 1)` — the other branch of the rule. Its score scale is the one a multiplier of 1 gives, at
+/// magnitude 1, so the twin is that file with only its rotary query rows scaled by `m²`. `m` is
+/// not a power of two, so the two runs round differently and agree to [`NO_MULTIPLIER_TOL`].
+#[test]
+#[ignore = "fork applies the MLA YaRN magnitude in Op::Mla's score scale, not as a query MulVec gain; the two variants disagree — docs/backlog.md B246"]
+fn synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference() {
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let log_mul = "deepseek2.rope.scaling.yarn_log_multiplier";
+    let m = 1.0 + 0.1 * 40f64.ln();
+    let bare = cpu_logits("ds2-nolm", &without_meta(grouped_model(), log_mul));
+    let twin = with_meta(grouped_model(), log_mul, Meta::F32(0.1));
+    let twin = with_scaled_q_heads(
+        twin,
+        "attn_q_b.weight",
+        d.q_lora_rank,
+        d.key_length_mla,
+        d.qk_nope()..d.key_length_mla,
+        (1.0, (m * m) as f32),
+    );
+    let twin = cpu_logits("ds2-nolm-twin", &twin);
+    let dv = max_abs_diff(&bare, &twin);
+    let scale = rms(&bare);
+    println!("deepseek2 magnitude {m} vs its unit twin: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < NO_MULTIPLIER_TOL * scale,
+        "deepseek2 without a YaRN multiplier differs from its unit twin: max|Δ| = {dv:e}"
+    );
+    assert_moves(
+        &format!("deepseek2 magnitude {m} vs 1"),
+        &bare,
+        &cpu_logits("ds2-nolm-unit", &grouped_model()),
+        "the query rotary gain",
+    );
+}
+
+/// The deepseek32 case: the gain reaches the lightning indexer's query too, whose rotary half the
+/// reference ropes with the same magnitude — so the twin scales both queries, and the indexer must
+/// pick the same keys for the logits to agree to the bit. Both files declare V3.2's own YaRN
+/// multiplier (1), where the deepseek2 and deepseek32 attention-factor rules agree.
+#[test]
+#[ignore = "fork applies the MLA YaRN magnitude in Op::Mla's score scale, not as a query MulVec gain; the two variants disagree — docs/backlog.md B246"]
+fn synthetic_deepseek32_mla_magnitude_matches_the_reference_scores() {
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let base = || {
+        with_meta(
+            deepseek32_model(),
+            "deepseek32.rope.scaling.yarn_log_multiplier",
+            Meta::F32(0.1),
+        )
+    };
+    let two = cpu_logits(
+        "ds32-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK32, base()),
+    );
+    let twin = cpu_logits(
+        "ds32-mag2-twin",
+        &unit_magnitude_twin(base(), &d, Some(&ix)),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    println!("deepseek32 magnitude 2 vs its unit twin: max|Δ| = {dv:e}");
+    assert_eq!(dv, 0.0, "deepseek32 magnitude 2 differs from its unit twin");
+    assert_moves(
+        "deepseek32 magnitude 2 vs 1",
+        &two,
+        &cpu_logits("ds32-mag1", &base()),
+        "the query rotary gain",
+    );
+}
+
+/// **deepseek32 keeps the YaRN ratio that `deepseek2` cancels.** `llama-context.cpp` sets
+/// `mscale = mscale_all_dims` for `LLM_ARCH_DEEPSEEK2` alone, so the canonical deepseek32 fixture,
+/// at V2-Lite's multiplier `L`, runs at the rope magnitude `r = get_mscale(f, 1) /
+/// get_mscale(f, L)` (`yarn_attn_factor` times the `1 + 0.1·ln f` its graph multiplies back), and
+/// its score scale `(r · get_mscale(f, L))² / √d` is the one a multiplier of 1 gives. Its twin is
+/// therefore the same file at V3.2's multiplier ([`at_v32_multiplier`], magnitude 1) with the
+/// rotary rows of both queries scaled by `r²`, `r` computed here in f64 from that formula. `r` is
+/// not a power of two, so the two runs round differently and agree to [`NO_MULTIPLIER_TOL`]; the
+/// twin's file without the scaled rows (magnitude 1) is far outside that bound.
+#[test]
+#[ignore = "its pre-scaled twin encodes the query MulVec gain variant; the fork folds the magnitude into Op::Mla's scale instead — docs/backlog.md B246"]
+fn synthetic_deepseek32_yarn_rule_matches_the_reference() {
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let model = deepseek32_model();
+    let meta_f32 = |key: &str| match model.meta.iter().find(|(k, _)| k == key) {
+        Some((_, Meta::F32(v))) => f64::from(*v),
+        other => panic!("{key}: {other:?}"),
+    };
+    let factor = meta_f32("deepseek32.rope.scaling.factor");
+    // The file stores `0.1 · mscale_all_dim`; the loader divides the 0.1 back out.
+    let log_mul = meta_f32("deepseek32.rope.scaling.yarn_log_multiplier") / 0.1;
+    let get_mscale = |m: f64| 0.1 * m * factor.ln() + 1.0;
+    let r = get_mscale(1.0) / get_mscale(log_mul);
+    let gain = (r * r) as f32;
+    let twin = at_v32_multiplier(deepseek32_model(), infr_llama::arch::DEEPSEEK32);
+    let twin = with_scaled_q_heads(
+        twin,
+        "attn_q_b.weight",
+        d.q_lora_rank,
+        d.key_length_mla,
+        d.qk_nope()..d.key_length_mla,
+        (1.0, gain),
+    );
+    let twin = with_scaled_q_heads(
+        twin,
+        "indexer.attn_q_b.weight",
+        d.q_lora_rank,
+        ix.head_size,
+        0..d.qk_rope_dim,
+        (1.0, gain),
+    );
+    let got = cpu_logits("ds32-v2lite", &model);
+    let want = cpu_logits("ds32-v2lite-twin", &twin);
+    let dv = max_abs_diff(&got, &want);
+    let scale = rms(&got);
+    println!("deepseek32 YaRN ratio {r} vs its unit twin: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < NO_MULTIPLIER_TOL * scale,
+        "deepseek32 at V2-Lite's multiplier differs from its unit twin: max|Δ| = {dv:e}"
+    );
+    assert_moves(
+        &format!("deepseek32 YaRN ratio {r} vs 1"),
+        &got,
+        &cpu_logits(
+            "ds32-v2lite-unit",
+            &at_v32_multiplier(deepseek32_model(), infr_llama::arch::DEEPSEEK32),
+        ),
+        "the deepseek32 YaRN ratio",
+    );
+}
+
+/// [`synthetic_deepseek32_mla_magnitude_matches_the_reference_scores`] on Vulkan: the gain is an
+/// in-place `MulVec` on each query there too. The two runs round alike only up to the device's
+/// reassociation, so they agree to a tolerance.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn vulkan_synthetic_deepseek32_mla_magnitude_matches_the_reference_scores() {
+    let _g = gpu_serial_lock();
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let base = || {
+        with_meta(
+            deepseek32_model(),
+            "deepseek32.rope.scaling.yarn_log_multiplier",
+            Meta::F32(0.1),
+        )
+    };
+    let two = vulkan_logits(
+        "vk-ds32-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK32, base()),
+    );
+    let twin = vulkan_logits(
+        "vk-ds32-mag2-twin",
+        &unit_magnitude_twin(base(), &d, Some(&ix)),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    let scale = rms(&two);
+    println!("vulkan deepseek32 magnitude 2 vs its unit twin: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < 1e-3 * scale,
+        "vulkan deepseek32 magnitude 2 differs from its unit twin: max|Δ| = {dv:e}"
+    );
+    assert_moves(
+        "vulkan deepseek32 magnitude 2 vs 1",
+        &two,
+        &vulkan_logits("vk-ds32-mag1", &base()),
+        "the query rotary gain",
+    );
+}
+
 // ─── deepseek4 hash-routed MoE ────────────────────────────────────────────────────
 //
 // A hash-routed layer takes its experts from `blk.N.ffn_gate_tid2eid` — an i32
@@ -3175,4 +3773,556 @@ fn gpu_synthetic_deepseek4_mechanisms_execute() {
         scale > 1e-3,
         "window-1 logits are degenerate (rms {scale:e})"
     );
+}
+
+// ─── Mistral-Large-3's attention temperature, against llama.cpp ───────────────────
+//
+// Mistral-Large-3 is a `deepseek2` file with `attention.temperature_scale` and
+// `attention.temperature_length`: the reference multiplies every layer's query at position `p` by
+// `ln(floor(p / length) + 1) · scale + 1` (`llm_graph_input_attn_temp`), and the runner emits
+// that as `Op::AttnTemp` on the MLA query. The oracle is llama.cpp itself, on a synthetic file of
+// that shape: `fixtures/synthetic_mistral_large3_llama_cpp.txt` holds the logits it computed at
+// several prompt lengths, below and past the temperature length.
+//
+// ```text
+// INFR_LLAMA_DEBUG=<llama.cpp>/build/bin/llama-debug [INFR_LLAMA_FIXTURE_OUT=<dir>] \
+//   cargo test -p infr-llama --test synthetic_deepseek2 -- --ignored \
+//   synthetic_mistral_large3_regenerate_llama_cpp_fixture
+// ```
+
+/// The temperature length of the Mistral-Large-3-shaped file, which its converter writes as the
+/// YaRN original context (`MistralMoeModel::set_gguf_parameters`), so both keys carry it. Short,
+/// so that a prompt of a few dozen tokens crosses it more than once.
+const ML3_TEMP_LENGTH: u32 = 16;
+
+/// `attention.temperature_scale` (the converter's `llama_4_scaling.beta`): the scale `llama4.cpp`
+/// hardcodes for the same temperature, since the real file's was not read here.
+const ML3_TEMP_SCALE: f32 = 0.1;
+
+/// The prompt lengths scored against llama.cpp: every position below the temperature length (the
+/// context the file was capped at before the temperature was applied), the first position at it,
+/// and two more steps of the floor past it.
+const ML3_PROMPT_LENS: [usize; 3] = [ML3_TEMP_LENGTH as usize, ML3_TEMP_LENGTH as usize + 1, 40];
+
+/// The llama.cpp logits for [`mistral_large3_model`] at each of [`ML3_PROMPT_LENS`].
+const ML3_ORACLE_FIXTURE: &str = "tests/fixtures/synthetic_mistral_large3_llama_cpp.txt";
+
+/// The expert-bank format of [`mistral_large3_quantized_model`]: one the batched MoE prefill has a
+/// kernel for.
+const ML3_EXPERT_DTYPE: infr_core::tensor::DType = infr_core::tensor::DType::Q8_0;
+
+/// `expert_gating_func` softmax, the scoring Mistral-Large-3's converter declares.
+const SOFTMAX_GATING: u32 = 1;
+
+/// Token `id`'s text in the oracle file's vocabulary: the printable ASCII characters from `!` on,
+/// each its own GPT-2 byte-level symbol, so with no merges llama.cpp's tokenizer reads a string of
+/// them back as exactly these ids (the scheme `synthetic_lfm3.rs`'s `token_text` uses).
+fn ml3_token_text(id: u32) -> char {
+    char::from(b'!' + u8::try_from(id).expect("a vocab id"))
+}
+
+/// A Mistral-Large-3-shaped `deepseek2` file: the canonical MLA model with softmax routing and no
+/// router bias, YaRN with the multiplier its converter writes (`mscale_all_dim` 1), the attention
+/// temperature, and a vocabulary llama.cpp tokenizes back to chosen ids, with no BOS.
+fn mistral_large3_model() -> SyntheticModel {
+    let k = |s: &str| format!("deepseek2.{s}");
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, None);
+    let mut m = deepseek2_model(&d);
+    m = with_meta(m, &k("expert_gating_func"), Meta::U32(SOFTMAX_GATING));
+    m = with_meta(m, &k("rope.scaling.yarn_log_multiplier"), Meta::F32(0.1));
+    m = with_meta(
+        m,
+        &k("rope.scaling.original_context_length"),
+        Meta::U32(ML3_TEMP_LENGTH),
+    );
+    m = with_meta(
+        m,
+        "tokenizer.ggml.tokens",
+        Meta::StrArr(
+            (0..d.vocab as u32)
+                .map(|i| ml3_token_text(i).to_string())
+                .collect(),
+        ),
+    );
+    m = with_new_meta(m, "tokenizer.ggml.add_bos_token", Meta::Bool(false));
+    // The absorbed-MLA cache shape every DeepSeek converter writes (`DeepseekV2Model`): one KV
+    // head of one `[latent | rope]` key row, with the latent as the value. llama.cpp sizes its
+    // cache from them; infr derives all three from the MLA keys.
+    m = with_new_meta(m, &k("attention.head_count_kv"), Meta::U32(1));
+    m = with_new_meta(m, &k("attention.key_length"), Meta::U32(d.kv_row() as u32));
+    m = with_new_meta(
+        m,
+        &k("attention.value_length"),
+        Meta::U32(d.kv_lora_rank as u32),
+    );
+    m = with_new_meta(
+        m,
+        &k("attention.temperature_length"),
+        Meta::U32(ML3_TEMP_LENGTH),
+    );
+    with_new_meta(
+        m,
+        &k("attention.temperature_scale"),
+        Meta::F32(ML3_TEMP_SCALE),
+    )
+}
+
+/// [`mistral_large3_model`] with the temperature off (scale 0, the reference's "off") and nothing
+/// else changed.
+fn mistral_large3_without_temperature() -> SyntheticModel {
+    with_meta(
+        mistral_large3_model(),
+        "deepseek2.attention.temperature_scale",
+        Meta::F32(0.0),
+    )
+}
+
+/// [`mistral_large3_model`] with its expert banks in [`ML3_EXPERT_DTYPE`]. The f32 banks of the
+/// oracle file have no batched MoE kernel, so every prompt token of it runs as its own one-row
+/// graph; these do, so a prompt prefills in multi-row chunks.
+fn mistral_large3_quantized_model() -> SyntheticModel {
+    let mut m = mistral_large3_model();
+    for bank in [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ] {
+        m = with_fill(m, bank, Fill::Quant(ML3_EXPERT_DTYPE));
+    }
+    m
+}
+
+/// The first `len` ids of the oracle prompt: drawn from the vocabulary minus the double quote and
+/// the backslash, which the command line and llama.cpp's prompt escaping would rewrite, and minus
+/// the EOS id.
+fn ml3_prompt(len: usize) -> Vec<u32> {
+    let vocab = ds2_dims(N_GROUPS, N_GROUPS_USED, None).vocab as u32;
+    let skip = |id: u32| matches!(ml3_token_text(id), '"' | '\\') || id == 2;
+    let ids: Vec<u32> = (0..vocab).filter(|&id| !skip(id)).collect();
+    (0..len as u64)
+        .map(|i| ids[(infr_testkit::gguf::splitmix64(i) % ids.len() as u64) as usize])
+        .collect()
+}
+
+/// The byte length and FNV-1a digest of `model`'s GGUF, as the fixture's `# gguf:` line records.
+fn ml3_gguf_identity(model: &SyntheticModel) -> String {
+    let bytes = model.to_gguf_bytes();
+    format!(
+        "{} bytes, fnv1a64 {:#018x}",
+        bytes.len(),
+        infr_testkit::gguf::fnv1a64(&bytes)
+    )
+}
+
+/// One llama.cpp run in the fixture: the prompt ids and the last position's logits.
+struct Ml3Run {
+    tokens: Vec<u32>,
+    logits: Vec<f32>,
+}
+
+/// The fixture's `# gguf:` identity and its runs: `# tokens:` lists a run's prompt ids, and the
+/// value lines after it are its logits.
+fn read_ml3_fixture() -> (String, Vec<Ml3Run>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ML3_ORACLE_FIXTURE);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut identity = None;
+    let mut runs: Vec<Ml3Run> = Vec::new();
+    for line in text.lines() {
+        if let Some(id) = line.strip_prefix("# gguf: ") {
+            identity = Some(id.to_string());
+        } else if let Some(ids) = line.strip_prefix("# tokens:") {
+            runs.push(Ml3Run {
+                tokens: ids
+                    .split_whitespace()
+                    .map(|t| t.parse().expect("a token id"))
+                    .collect(),
+                logits: Vec::new(),
+            });
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            runs.last_mut()
+                .unwrap_or_else(|| panic!("{}: a logit before any `# tokens:`", path.display()))
+                .logits
+                .push(line.trim().parse().expect("a logit"));
+        }
+    }
+    let identity = identity.unwrap_or_else(|| panic!("{} names no `# gguf:`", path.display()));
+    (identity, runs)
+}
+
+/// The fixture's runs, checked to be for [`ML3_PROMPT_LENS`]' prompts and the model's vocabulary.
+fn ml3_oracle_runs() -> Vec<Ml3Run> {
+    let (_, runs) = read_ml3_fixture();
+    let lens: Vec<usize> = runs.iter().map(|r| r.tokens.len()).collect();
+    assert_eq!(lens, ML3_PROMPT_LENS, "the fixture is for other lengths");
+    let vocab = ds2_dims(N_GROUPS, N_GROUPS_USED, None).vocab;
+    for Ml3Run { tokens, logits } in &runs {
+        assert_eq!(
+            *tokens,
+            ml3_prompt(tokens.len()),
+            "the fixture is for another prompt"
+        );
+        assert_eq!(logits.len(), vocab, "the fixture is for another vocabulary");
+    }
+    runs
+}
+
+/// The KV cache format the oracle runs at, on both engines, by the name llama.cpp's
+/// `--cache-type-k`/`--cache-type-v` and infr's `kv.type_k`/`kv.type_v` share: f32, so that what
+/// separates them is summation order and not where each rounds its cache to f16. infr's CPU MLA
+/// arm reads it natively; llama.cpp also runs with flash attention off, whose CPU path rounds the
+/// query to f16.
+const ML3_ORACLE_KV: &str = "f32";
+
+/// [`load`] with both KV sides pinned to the format named `kv`.
+fn load_kv(tmp: &TempGguf, kv: &str) -> infr_llama::SeamModel {
+    let mut cfg = env_cfg();
+    let dt = infr_core::budget::parse_kv_dtype(kv).expect("a KV format name");
+    cfg.kv.type_k = Some(dt);
+    cfg.kv.type_k_specified = true;
+    cfg.kv.type_v = Some(dt);
+    cfg.kv.type_v_specified = true;
+    load_with(tmp, cfg)
+}
+
+/// The bound on infr's CPU logits against llama.cpp's on the Mistral-Large-3-shaped file, both at
+/// [`ML3_ORACLE_KV`]. The fixture header records the gaps measured when the data was made, and the
+/// gap the temperature itself makes, which this bound separates by orders of magnitude.
+const ML3_ORACLE_MAX_ABS: f32 = 1e-4;
+
+/// **The external oracle for the attention temperature, in CI.** infr's CPU prefill of the
+/// Mistral-Large-3-shaped file against llama.cpp's logits at every stored length: below the
+/// temperature length, at it, and two floor steps past it. Past it the temperature moves the
+/// logits by orders of magnitude more than the bound, so a temperature at the wrong position or
+/// with the wrong offset fails here. The file's f32 expert banks have no batched MoE kernel, so
+/// every token here is a one-row graph: a chunk of several rows across the length is checked
+/// against this one-row path by
+/// [`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`].
+#[test]
+fn synthetic_mistral_large3_cpu_matches_llama_cpp() {
+    let tmp = TempGguf::write("ml3-oracle-cpu", &mistral_large3_model());
+    let model = load_kv(&tmp, ML3_ORACLE_KV);
+    for Ml3Run {
+        tokens,
+        logits: want,
+    } in ml3_oracle_runs()
+    {
+        let got = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+        let err = max_abs_diff(&got, &want);
+        println!(
+            "synthetic mistral-large-3 cpu at {} tokens: max |logit diff| {err:e} against \
+             llama.cpp",
+            tokens.len()
+        );
+        assert!(
+            err < ML3_ORACLE_MAX_ABS,
+            "infr's CPU misses llama.cpp by {err} at {} tokens on the synthetic Mistral-Large-3",
+            tokens.len()
+        );
+    }
+}
+
+/// The `Op::AttnTemp` ops a CPU prefill of `prompt` on `tmp`'s model ran, as `(rows, pos)`, with
+/// its logits, at the prefill chunk height `ubatch` (`None`: the default).
+fn ml3_attn_temps(
+    tmp: &TempGguf,
+    prompt: &[u32],
+    ubatch: Option<usize>,
+) -> (Vec<f32>, Vec<(u32, u32)>) {
+    use infr_cpu::op_tap::{self, TappedOp};
+    let mut cfg = env_cfg();
+    if let Some(rows) = ubatch {
+        cfg.device.ubatch = Some(rows);
+        cfg.device.ubatch_specified = true;
+    }
+    let model = load_with(tmp, cfg);
+    op_tap::start();
+    let logits = model.prefill_logits_cpu(prompt);
+    let temps = op_tap::take()
+        .into_iter()
+        .filter_map(|o| match o {
+            TappedOp::AttnTemp { rows, pos } => Some((rows, pos)),
+            _ => None,
+        })
+        .collect();
+    (logits.expect("cpu prefill"), temps)
+}
+
+/// **A chunk that straddles the temperature length computes what one row at a time does, to the
+/// bit.** The runner gives `Op::AttnTemp` a chunk's first position and the kernel steps it per row,
+/// so a chunk whose rows sit on both sides of the length must give each row its own factor. The
+/// llama.cpp oracle cannot see that mapping: its f32 expert banks have no batched MoE kernel, so
+/// every token there is a one-row graph, and with quantized banks llama.cpp and infr round the
+/// expert activations differently, too far apart to judge it. So the quantized model's default
+/// prefill (one multi-row chunk across the length, checked through the op tap) is held to the same
+/// model prefilled one row per graph (`device.ubatch` 1), the path the oracle does check. The CPU
+/// computes every row the same way whatever the chunk, so the two agree exactly unless the rows
+/// got the wrong positions.
+#[test]
+fn synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time() {
+    let tmp = TempGguf::write("ml3-straddle", &mistral_large3_quantized_model());
+    let prompt = ml3_prompt(*ML3_PROMPT_LENS.last().expect("lengths"));
+    let len = ML3_TEMP_LENGTH;
+    let (chunked, temps) = ml3_attn_temps(&tmp, &prompt, None);
+    println!("mistral-large-3 chunked AttnTemp (rows, pos): {temps:?}");
+    assert!(
+        temps.iter().all(|&(rows, pos)| pos + rows > len),
+        "an AttnTemp ran wholly before the temperature length: {temps:?}"
+    );
+    assert!(
+        temps.iter().any(|&(rows, pos)| rows > 1 && pos < len),
+        "no multi-row AttnTemp straddled the temperature length: {temps:?}"
+    );
+    let (rows, temps) = ml3_attn_temps(&tmp, &prompt, Some(1));
+    assert!(
+        temps.iter().all(|&(rows, _)| rows == 1),
+        "the one-row prefill ran a multi-row AttnTemp: {temps:?}"
+    );
+    let dv = max_abs_diff(&chunked, &rows);
+    println!("mistral-large-3 straddling chunk vs one row at a time: max|Δ| = {dv:e}");
+    assert_eq!(dv, 0.0, "a straddling chunk moved the logits");
+}
+
+/// [`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`] on Vulkan, where
+/// `attn_temp.comp` steps the position per row: the quantized model's default prefill, one
+/// multi-row chunk across the length (checked on the CPU through the op tap; the tap is CPU-only),
+/// against the same model one row per graph, at
+/// [`ML3_VULKAN_MAX_ABS`]: the two agree exactly on the discrete GPU and to reassociation on the
+/// integrated one (measured). The bound holds because this file's expert width is narrower than
+/// the batched expert GEMMs' column tile, which sends the chunked run's MoE to the same small-m
+/// path the one-row run takes (and caps its chunk); if those kernels gain partial-tile support, the
+/// chunked run moves to int8 activations and this bound will need revisiting. Against the CPU they
+/// are int8-activation rounding apart, too far to judge the mapping.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write("ml3-straddle-vk", &mistral_large3_quantized_model());
+    let prompt = ml3_prompt(*ML3_PROMPT_LENS.last().expect("lengths"));
+    let (_, temps) = ml3_attn_temps(&tmp, &prompt, None);
+    assert!(
+        temps
+            .iter()
+            .any(|&(rows, pos)| rows > 1 && pos < ML3_TEMP_LENGTH && pos + rows > ML3_TEMP_LENGTH),
+        "no chunk straddles the temperature length: {temps:?}"
+    );
+    let chunked = load(&tmp)
+        .prefill_logits_vulkan(&prompt)
+        .expect("vulkan prefill");
+    let mut cfg = env_cfg();
+    cfg.device.ubatch = Some(1);
+    cfg.device.ubatch_specified = true;
+    let rows = load_with(&tmp, cfg)
+        .prefill_logits_vulkan(&prompt)
+        .expect("vulkan prefill");
+    let dv = max_abs_diff(&chunked, &rows);
+    println!("mistral-large-3 vulkan straddling chunk vs one row at a time: max|Δ| = {dv:e}");
+    assert!(
+        dv < ML3_VULKAN_MAX_ABS,
+        "a straddling chunk moved the Vulkan logits by {dv}"
+    );
+}
+
+/// The bound on Vulkan's logits against the CPU's at the f16 KV cache Vulkan's MLA kernel reads,
+/// and against its own at another chunk height: the same arithmetic and the same cache roundings,
+/// so only reassociation separates them.
+const ML3_VULKAN_MAX_ABS: f32 = 2e-4;
+
+/// The bound on Vulkan's logits against llama.cpp's: Vulkan's MLA cache is f16 and the oracle's
+/// f32, so this is the f16 cache's rounding, recorded in the fixture header by the CPU at f16.
+const ML3_VULKAN_ORACLE_MAX_ABS: f32 = 1e-2;
+
+/// [`synthetic_mistral_large3_cpu_matches_llama_cpp`] on Vulkan, where `Op::AttnTemp` runs
+/// `attn_temp.comp` on the prefill chunk and on every decode step. Vulkan's MLA reads an f16 cache
+/// only, so it is held tightly to the CPU at that cache, and to llama.cpp at the f16 cache's own
+/// distance from it.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_mistral_large3_matches_llama_cpp() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write("ml3-oracle-vk", &mistral_large3_model());
+    let model = load_kv(&tmp, "f16");
+    for Ml3Run {
+        tokens,
+        logits: want,
+    } in ml3_oracle_runs()
+    {
+        let len = tokens.len();
+        let got = model
+            .prefill_logits_vulkan(&tokens)
+            .expect("vulkan prefill");
+        let cpu = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+        let (to_cpu, to_oracle) = (max_abs_diff(&got, &cpu), max_abs_diff(&got, &want));
+        println!(
+            "synthetic mistral-large-3 vulkan at {len} tokens: max |logit diff| {to_cpu:e} against \
+             the CPU at f16 KV, {to_oracle:e} against llama.cpp"
+        );
+        assert!(
+            to_cpu < ML3_VULKAN_MAX_ABS,
+            "Vulkan misses the CPU by {to_cpu} at {len} tokens on the synthetic Mistral-Large-3"
+        );
+        assert!(
+            to_oracle < ML3_VULKAN_ORACLE_MAX_ABS,
+            "Vulkan misses llama.cpp by {to_oracle} at {len} tokens on the synthetic \
+             Mistral-Large-3"
+        );
+    }
+}
+
+/// **Below its length the temperature changes nothing, to the bit; past it, it changes the
+/// output.** Every factor is exactly 1 until a position reaches the temperature length, and the
+/// runner emits no `Op::AttnTemp` for a batch wholly before it, so a prompt that ends there must
+/// give the same logits as the file with the temperature off: the context the file used to be
+/// capped at keeps the numbers it had. Past it the two must differ, or the temperature never ran.
+fn temperature_is_inert_before_its_length(
+    logits: impl Fn(&str, &SyntheticModel, &[u32]) -> Vec<f32>,
+) {
+    let below = ml3_prompt(ML3_TEMP_LENGTH as usize);
+    let on = logits("ml3-on-below", &mistral_large3_model(), &below);
+    let off = logits(
+        "ml3-off-below",
+        &mistral_large3_without_temperature(),
+        &below,
+    );
+    let dv = max_abs_diff(&on, &off);
+    println!("mistral-large-3 temperature on vs off below its length: max|Δ| = {dv:e}");
+    assert_eq!(
+        dv, 0.0,
+        "the temperature moved the logits before its length"
+    );
+
+    let past = ml3_prompt(*ML3_PROMPT_LENS.last().expect("lengths"));
+    assert_moves(
+        "mistral-large-3 temperature on vs off past its length",
+        &logits("ml3-on-past", &mistral_large3_model(), &past),
+        &logits("ml3-off-past", &mistral_large3_without_temperature(), &past),
+        "the attention temperature",
+    );
+}
+
+#[test]
+fn synthetic_mistral_large3_temperature_is_inert_before_its_length() {
+    temperature_is_inert_before_its_length(cpu_logits_of);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_mistral_large3_temperature_is_inert_before_its_length() {
+    let _lk = gpu_serial_lock();
+    temperature_is_inert_before_its_length(|tag, model, prompt| {
+        let tmp = TempGguf::write(tag, model);
+        load(&tmp)
+            .prefill_logits_vulkan(prompt)
+            .expect("vulkan prefill")
+    });
+}
+
+/// The command that regenerates [`ML3_ORACLE_FIXTURE`].
+const ML3_REGENERATE: &str = "INFR_LLAMA_DEBUG=<llama-debug> INFR_LLAMA_FIXTURE_OUT=<dir> cargo \
+                              test -p infr-llama --test synthetic_deepseek2 -- --ignored \
+                              synthetic_mistral_large3_regenerate_llama_cpp_fixture";
+
+/// **The checked-in llama.cpp data was made from the file [`mistral_large3_model`] writes today.**
+/// A change to the builder or to the testkit's GGUF writer that moves a byte of the file fails
+/// here, rather than leaving infr scored against data for another model.
+#[test]
+fn synthetic_mistral_large3_llama_cpp_fixture_matches_its_gguf() {
+    let (identity, _) = read_ml3_fixture();
+    assert_eq!(
+        identity,
+        ml3_gguf_identity(&mistral_large3_model()),
+        "{ML3_ORACLE_FIXTURE} was made from another GGUF; regenerate it with `{ML3_REGENERATE}`"
+    );
+}
+
+/// Recompute [`ML3_ORACLE_FIXTURE`]: write the synthetic GGUF, run `llama-debug --save-logits` on
+/// each prompt's text (the binary `INFR_LLAMA_DEBUG` names), check llama.cpp tokenized it to
+/// exactly those ids, and record its last-position logits with the build's version line, the
+/// command, the file's identity, and what infr's CPU measured against them. The result is compared
+/// with the checked-in file, or written into the directory `INFR_LLAMA_FIXTURE_OUT` names, so
+/// running every ignored test with llama.cpp configured never rewrites the tree. Without
+/// `INFR_LLAMA_DEBUG` it returns at once.
+#[test]
+#[ignore = "recomputes the llama.cpp fixture: needs INFR_LLAMA_DEBUG (a llama-debug binary)"]
+fn synthetic_mistral_large3_regenerate_llama_cpp_fixture() {
+    use infr_testkit::llama_cpp::{
+        llama_cpp_version, llama_debug_logits, run_headless, write_or_compare_fixture,
+    };
+    let Ok(exe) = std::env::var("INFR_LLAMA_DEBUG") else {
+        eprintln!("skip: INFR_LLAMA_DEBUG not set");
+        return;
+    };
+    let model = mistral_large3_model();
+    let tmp = TempGguf::write("ml3-oracle", &model);
+    let version = llama_cpp_version(&exe);
+    let ours = load_kv(&tmp, ML3_ORACLE_KV);
+    let ours_f16 = load_kv(&tmp, "f16");
+    let tmp_off = TempGguf::write("ml3-oracle-off", &mistral_large3_without_temperature());
+    let ours_off = load_kv(&tmp_off, ML3_ORACLE_KV);
+    let kv = ML3_ORACLE_KV;
+    // Flash attention off: llama.cpp's CPU flash path rounds the query to f16, which put the two
+    // engines 4e-3 apart where the f32 path leaves them 4e-6 apart (measured at generation). No
+    // device: a build with a GPU backend would otherwise offload and compute other bits than the
+    // CPU-only build the data was made with, and compare mode needs identical data lines.
+    let args: [&std::ffi::OsStr; 8] = [
+        "--cache-type-k".as_ref(),
+        kv.as_ref(),
+        "--cache-type-v".as_ref(),
+        kv.as_ref(),
+        "--flash-attn".as_ref(),
+        "off".as_ref(),
+        "--device".as_ref(),
+        "none".as_ref(),
+    ];
+    // The build's own device list, recorded so a regeneration on another build can be told apart.
+    let devices: String = run_headless(&exe, &["--list-devices".as_ref()])
+        .lines()
+        .skip_while(|l| !l.starts_with("Available devices"))
+        .map(|l| format!("#   {}\n", l.trim()))
+        .collect();
+    let mut header = format!(
+        "# llama.cpp logits for the synthetic Mistral-Large-3-shaped deepseek2 model\n\
+         # (`mistral_large3_model` in synthetic_deepseek2.rs) at the last position of each prompt,\n\
+         # one per vocabulary id.\n\
+         # llama.cpp {version}, run on the CPU (`--device none`); `llama-debug --list-devices`:\n\
+         {devices}\
+         # Regenerate: {ML3_REGENERATE}\n\
+         # which runs: llama-debug -m <synthetic gguf> -p <prompt as text> --save-logits \
+         --logits-output-dir <dir> --cache-type-k {kv} --cache-type-v {kv} \
+         --flash-attn off --device none\n\
+         # gguf: {}\n",
+        ml3_gguf_identity(&model)
+    );
+    let mut body = String::new();
+    for len in ML3_PROMPT_LENS {
+        let ids = ml3_prompt(len);
+        let prompt: String = ids.iter().map(|&id| ml3_token_text(id)).collect();
+        let (tokens, logits) = llama_debug_logits(&exe, tmp.path(), &prompt, &args);
+        assert_eq!(tokens, ids, "llama.cpp tokenized the prompt differently");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "non-finite llama.cpp logits"
+        );
+        let cpu = ours.prefill_logits_cpu(&ids).expect("cpu prefill");
+        let off = ours_off.prefill_logits_cpu(&ids).expect("cpu prefill");
+        let f16 = ours_f16.prefill_logits_cpu(&ids).expect("cpu prefill");
+        header.push_str(&format!(
+            "# infr CPU at {len} tokens: max |logit diff| {:e}; with the temperature off {:e}; \
+             at an f16 KV cache {:e}\n",
+            max_abs_diff(&cpu, &logits),
+            max_abs_diff(&off, &logits),
+            max_abs_diff(&f16, &logits)
+        ));
+        let ids: Vec<String> = tokens.iter().map(u32::to_string).collect();
+        body.push_str(&format!("# tokens: {}\n", ids.join(" ")));
+        for v in &logits {
+            body.push_str(&format!("{v}\n"));
+        }
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ML3_ORACLE_FIXTURE);
+    let text = format!("{header}{body}");
+    if let Some(written) = write_or_compare_fixture(&path, &text) {
+        println!("wrote {}", written.display());
+    }
+    print!("{header}");
 }

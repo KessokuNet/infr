@@ -26,6 +26,104 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-DECISIONS-2026-11-25 — owner's decisions, and the slices they queue (2026-11-25)
+
+**Tag:** re-land · **Needs:** work, per item
+
+`docs/plan/reland-fork-features.md` records the whole replay. These items did
+not come back, each for its own reason:
+
+1. ~~Forward paged attention in the seam (`kv.paged`)~~ — **landed**: `KvPool`
+   + `PagedSlot` live in `seam/pool.rs`, the pool is built at the first fork
+   (`SlotPool`) or at boot (`--parallel`), and every pooled cache carries a
+   `PageMap` into its graph. Two bugs the port exposed are fixed with it: the
+   `Op::Rope` peephole wrote a pooled slot's K rows at row 0 (it applied no
+   row-base bias, unlike the `QkNormRope` arm), and the record-once V store
+   baked an unbiased address. `tests/kv_paged_session.rs` pins a two-conversation
+   session byte-for-byte against a contiguous one.
+2. **Store kernels' params-based row base (`p_rb`).** `store_f16.comp` and
+   `quant_q8.comp` derive the write row from `p_pos` alone; a paged slot's row
+   base travels in the destination device address instead
+   (`adapter::kv_row_base * row_bytes`). The test that pinned `p_pos + p_rb`
+   (`a_store_row_base_puts_the_row_in_that_block`) is `#[ignore]`d with that
+   reason, because the params word never landed in any store kernel.
+3. ~~fp32 K-quant prefill GEMM~~ — **landed** (`native_gemm_kq_fma.comp` + the
+   split-K twin, `NcGemm::KqFma`).
+4. **Small per-kernel tuning the replay dropped**: mmv OUTS4 K-tail
+   (`eea45032`), small-turn attention + K-quant linears (`05eb5b55`), compare
+   benchmark overrides (`c79c4034`).
+5. **Fused RmsNorm consumers.** `infr-core/src/fusion.rs` now plans only
+   `Op`-level fusions; `plan_rmsnorm_linear` / `FusionPlan::rmsnorm_linear` (and
+   `446eb403`'s input-unchanged fix) are gone with upstream's pattern. Restoring
+   it needs a Vulkan (and Metal) planner again.
+
+The GCN tiers that landed (`kq_fma_gemv`, `wave64_native`, `kq_fma` prefill) have
+now been re-measured on the RX 580 on the current tree, three sweeps in
+`docs/legacy-gpus.md`; the prefill GEMM is ahead of llama.cpp there.
+=======
+### B-DECISIONS-2026-11-25 — owner's decisions, and the slices they queue (2026-11-25)
+
+**Kind:** decisions taken by the owner on 2026-11-25, one question at a time.
+Each is a slice to run through the usual coder, reviewer and gate flow; delete a
+line when its slice ships.
+
+Queue order (the owner's): MoE routing first, then the rest in the order below.
+(Item 1, the download fan-out, shipped; see B-FANOUT for what it left.)
+
+2. **MoE routing: keep int8, fix the GPU activation quantizer (B207).** Measured
+   2026-11-25 (`docs/gpu-tolerance.md`, "MoE routing, int8 against float"): the
+   router already runs on float activations, so the gap is upstream int8 error
+   in the hidden state; Float decodes at the shipped speed and prefills about
+   5.6 times slower on Qwen3-30B-A3B on the RX 7900 XTX. **Decided by the owner,
+   2026-11-25:** the default stays int8. Next slice: outlier handling in
+   `quant_q8.comp` for the activations feeding the expert kernels (and f32 block
+   scales and sums as a second variant), measured with the same harness on both
+   models and both GPUs plus a decode and prefill A/B; if it does not close most
+   of the gap, back to the owner with the numbers. To measure in the same slice
+   because it looked free: the dense decode GEMVs on float for MoE models only
+   (decode read the same speed with them float). The real MoE rows of the
+   tolerance table wait for that result.
+3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
+   (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
+   on this driver and why.
+4. **Breaking API changes in `[Unreleased]`.** Accepted as they are; the next
+   cut is a minor bump. No shims.
+5. **Spill ordering and the spilled session's chunk.** Measure decode and
+   prefill for spill-before-stream against stream-before-spill, and a short
+   against a tall prefill chunk on a spilled session (RX 7900 XTX under
+   `INFR_VRAM_LIMIT`, quiet window). Change the defaults where the result is
+   clear; bring a real trade-off back to the owner.
+6. **`sample_topk` exact ties (B120).** Make the tie-break deterministic and
+   equal to the host sampler's, with a test that plants more than k tied logits,
+   then a decode A/B. A measurable slowdown goes back to the owner before it
+   ships.
+7. **CPU single-row Q5_0 and `cpu_golden_gemma3`.** Approved with evidence:
+   route the single row through `vec_dot_q5_0_32_batch`, show the new output is
+   at least as close to the f64 reference as the old and that decode and prefill
+   rows agree bit for bit, then re-bless. Otherwise back to the owner.
+8. **A bare model reference always means the default quant** (`store.rs`
+   `fallback_quant`): `infr run org/repo` fetches the default quant when it is
+   not cached, as `llama-cli -hf` does, rather than running whichever quant is
+   cached. Fix in the same slice, no decision needed: `Match::Exact` returning
+   before the `is_mmproj` exclusion, and `is_mmproj` missing the
+   `name.mmproj-Q8_0.gguf` form.
+9. **Sampler order: match llama.cpp.** Top-p on the raw probabilities,
+   temperature last, in `sampling.rs`, `infr-cpu`'s `sample_token`,
+   `sample_topk.comp` and the Metal sampler together; a test at logits
+   `[2, 0, 0]`, temperature 0.6, top_p 0.9; decode speed check.
+10. **Penalties, split by the API that defines each.** `repeat_penalty` follows
+    llama.cpp: seeded from the prompt, windowed to `repeat_last_n`, and
+    `repeat_last_n` accepted as a request field. `presence_penalty` and
+    `frequency_penalty` keep the OpenAI definition. Fix
+    `RequestSampling::default`'s doc.
+11. **`gpu_seam_tolerance_float_runs_build_no_int8_kernel` on a device with no
+    int8 kernel.** Approved: when the shipped run builds no int8 kernel the test
+    says so and asserts the Int8 and Float kernel lists are equal, as
+    `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` does for its tier.
+12. **`/status` and `infr tune show` under `INFR_VRAM_LIMIT`.** Additive: keep
+    total and free as the budget in force, add the configured limit and the
+    device's real total; `infr tune show` gains a memory line with the same
+    figures.
 ### B-RELAND — what the upstream sync left behind (2026-11-17)
 
 **Tag:** re-land · **Needs:** work, per item
@@ -60,6 +158,32 @@ not come back, each for its own reason:
 The GCN tiers that landed (`kq_fma_gemv`, `wave64_native`, `kq_fma` prefill) have
 now been re-measured on the RX 580 on the current tree, three sweeps in
 `docs/legacy-gpus.md`; the prefill GEMM is ahead of llama.cpp there.
+
+### B246 — the MLA YaRN magnitude has two implementations that disagree (2026-11-25)
+
+**Tag:** deepseek · **Kind:** correctness question, unverified against a reference
+
+`kryptic/main` applies a DeepSeek MLA file's YaRN magnitude by emitting `Op::MulVec` gain rows over
+the query's rotary columns (`mla_q_rope_gain` / `mla_q_rope_gain_rows`, one row per rope/nope split,
+plus a second per-head row for deepseek32's lightning indexer). The fork applies the same quantity
+by folding `mscale²` into `Op::Mla`'s score scale (`seam/runner.rs`'s `mla_scale`), which multiplies
+the WHOLE absorbed score instead of only the rotary half.
+
+Those are not the same arithmetic, and both branches' goldens are blessed against their own. Taking
+upstream's arm on the 2026-11-25 sync moved 6 tests:
+
+- `synthetic_deepseek{2,32}_mla_magnitude_*` (3) and `synthetic_deepseek32_mla_magnitude_matches_the_reference_scores`
+  pass only WITH the arm.
+- `synthetic_deepseek32_yarn_rule_matches_the_reference` (a pre-scaled weight twin) passes only WITHOUT it.
+- `synthetic_deepseek32_indexer_selection_is_locked` fails either way: the branch's and upstream's
+  `GOLDEN_DS32_TOPK5` differ and neither matches the tree that results from this merge.
+
+Settled for now by the owner's rule (the fork's implementation stands, no query-side gain emitted),
+so the six tests are `#[ignore]`d with that reason rather than deleted or re-blessed. **What closes
+it:** run both variants on a real deepseek2/deepseek32 file against llama.cpp's scores at a context
+past `attn_temp_floor_scale`, decide which half's arithmetic reproduces the reference, then re-bless
+`GOLDEN_DS32_TOPK5` against the winner with the reason written in `docs/deepseek.md` (that test says
+explicitly not to re-bless to make it green).
 
 ### B-DSV2-NONYARN-SCALE — deepseek2 ignores a non-YaRN `rope.scaling.factor` (2026-11-16)
 
@@ -358,9 +482,10 @@ window between the weight upload and the KV allocation, against
    requires.** gemma-4-31B advertises 14 592 (the interim-margin build said 15
    872, and 19 021 was measured to miss by 2 MiB). The gap is
    `POST_KV_DEVICE_RESERVE` + the allocator's own 256 MiB `GUARD_HEADROOM` + the
-   reserve's pad + `KV_SLOP_ROWS` (B13). Reclaiming it means measuring the
-   driver-side growth on more than one GPU first — 181 MiB is one sample, on one
-   RADV version.
+   reserve's pad. Reclaiming it means measuring the driver-side growth on more
+   than one GPU first — 181 MiB is one sample, on one RADV version. The 14 592
+   was measured while every estimate still added 64 rows per layer; those rows
+   are gone (B13), so the figure is a little higher now and was not re-measured.
 4. **Every measurement here is from one 7900 XTX on RADV.** The arena-tail
    percentage, the driver-side growth and the activation peaks are all
    Mesa/RADV/discrete numbers. An Intel or NVIDIA driver could report its budget
@@ -374,28 +499,6 @@ window between the weight upload and the KV allocation, against
    the interaction between a shrunk window and `vulkan_slot_ctx`'s divide-by-N
    is reasoned, not measured.
 
-### B11 — an explicit `INFR_CACHE=<pct>` still resolves against raw free VRAM
-
-**Tag:** narrowed 2026-08-02 · **Blocked on:** a decision about what the
-percentage should MEAN
-
-The placement budgets that infr derives for itself — `vulkan_moe_binder`'s dense
-residency predicate, its streaming budget and its MoE expert budget — now take
-the allocator's ceiling (`VramInfo::alloc_room`, free minus the VRAM guard's 256
-MiB headroom), the same function the context-fit math uses, guarded by
-`budgets_agree_with_the_allocator_ceiling` and
-`fit_math_and_placement_pick_the_same_rung`.
-
-Both `INFR_CACHE` tiers still resolve a percentage spec against `vram.available`
-(`spec.resolve(..)` in the MoE and dense override arms). Left alone
-deliberately: that value is the CALLER's budget, the grammar is documented as "a
-percentage of the device's AVAILABLE VRAM", and the override exists to force a
-placement the auto tiers would not choose — so failing loudly at the alloc guard
-is defensible where silently handing back less than asked is not.
-`INFR_CACHE=100%` is the case that would trip it. Decide whether the percentage
-means "of free VRAM" (today) or "of what can actually be allocated" before
-changing it; either way it is one `spec.resolve` argument per arm.
-
 ### B12 — what the explicit `--ctx N` fit ladder still does not cover
 
 **Tag:** raised 2026-08-02 · **Blocked on:** nothing; the ladder shipped (q8
@@ -404,13 +507,13 @@ changing it; either way it is one `spec.resolve` argument per arm.
 **DECIDED 2026-08-12 (user):** an explicit `--ctx N` that does not fit must try
 q8_0 KV first, then refuse — f16, then q8_0, then refuse.
 
-**Shipped:** `SeamModel::auto_q8_for_explicit_ctx` pins q8_0 when f16 misses and
-q8_0 holds `want * n_slots`. `SeamModel::refuse_explicit_ctx` then refuses,
-before any weight loads, when `seam::kv_floor_alloc_bytes` (each side at the
-cheapest of the requested format, f16 and q8_0, the ring wherever possible, the
-shortest prefill chunk) exceeds `alloc_room()`. The runner repeats the check
-with the exact buffers against the measured room between the weight upload and
-the KV allocation. Both count only buffers of at least
+**Shipped:** `SeamModel::fit_explicit_ctx` pins q8_0 when f16 misses and q8_0
+holds `want * n_slots`. `SeamModel::refuse_explicit_ctx` then refuses, before
+any weight loads, when `seam::kv_floor_alloc_bytes` (each side at the cheapest
+of the requested format, f16 and q8_0, the ring wherever possible, the shortest
+prefill chunk) exceeds `alloc_room()`. The runner repeats the check with the
+exact buffers against the measured room between the weight upload and the KV
+allocation. Both count only buffers of at least
 `infr_vulkan::VRAM_GUARD_MIN_ALLOC`, and both skip under `INFR_KV_OVERFLOW` and
 `INFR_NO_VRAM_GUARD`. Observed on the iGPU: Qwen3-0.6B at `INFR_CTX=1000000` is
 refused in under a second with the sizes.
@@ -423,31 +526,381 @@ refused in under a second with the sizes.
   (observed on the iGPU: Qwen3-0.6B, f16 KV, `INFR_CTX=500000`). Folding the
   weights into the early refusal is provable only for a model that cannot stream
   them.
-- **Not observed in a real run:** the q8 pin, and the runner's post-load
-  refusal. Both need an explicit window close to the whole device: on this box
-  that means filling the iGPU's shared memory or using the dGPU, both
-  off-limits. Only their decision functions are tested.
+- **Observed now, on the integrated GPU only, under `INFR_VRAM_LIMIT`**
+  (`seam::model::vram_limit_tests`, Qwen3-0.6B with 1880 MiB of room above what
+  is in use): `explicit_ctx_f16_cannot_hold_is_served_in_q8` (f16 fit 7 546
+  tokens, q8_0 14 204, asked 10 875, served 10 875 in q8_0) and
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused`. Since the fit
+  before the load prices the weights as the arena commits them, the upload
+  staging and `POST_KV_DEVICE_RESERVE` (B-PRELOAD-CLAMP), the largest f16 window
+  it accepts (7 546) runs as asked. The post-load refusal is reached by a window
+  the fit rejects and dense placement still takes resident, because
+  `vulkan_moe_binder`'s residency prices the weights at their bare footprint and
+  holds no reserve: asked 11 104 with `INFR_KV_TYPE_K/V=f16` (so neither q8_0
+  rung takes it), the largest window that footprint leaves, it is refused after
+  the weights (1.19 GiB of KV against 1.10 GiB left); a window whose f16 cache
+  cannot sit beside the footprint stops at dense placement's streaming-floor
+  error first (the gap above). The q8 pin has a backstop the q8 test had to work
+  around: dense placement's own auto-q8 rung in `vulkan_moe_binder` pins q8_0
+  for the same window, so with `fit_explicit_ctx` disabled the window is still
+  served in q8_0; the test reads the session's pins before any weight loads to
+  see which rung decided. Not run on the RX 7900 XTX.
 - The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
   context at all" may refuse, or every ordinary long-context model breaks on a
   24 GiB card.
 
-### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
+### B13 — the KV estimate is the allocation: what plan 13 S2 left (2026-11-24)
 
-**Tag:** verified 2026-08-02 · **Blocked on:** nothing; left alone deliberately
+**Tag:** vram fit · kv · qwen35
 
-`seam::kv_bytes_estimate_fmt` adds `KV_SLOP_ROWS = 64` rows per layer before
-sizing each side's buffer, and the comment it inherited described this as
-mirroring a pad `SeamKv` allegedly applies. It does not: both allocation sites
-(`generate_dense_backend`'s KV loop and `SeamKv::fork`) allocate exactly
-`kv_rows(..) * n_kv * head_dim` elements. The 64 rows are a deliberate
-conservative margin and nothing more — the doc now says so.
+`seam::kv_bytes_estimate_fmt` sums `seam::kv_slot_allocs`, each buffer priced by
+`Backend::kv_alloc_cost` (`infr_core::KvAllocCost`), and on Vulkan every
+`BufferUsage::KvCache` buffer is its own `vkAllocateMemory` (`make_alloc`), so
+the estimate is what the device commits for the buffers as far as the backend
+measured it. Left:
 
-Left in because every placement estimate shares this helper and removing it
-would loosen all of them at once. That argument has weakened since: the window a
-session actually gets is now re-decided against the device's measured free
-memory (B8), so these rows are no longer a cushion against an over-optimistic
-plan — they are context the fit hands back for nothing. Removing them is worth a
-measurement now, not just a revisit.
+- **The refuse rung leaves the snapshot out, against plan 13 S2's text.** The
+  plan had `kv_floor_alloc_bytes` gain the snapshot term. It did not: the floor
+  is documented and tested as never refusing a run that would have worked, and
+  the snapshot is allocated on first use, the decode loop survives its refusal
+  (B131), and a slot that never snapshots never allocates it. So an explicit
+  `--ctx` that fills the device is not refused over it, and the MTP path can
+  still fail a request on it. The guard (and so the floor) counts only buffers
+  of at least `infr_vulkan::VRAM_GUARD_MIN_ALLOC`: on Qwen3.5-0.8B each DeltaNet
+  layer's S state is exactly 1 MiB and counts, and only its 73 728-byte
+  convolution state is skipped (18 layers x (73 728 + 1 048 576) = 20 201 472
+  bytes, the snapshot the estimate adds).
+- **Callers can still pass the estimate something the runner will not
+  allocate.** The function is exact for the ring flag, chunk height and formats
+  it is given; three callers derive those apart from the runner. The MoE arm of
+  `vulkan_moe_binder` prices `kv_ring_wanted` and `kv_auto_q8()` (f16 or q8_0)
+  and so ignores an explicit `INFR_KV_TYPE_K` / `INFR_KV_TYPE_V`.
+  `SeamModel::kv_fit_fmts` prices a requested format the runner may gate back to
+  f16. `cpu_committed_bytes` prices f16 with no ring whatever the run picks.
+  Each is an estimate of the inputs, not of the bytes; none was changed.
+- **Extra slots are divided, not priced.** `SeamModel::vulkan_slot_ctx` gives
+  each of `n_slots` a context of one slot's fit divided by `n_slots`, so every
+  term that does not scale with the context is counted once for all of them:
+  - A recurrent layer's state and its snapshot. On Qwen3.5-0.8B, 2 x 20 201 472
+    = 40 402 944 bytes (38.5 MiB) per extra slot.
+  - The sliding-window rings, the largest. With the ring on, each slot's window
+    layers hold `kv_rows_at`'s `window + chunk` rows (rounded to 64) whatever
+    its context. Arithmetic from gemma-3-1b-it's GGUF metadata, not a run: 26
+    layers with a period of 6 leave 22 window layers, window 512 and the
+    discrete 1024-row chunk give 1536 rows, and a row of K and V at f16 is 2 x 1
+    KV head x 256 x 2 bytes = 1024, so 22 x 1536 x 1024 = 34 603 008 bytes (33.0
+    MiB) per extra slot.
+  - A V4 layer's compressor rings.
+  - Since each KV buffer is now its own allocation, also its step's rounding and
+    the per-allocation overhead per buffer per extra slot (up to a page per
+    buffer on the integrated GPU).
+- **What the device reports taken beyond the estimate, unexplained.** Measured
+  2026-11-24 on the integrated GPU (RADV, RAPHAEL_MENDOCINO) through the
+  runner's `kv_committed_bytes` (the live `device_alloc_room` before the KV
+  allocation less after): Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT` 2640 to 2740
+  MiB, 335 872 bytes past the estimate at every limit (56 buffers, about 6.0 KB
+  each); `vram_limit_tests` rooms, Qwen3-0.6B 323 584 to 335 872 (56 buffers)
+  and Qwen3.5-0.8B 163 840 to 188 416 (48 buffers). The allocations themselves
+  commit exactly their price: infr-vulkan's
+  `kv_buffers_commit_no_more_than_their_price` reads the process heap usage
+  (`VK_EXT_memory_budget`'s `heapUsage`) and finds each dedicated KV buffer, 16
+  bytes to 48 MiB + 8, at its size rounded up to 4096, nothing past. So the
+  remainder is memory the device's budget loses outside this process's heap
+  usage while the KV cache is allocated and zero-filled; kernel page tables for
+  each new mapping are a guess, not verified. A one-off throwaway read of the
+  room around plain allocations, without the runner, was not usable: on the iGPU
+  it fell 12 464 128 bytes less than the heap usage rose for 56 buffers of 23
+  MiB, and not at all for the same allocated again (`vram_info` clamps each
+  heap's free figure to the heap's size, a likely cause, not checked). Not
+  priced; `clamped_kv_opens_no_pooled_block` allows 16 KiB a buffer for it. At
+  about 6 KB a buffer, a 15-slot V4 serve (15 x 272 buffers) would lose about 24
+  MB, under `POST_KV_DEVICE_RESERVE` (256 MiB), which covers it here. Pricing it
+  would mean measuring it somewhere other than the UMA budget (the probe's
+  per-allocation overhead reads the process heap usage, which does not show it);
+  decide once it is measured on the RX 7900 XTX, where the budget is plain VRAM.
+- **`kv_alloc_cost`'s measurement, where it was not made.** The backend measures
+  it once at construction (`probe_kv_alloc_cost`): the median of three dedicated
+  allocations of each of `KV_COST_PROBES` (4 bytes, 64 KiB, 64 KiB + 4, 2 MiB +
+  4), read off the process heap usage, giving a step for buffers below
+  `KV_LARGE_FROM` (2 MiB), one for buffers from it up, and the overhead the
+  exact 64 KiB probe commits past its size (`kv_alloc_cost_from`). Read on the
+  integrated GPU only: 4096 in both classes, no overhead; every dedicated
+  allocation from 4 bytes to 100 MiB + 4 committed its size rounded up to 4096
+  (a throwaway measurement, four allocations per size, and the test above at
+  eight per size). Not probed on the RX 7900 XTX, Windows drivers, NVIDIA, Intel
+  or any other driver, so the step and overhead are unverified on all of them. A
+  device without `VK_EXT_memory_budget`, or whose heap usage does not move, gets
+  a guess: a 64 KiB small step and a 2 MiB large one, no overhead. Blind spots:
+  a driver that rounds only allocations larger than 2 MiB + 4 further (a probe a
+  word past `DEDICATED_MIN` would see more, but on the integrated GPU the pages
+  a probe frees stayed counted as in use by the live budget, about 80 MiB of
+  reported room for that one, so it was dropped); a class whose step changes
+  between probes; and the host-visible memory type the UMA spill and
+  `INFR_KV_OVERFLOW`'s host KV allocate in. Its cost: about 0.1 ms in-process on
+  the integrated GPU (a throwaway timing of an earlier, larger probe set, ten
+  runs, median 115 us), and backend open (`infr tune show`, ten runs alternated
+  with HEAD's build) 24.7 ms median against 23.8, inside a 20 to 26 ms spread,
+  load average 1.2. Run at construction rather than on first use: run lazily,
+  between two budget reads of one sizing decision, its freed pages moved
+  Qwen3-0.6B at `INFR_VRAM_LIMIT=2640m` from an f16 cache of 13 060 tokens to a
+  q8_0 cache of 16 510.
+- **The allocation count.** Each KV buffer counts against
+  `maxMemoryAllocationCount` (RADV reports 4 294 967 295 on both GPUs here;
+  Vulkan guarantees only 4096, and a driver may report just that; none here
+  does). Per slot, read in code (`kv_slot_allocs`): two per layer, plus three
+  per V4 HCA layer and six per CSA layer, plus two per recurrent layer's
+  snapshot. DeepSeek V4-Flash (43 layers: 2 ratio-0, 21 CSA, 20 HCA) is the
+  largest in the codebase: 2 x 43 + 20 x 3 + 21 x 6 = 272.
+  `infr serve --parallel N` has no upper bound and allocates every slot at
+  startup (`ParallelSeam::init_slots` forks them). 15 x 272 = 4 080, so against
+  a limit of 4096 a V4 serve has room for 15 slots at most, fewer once the
+  weights' own allocations are counted (one per arena block, a block being at
+  most `maxMemoryAllocationSize`). Qwen3-0.6B's run holds 64 device memory
+  allocations in all with its 56 KV buffers, and Qwen3.5-0.8B 57 with 48 (the
+  `vram_limit_tests` lines), so the rest of a run is a handful. `make_alloc`
+  refuses a KV allocation that would pass the limit, naming the count and the
+  limit (`admit_memory_allocation`, tested without a GPU). It reads counters
+  kept where allocations are made and freed
+  (`VulkanBackend::memory_allocations_bound`): exact for the backend's own
+  allocations and gpu-allocator's dedicated ones, an upper bound for its shared
+  blocks (one per live pooled allocation, plus one emptied block per memory
+  type); only when that bound reaches the limit does it walk gpu-allocator's
+  report for the exact count. P2P exports and imports (`p2p.rs`) are not
+  counted. Best-effort near the limit: the check and the allocation are not
+  atomic, and only KV allocations are admitted this way, so any other class past
+  the limit fails inside the driver. Where it fires: at serve startup for
+  `--parallel`; on a request for a session-pool fork (`SlotPool::pick`, which
+  then recycles the LRU slot) and for a slot's first recurrent snapshot (the
+  decode loop carries on, the MTP path fails the request, as for any refused
+  snapshot). No up-front check that a configuration fits the count before the
+  weights load; never exercised against a real 4096 limit.
+- **To measure on Windows:** a session-pool fork during a request
+  (`SlotPool::pick`) now makes one `vkAllocateMemory` per KV buffer of the new
+  slot (bounded by `INFR_KV_SLOTS`; each already did a one-shot submit for its
+  zero-fill). Not timed anywhere; the cost of an allocation on a WDDM driver is
+  the question.
+- **Wrappers that report no rounding make no budget decision with it.** The
+  multi-device wrappers (`PipelineBackend`, `TensorParallelBackend`,
+  `ExpertParallelBackend`) forward neither `kv_row_align` nor `kv_alloc_cost`.
+  None of them implements `Backend::device_alloc_room` either, whose default is
+  `None`: `reclamp_ctx_to_live_room` then returns the context at once, and the
+  runner's post-load `refuse_unallocatable_kv` returns `Ok` without calling its
+  fit closure (`kv_guarded_bytes` is `None` without a room). So through those
+  wrappers only the `KV cache allocated` debug line uses the default cost; no
+  budget decision does. Read in code. Metal keeps the default
+  (`KvAllocCost::IDENTITY`); what a Metal shared buffer commits was not checked.
+- **A split model and KV allocations past two per layer.**
+  `PipelineBackend::next_kv_device` places `KvCache` allocations by pair index
+  and, on more than one device, refuses any past `2 x n_layer`
+  (`kv_past_the_last_layer_is_refused_across_devices`). Neither a recurrent
+  snapshot nor a V4 compressed buffer reaches it today: `dense_multi_gpu_guard`
+  refuses recurrent-state and MoE models (V4 is MoE) under `INFR_PIPELINE` and
+  `INFR_TENSOR_PARALLEL` before anything is allocated. If those guards were
+  lifted, V4's cold init would fail on its first compressed buffer
+  (`alloc_dsv4_comp_bufs` runs after the pair loop), and a snapshot would be
+  refused on first use: the decode loop carries on without it, MTP fails the
+  request. Read in code, not run.
+- **Coverage of the clamped runs.** `clamped_default_ctx_allocates_its_estimate`
+  and `clamped_kv_opens_no_pooled_block` run Qwen3-0.6B and Qwen3.5-0.8B on the
+  integrated GPU only. No qwen35moe file is cached, so its expert budget was not
+  run. gemma-4-31B's documented context (B8) was measured with the 64 rows and
+  not re-measured.
+- The MTP head's own K and V cache stays outside the fit (B191).
+
+### B-GUARD-POOLED — what the pooled-block charge left (2026-11-24)
+
+**Tag:** vram guard · vram fit · **Blocked on:** nothing
+
+`VulkanBackend::check_vram_commit` charges a device-local allocation what it
+commits (`pool::Commit`): an allocation of its own its size, a pooled buffer
+nothing when it fits the free space of an open gpu-allocator block, and the
+whole block when it opens one (checked even below `VRAM_GUARD_MIN_ALLOC`).
+`pool::Pool` holds gpu-allocator and a copy of its shared blocks
+(`pool::PoolLedger`) behind one lock and is the only way to reach gpu-allocator;
+the guard's check runs under that lock, before the allocation it admits. Left:
+
+- **The fit reserves activations in bytes; the estimate's margin is what covers
+  the blocks.** The guard charges a new shared block whole, but the context fit,
+  the post-load re-clamp and placement still hold back `dense_act_reserve_at` in
+  bytes. Measured only on gemma-4-12b Q4_K_M (RX 7900 XTX, RADV) plus the small
+  `vram_limit_tests` models: activations peaked at 153 MB with a 128-row chunk
+  and 1.12 GB with a 1024-row chunk, against reserves of 0.38 to 2.77 GB.
+  `auto_ctx_prefills_full_chunks_on_a_large_model` with the reserve scaled down
+  (a throwaway edit): the 1024-row chunk ran at 30 % of the reserve and was
+  first refused by the guard at 20 % (10 500 MiB of room); the default chunk ran
+  at every factor down to 10 %. So the estimate carries at least about 3.3 times
+  what the 1024-row prefill needed there. Not measured on any other model,
+  driver or GPU.
+- **Considered and declined: pricing the reserve in whole blocks.** Built and
+  measured 2026-11-24 (`Backend::activation_block`, the reserve rounded up to
+  whole gpu-allocator blocks plus one) and taken out: no run with the reserve in
+  bytes failed under the new guard, and the block pricing cost context that
+  worked. RX 7900 XTX, auto context, HEAD against blocks: Qwen3-0.6B with 1150
+  to 1536 MiB of room 1 637 to 4 400 tokens against refused, 2600 MiB 14 090
+  against 9 746; Qwen3.5-0.8B 1280 to 1700 MiB 1 280 to 29 696 against refused,
+  3200 MiB 132 096 against 104 980; gemma-4-12b under `INFR_VRAM_LIMIT` 10 500
+  MiB 32 000 against 14 080. **What would reopen it:** a guard refusal during
+  prefill or decode on a context the fit admitted.
+- **No live budget, no change.** Without `VK_EXT_memory_budget` every request is
+  still charged its size against `device_used`, which counts each
+  sub-allocation's size and never a block's free tail, so there the guard
+  under-counts blocks. Making it count blocks whole needs a decision on the
+  unified-memory spill (`device_local_room` reads it too) and a device without
+  the extension to test on; none here lacks it.
+- **Coupled to gpu-allocator's internals.** The ledger copies its block sizes
+  (`AllocationSizes::default`, which `Allocator::new` uses whatever it is
+  given), its memory type choice per location, its free-list placement and its
+  keep-the-last-block rule. `the_mirror_is_of_the_resolved_gpu_allocator` fails
+  without a GPU when Cargo.lock resolves another version than
+  `pool::MIRRORED_GPU_ALLOCATOR`; `ledger_matches_gpu_allocators_blocks` and
+  `predicted_commits_are_what_gpu_allocator_opens` compare the copy with
+  gpu-allocator's report on a device. A `CpuToGpu` request that fails in its
+  preferred type and is retried in another is not foreseen (only host-visible
+  types, which the guard does not check). A mismatch found at run time
+  (`PoolLedger::lose`) logs once and charges every pooled request a whole block
+  from then on.
+- **The unified-memory spill still diverts a buffer that fits an open block.**
+  `make_buf_ex` spills any `GpuOnly` buffer to the overflow heap once
+  `device_local_room` is short of its size plus a margin, block room or not; it
+  is charged its size there (the spill is decided before the guard).
+- **Cost.** Each pooled allocation and free updates the ledger under the pool's
+  lock. Release build, in-process, 2000 allocate-and-free cycles with 300 pooled
+  buffers live, medians of 7 rounds over 3 alternated runs, load average 4.05
+  (from the builds just before; the CPU was otherwise idle): a 256 KiB buffer
+  284 to 292 ns on HEAD and 451 to 458 ns now on the RX 7900 XTX, 410 to 469
+  against 576 to 595 on the integrated GPU; a 2 MiB buffer (one the guard
+  checks), which no longer queries the driver's budget when it lands in an open
+  block, 535 to 559 against 444 to 450, and 574 to 595 against 576 to 580.
+  Decode and prefill do not move: `infr bench` on Qwen3.5-0.8B Q4_K_M, RX 7900
+  XTX, 6 rounds alternating which build ran first, load average 1.92 to 2.17:
+  decode (`-p 0 -n 128`) median 452.26 tok/s on HEAD (450.78 to 453.33) and
+  452.52 now (451.44 to 452.95); prefill (`-p 512 -n 0`) 23 449 (22 642 to
+  24 134) and 24 048 (22 365 to 24 702). Measured with the block pricing still
+  in the fit, which no allocation path read.
+- **The large-model run is discrete only in the gate.**
+  `auto_ctx_prefills_full_chunks_on_a_large_model` (gemma-4-12b, skipped when it
+  is not cached) skips on an integrated GPU: the integrated GPU here took 430 s
+  for it (passing). It runs four rooms at the default chunk and at a pinned
+  1024-row chunk.
+- **`PoolLedger::lose` is sticky.** After one mismatch between the ledger and
+  what gpu-allocator did, every pooled `GpuOnly` request is charged a whole
+  block until the process restarts, so a run within one block of its budget
+  would have every scratch allocation refused. Safe (it never admits more than
+  the device commits); no trigger is known and there is no path to resynchronise
+  from gpu-allocator's report.
+- **`a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard` on a
+  unified-memory device.** Where the device-local heap's room is under the
+  request plus `UMA_SPILL_MARGIN`, `make_buf_ex` spills the probe buffer to the
+  overflow heap, charged its own size, and the test's expected refusal would not
+  come. Not observed on the integrated GPU here.
+- **Without a live budget the ledger is kept but never read.**
+  `PoolLedger::commit` returns the request's size when `live` is false, and
+  `Pool::allocate`'s `live` argument always receives `has_mem_budget`, which
+  could live inside `Pool`.
+- **Not checked: that RADV's reported heap usage counts a shared block in full
+  from the moment it is allocated,** which the whole-block charge relies on. The
+  guard tests pass on RADV, which is indirect evidence only.
+- **The driver's reported usage lags this process's frees.** Measured on the RX
+  7900 XTX: the first reading after gemma-4-12b's session was dropped was 4 456
+  771 584 bytes, and it settled at 1 832 218 624 half a second later. A
+  `vram_limit_tests` limit built on the first reading left the next test
+  gigabytes of extra room (the 2026-11-24 flake in
+  `clamped_default_ctx_allocates_its_estimate`, and, inferred from the same
+  mechanism rather than observed, a streaming-floor error in
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused` after its probe
+  backend was dropped); the module's `settled_use` now waits for the figure to
+  settle, and every session's limit is built on a reading taken just before it,
+  through one reader backend the test process never drops. Separately, other
+  processes on the shared GPU moved the reading by 60 to 77 MB within one
+  `auto_ctx_before_the_load_is_the_ctx_after_it` run (observed twice on the RX
+  7900 XTX, 2026-11-24), past `AGREEMENT_SLACK`; that test now runs such a room
+  once more and fails only if it fails again. Anything in the product that reads
+  the room right after freeing a large session (a serve that swaps models) sees
+  the same lag; not investigated.
+- Not run on Windows, Metal (which has no gpu-allocator) or any driver other
+  than RADV.
+
+### B-PRELOAD-CLAMP — what the pre-load fit still cannot price (2026-11-24)
+
+**Tag:** vram fit · **Blocked on:** a decision (the staging term)
+
+On Vulkan the fit before the load (`SeamModel::preload_held`) holds back what
+the post-load re-clamp (`seam::reclamp_ctx_to_live_room`) will measure: the
+weights as the resident arena commits them at the least
+(`seam::weight_arena_floor` over `seam::weight_upload_units`, the arena's
+geometry from `VulkanBackend::weight_load_cost`), the upload staging ring still
+allocated when the re-clamp reads the room, and `POST_KV_DEVICE_RESERVE`. The
+re-clamp never keeps less than `min(MIN_SESSION_CTX, window)`: below it, it
+retries q8_0 where the auto-q8 policy allows, spills at it under `kv.overflow`,
+and otherwise refuses (`seam::post_load_ctx`). Left:
+
+- **The staging ring is priced at its size, and the integrated GPU charges less
+  of it.** Measured there without a limit: the weight load took 517 881 856
+  bytes for Qwen3-0.6B Q4_K_M and 665 952 256 for Qwen3.5-0.8B Q4_K_M, which is
+  the arena floor (396 061 696 and 544 133 120) plus 121 820 160 and 121
+  819 136. The arena opens exactly the blocks the floor counts on both models
+  and both GPUs (`arena_commits_its_floor_for_a_model`, which counts blocks;
+  their sizes follow from the placement rule, not a device read), so the rest is
+  the ring, charged about 12.4 MB below its 134 217 728 bytes. Why was not
+  found; the same device also charged a fresh 64 MiB weight block at 54 411 264
+  in a throwaway probe after the backend had freed memory, which suggests the
+  budget reuses freed pages, unverified. Since the re-clamp only shrinks, every
+  room where the clamp binds serves that much less context there than before:
+  108 tokens on Qwen3-0.6B and 780 to 816 on Qwen3.5-0.8B in
+  `auto_ctx_before_the_load_is_the_ctx_after_it`'s sweep. The RX 7900 XTX
+  charges the ring in full: its load took 300 032 (Qwen3-0.6B) and 299 008
+  (Qwen3.5-0.8B) bytes MORE than the floor and the ring, which the re-clamp
+  takes back as 0 to 24 tokens. Options: (a) keep it (safe, the loss above); (b)
+  allocate the ring when the backend opens, so both readings include it (128 MiB
+  held by sessions that never load, and an infr-vulkan change); (c) let the
+  re-clamp raise an auto-sized window back toward the window the pre-load clamp
+  cut from (the runner would need that bound, and placement and the chunk pin
+  were decided at the smaller window).
+- **Releasing the staging ring before the post-load check would return nothing
+  measurable.** The ring is drained when the weight-load scope ends, after the
+  KV allocation, so the re-clamp sees it allocated. Draining it first would help
+  only on a device that gives freed memory back to its budget at once. Measured
+  2026-11-24 with a throwaway probe (one weight block, one staged upload to
+  create the ring, then the drain): the ring took 134 463 488 bytes of
+  `alloc_room` on both the integrated GPU and the RX 7900 XTX, and the drain
+  returned 0 on both, read straight after it. Whether the room comes back later
+  was not measured.
+- **Not priced, and not knowable before the load:** tails first-fit strands past
+  the floor (none on the two cached models; gemma-4-31B's 2.20% tails were
+  measured before the floor existed, and how much of them it covers was not),
+  the driver's own memory during the load (the 0.3 MB above on the RX 7900 XTX,
+  none on the integrated GPU), and memory another process takes meanwhile. Each
+  makes the pre-load window larger than the re-clamp's, which cuts it as before.
+- **More memory can give fewer tokens.** The default ladder's policy pins q8_0
+  only for a full rescue or for the minimum, so a room where f16 holds the
+  minimum gets f16 at fewer tokens than a slightly smaller room that fell to
+  q8_0: Qwen3-0.6B on the integrated GPU ran 1 641 tokens in q8_0 at 1150 MiB of
+  room and 1 330 in f16 at 1200. A visible consequence of the policy (f16's
+  faster decode over a larger window), not a defect in the fit.
+- **An explicit window can still load and be refused** (medium: the refusal is
+  clean and names the sizes, after a full weight load). `refuse_explicit_ctx`
+  checks the cache's floor against `alloc_room` alone, and `vulkan_moe_binder`'s
+  dense residency and streaming budgets price the weights at `weight_footprint`
+  and hold no reserve, so an explicit f16 window between the fit and what the
+  footprint leaves is placed resident and refused after the weights by
+  `refuse_unallocatable_kv` (B12's test). Options: the binder prices
+  `preload_held`'s weights and staging, so such a window streams or takes q8_0
+  instead; or `refuse_explicit_ctx` folds the weights in for a model placement
+  keeps resident. Not done: the same budgets size the streaming and MoE tiers.
+- **MoE: the minimum applies after the load, the pre-load fit is unchanged.**
+  The re-clamp's minimum and refusal reach an MoE session (its q8_0 retry does
+  not: `may_auto_q8` excludes MoE), but the MoE pre-load fit still prices the
+  bare footprint and holds back `max(total / 12, 1 GiB)` in place of the
+  reserve, staging and floor, which was not measured against them (no MoE run).
+- **Not verified:** Windows drivers, Metal (no `device_alloc_room`, unchanged),
+  the multi-device wrappers (they never call the pre-load fit, read in code),
+  and `infr serve --parallel N`, whose per-slot window is now divided from the
+  priced fit (not run).
+
+Also from the VRAM limit slice, not done: `infr serve`'s `/status` reports the
+limited `VramInfo` totals without saying they are limited
+(`infr_server::DeviceMemory` has no field for it); `infr tune show` prints no
+memory figure, so only its startup log line names the limit.
 
 ### B14 — verification gaps from the 2026-08-02 decode-attention and KV-fit slices
 
@@ -484,7 +937,7 @@ time or hardware, not difficulty.
   re-clamp) refuses to RAISE a height for the same reason, and is equally
   unmeasured there.
 - **The tightened placement budgets were only exercised on their RESIDENT
-  branch** (the 2026-08-02 B11 slice). gemma-4-31B, gemma-3-12b and
+  branch** (the 2026-08-02 placement-budget slice). gemma-4-31B, gemma-3-12b and
   Qwen3-30B-A3B all stay resident on this box, so `dense_stream_budget_at` and
   `moe_expert_budget`'s `None` arm (dense weights + KV past the ceiling — the
   hard error) were verified only by unit test, never by a run that actually
@@ -677,9 +1130,32 @@ operation infr itself performs.
 - `serve` checks per REQUEST, so a change landing mid-request is caught by the
   next one, after that response has already streamed. Post-checking would not
   un-send it.
-- `WeightWatch::open` is a second `open` beside `Gguf::open`, so a rename
-  landing exactly between them leaves the watch on the new inode and the mapping
-  on the old — a missed detection, never a false one, two syscalls wide.
+- **The CLI's watches are still a second open of the model.** Since 2026-11-25
+  `WeightWatch::for_model(&Gguf)` watches a loaded model's own descriptors
+  against the stamps `Gguf::open` took before mapping (`Gguf::shard_handles`),
+  and the pager's reader is built from the same handles
+  (`FileBlockIo::from_handles`). But every `infr-cli` caller (`run_chat`,
+  `SeamGenerator`, `ParallelGenerator`, the bench arms) still calls
+  `WeightWatch::open_model(path)`, which maps the model a second time, because
+  the model's own `Gguf` lives inside `SeamModel` (and the DiffusionGemma, Metal
+  and `ParallelSeam` paths) and none of them hands it out. So a rename landing
+  between the CLI's watch and the model's load leaves the two on different
+  inodes — a missed detection, never a false one. Closing it means exposing a
+  `WeightWatch` built from the loaded model (e.g. a `SeamModel` method) and
+  threading it through each of those paths in `infr-cli`.
+- **The Windows side of the shared descriptors has only run in CI.** Every
+  reader handle is `infr_plat::fileio::reopen_for_reads` of the mapped
+  descriptor (`ReOpenFile` on Windows, a file object of its own per handle).
+  Compiled here for `x86_64-pc-windows-msvc`; whether a rename over a mapped or
+  open file is refused or allowed there, and whether NTFS shows another handle a
+  writer's mtime change before that writer closes its handle, are both unknown
+  until the CI Windows job runs the tests (which accept either rename outcome).
+- **mtime resolution is coarser than it looks.** In the 2026-11-25 red runs a
+  file written, renamed over the original and stamped within a few milliseconds
+  on this box's filesystem carried the SAME mtime as the file it replaced, so a
+  same-length in-place rewrite landing in the load's own timer tick is invisible
+  to every stamp check here, not only one whose mtime was restored on purpose.
+  The tests move the mtime explicitly for that reason.
 
 **Considered and rejected: copying the file into an anonymous mapping.** PR #90
 did exactly that and it works, but it is not affordable. Measured on a 16 GiB
@@ -810,14 +1286,28 @@ rediscovered:
   exposed than the CPU one — `DensePagerSession::stage` drops its pin before
   returning, so its floor is one slot per pool regardless of N — while the CPU
   interpreter holds a whole op's pins across the op.
-- **The per-pass file-change check is not wired — needs a decision.**
-  `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet
-  (read), so a model rewritten mid-generation is read as whatever the new bytes
-  are (the same exposure as B30, now reachable through explicit reads rather
-  than the mapping). Options: check once per forward pass, once per request, or
-  at each `HostPager::pin`; and on a mismatch either fail the request or reload.
-  Each costs one `fstat` per check; which granularity is worth it is the
-  decision.
+- **The per-read file check (2026-11-25): what it costs and what it leaves.**
+  `FileBlockIo::read_block` re-stats every shard a block touched, after the
+  read, and fails it by name on a changed length or mtime. The small blocks that
+  matter are experts: `Pageable::class` (`infr-cpu/src/paged.rs`) applies
+  `MIN_PAGED_BYTES` to a whole expert bank and then cuts it per expert, so
+  expert blocks of a few hundred KiB are normal. Measured on this box (Linux,
+  warm page cache, so each read is a memcpy and the check's share is the largest
+  it gets), Qwen3-0.6B-Q4_K_M cut into equal blocks, 40 passes with the check on
+  and off interleaved in one process, three runs at load average 1.2-1.6:
+  `FileStamp::of` alone 96 ns; per block, 64 KiB +4.6% to +4.9% (about 100 ns on
+  2.1-2.2 µs), 256 KiB +0.65% to +1.24% (about 60-110 ns on 8.6-8.7 µs), 1 MiB
+  +0.02% to +0.50%. So at a realistic expert size the cost is about 1% of a
+  page-cache hit and less against a read that goes to disk. A cheaper form (stat
+  once per request or per forward pass) was not built; it would give up catching
+  a change between two reads of the same request. Windows' `metadata()`
+  (`GetFileInformationByHandle`) was not measured. What it leaves: a block
+  already resident in the DRAM arena before the change keeps being served (it
+  holds the bytes the model loaded, so it is consistent, not wrong); nothing
+  reloads, so every later request fails until a restart; and the failure has
+  only been driven by unit tests, never through `infr serve` or a paged run. A
+  failing `fstat` after a read is reported with the path and the read's own
+  error, but no test drives that path.
 
 ### B36 — paging optimizations found by review, measured but not built
 
@@ -1042,7 +1532,8 @@ confidence or the loader does not go through `wload`:
   head-major layout), and the V3.2 lightning indexer.
 - qwen35 DeltaNet tensors, the dual-FFN router / banks / extra norms, E2B
   per-layer embedding tensors, DiffusionGemma's self-conditioning MLP.
-- A KV-sharing layer's `attn_k` / `attn_v` (loaded, never read).
+- A KV-sharing layer's `attn_k` / `attn_v` (loaded when the file ships them,
+  never read).
 - `token_embd` when only the host embedding path reads it (CPU backend, untied
   `output.weight`): that path does not call `check_weight_shape`, so a wrong
   `ne0` is read at the wrong stride. Applies to every arch, not only V4.
@@ -1050,6 +1541,39 @@ confidence or the loader does not go through `wload`:
 - V4's `ffn_gate_tid2eid` is checked, but by `generate_dense_backend`'s own
   vocabulary check rather than by `wshape.rs`.
 - A LEADING size-1 dim is not ignored; no GGUF writer is known to emit one.
+
+### B-G4-SHARED-KV — what the optional shared-layer K/V slice did NOT verify (2026-11-25)
+
+`session_stable` now loads a gemma4 KV-sharing layer's `attn_k` / `attn_k_norm`
+only when the file ships them (`SessionStable::has_wk` / `has_k_norm`; `attn_v`
+was already presence-gated by `has_wv`), and `AttnW::wk` is an `Option`.
+Verified: `tests/synthetic_gemma4.rs` (CPU, plus Vulkan on both local devices),
+and unsloth `gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf` against `llama-debug` logits on
+a 10-token prompt (CPU and Vulkan, 5/5 top-5, same argmax). Not verified:
+
+- Metal: runs only in CI, and no CI test loads a file with stripped shared
+  layers on Metal.
+- Tensor parallelism and pipeline split on such a file (never run; both key
+  weights by name, so a missing tensor should simply not appear).
+  `dense_multi_gpu_guard` refuses every file with per-layer embeddings, so the
+  real E2B and E4B files cannot reach either path; only a gemma4 file that
+  shares KV without per-layer embeddings could.
+- Depth: the real-file oracle prompt is shorter than the 512-token window, so
+  the shared window layers reading past it was not exercised on the real file
+  (the synthetic test does exercise it, with a 4-token window).
+- Greedy text against `llama-cli`: the local `llama-cli` build ignored `-no-cnv`
+  and ran a chat turn, so only the logits oracle was compared.
+- `Config::kv_src_layer` is llama.cpp's reuse rule as written (the lambda next
+  to `n_layer_kv_from_start` in `llama-model.cpp`), assumption included: the
+  last own-KV layer is full attention and the one before it sliding-window. That
+  holds for E2B and E4B. Neither implementation checks the source layer's window
+  type or head width against the sharing layer; whether infr validates that
+  anywhere else was not checked.
+- Found by the review, older than this slice and not fixed: `has_wv` in
+  `session_stable` is gated by the tensor's presence on every architecture, so a
+  file of any family missing `attn_v` would run with V = K where only gemma4
+  defines that. Read in code; whether another per-architecture tensor check
+  refuses such a file first was not checked.
 
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 
@@ -1111,10 +1635,10 @@ equal to HF's `lfs.oid`. Not covered:
   sidecar; the per-chunk `If-Range` has never been seen to reject anything,
   because the CDN answered all 2 404 chunk requests `206`.
 - **A connection freed mid-chunk.** A range worker only tries to grow the
-  fan-out between chunks (`ranged::worker`), so a download already inside its
-  last chunk cannot pick up a permit another file just released. Bounded by one
-  chunk time (64 MiB, seconds), and not worth a wake-up mechanism until
-  something measures it.
+  fan-out between chunks (`ranged::grow`), so a download already inside its last
+  chunk cannot pick up a permit another file just released. Bounded by one chunk
+  time (64 MiB, seconds), and not worth a wake-up mechanism until something
+  measures it.
 - **An `ETag` that differs between CDN edges.** If one ever did, `If-Range`
   would make that chunk come back `200` and the file would restart as a single
   stream — correct, but slow, and nothing would say why beyond one `warn!`.
@@ -1143,6 +1667,92 @@ equal to HF's `lfs.oid`. Not covered:
 - **The progress block was read, not eyeballed.** One bar per file is what the
   code does (chunk workers all `inc` the same bar); the real pull ran with
   stderr redirected to a file, where bars are hidden.
+
+### B-FANOUT — what the download fan-out slice left (2026-11-25)
+
+**Tag:** B-DECISIONS-2026-11-25 item 1 · **Blocked on:** nothing; findings and
+gaps
+
+What shipped: every file of more than one chunk is fetched as ranges when the
+server serves them, even with nothing spare at its start (`fetch_ranged`), and
+files starting together divide the spare permits by `Claim::take_share`
+(`ceil(spare / files still starting)`, the claims registered in `fetch_all`
+before any file takes its share; growth through `ConnBudget::try_grow` is held
+off while a file is still starting). A ranged worker alone on its file asks for
+every missing cell up to the next landed one in one request (`ranged::span_end`)
+and abandons that request at the boundary where a new worker took the next cell.
+
+Real pull, `Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M` (two shards, 3.993 + 0.690
+GB), anonymous, cold cache, A = `f3cfa973`, B = this slice, alternated, load
+average under 4.2 throughout:
+
+- `hub.pull_jobs = 8`: A 58.3 / 59.3 s, B 59.0 / 64.4 s. Starting fan-outs: A
+  seven connections for the small shard and one for the big, B four each. A tie:
+  the link is the cap (about 80 MB/s, as B58/B59 found).
+- `hub.pull_jobs = 2`: A 62.3 / 91.2 s, B 64.5 / 62.7 / 64.2 s (the third B run
+  only verified the bound). A's big shard finishes on its one stream; B's takes
+  the small shard's connection when it finishes (socket sampling: one receiving
+  socket for most of A's run, two for B's tail; never more than two sockets
+  receiving at body rate, 114 of 125 samples at two). The gain depends on how
+  fast one connection happens to be: one connection ran at 44 to 64 MB/s in A's
+  tails, where `HubCfg::pull_jobs`'s doc still quotes 8.8 MB/s from 2026-08.
+
+Left open:
+
+- **Growth is greedy, not per-file fair.** When a file finishes, its permits go
+  to whichever surviving worker reaches a chunk boundary first, one permit per
+  worker per boundary, so two survivors can end up unequal. The fair split is
+  only at the start. Not required by the decision; a lever if it is ever seen to
+  matter.
+- **A starting file holds off everyone's growth while it starts.** From its
+  claim to its share it is the LFS `HEAD` (retried up to `HEAD_ATTEMPTS`), the
+  blob lock and the probe `HEAD`. Bounded by the metadata timeouts; a contended
+  lock stands the claim aside first, because another process can hold it for a
+  whole download. A late claim can still lose a permit to a growth that checked
+  just before it registered (documented on `try_grow`).
+- **A file that will not split still counts as starting until it stands aside.**
+  A one-chunk object, a range-refusing server or (only when it is found late) a
+  stream partial shrinks the first share of every file starting alongside it,
+  until growth at their chunk boundaries takes the difference back. A stream
+  partial on disk is now seen before any network call (`fetch_and_link` stands
+  its claim aside first), so in practice it no longer costs anything — but that
+  is a race between one thread start and the other files' `HEAD`s, not a
+  guarantee. The other two need a round trip to know (the LFS `HEAD` for the
+  size, the probe for ranges) and are left.
+- **What a file on one connection still pays over a stream:** one probe `HEAD`
+  (the LFS `HEAD` plus the probe took about 0.75 s together in the B logs), and
+  an `fdatasync` plus a sidecar rewrite per 64 MiB chunk. A 64 MiB `fdatasync`ed
+  write took 35–40 ms here against about 35 ms unsynced. On one connection the
+  0.69 GB shard took 14.9 / 15.6 s as a stream and 16.1 / 26.1 / 16.0 s ranged,
+  while sharing the link with the other shard, so the overhead is not isolated.
+  The lever, if it shows: sync every few chunks on the span path, at the cost of
+  re-fetching those chunks after a crash.
+- **Abandoning a span costs a connection.** When a lone worker grows, it drops
+  its request mid-body at the next boundary: one new TLS connection, and
+  whatever was in flight for the cell another worker now owns. Once per growth
+  from one worker, not per chunk. The same happens when a server answers a range
+  short (`fetch_chunk_once` keeps the whole cells and drops the rest).
+- **A dropped request's socket can outlive the next request's start.** After a
+  span is abandoned, or a reply too short for one cell is dropped, the next
+  request can start a moment before the old socket is gone. Permits are never
+  exceeded — the permit is the worker's, not the socket's — but the test hub
+  cannot show either way: it stops counting a body before writing it, so a
+  socket dropped mid-body is invisible to `peak_concurrent_bodies`, while one
+  dropped on its headers is still counted through `BODY_DELAY` and reads as an
+  extra body (which is why
+  `a_server_that_caps_range_length_still_assembles_the_file` asserts no peak for
+  its below-one-chunk case).
+- **`hub.pull_jobs` 0 or 1 with a ranged partial on disk** (left by a run at a
+  higher setting) still finishes it as ranges, one request per run of missing
+  cells, as before this slice. Streaming it instead would throw the partial
+  away. The "one request per file" promise is for a fresh download.
+- **A one-chunk LFS object no longer probes** (`obj.size` is the hub's LFS size,
+  which the probe is checked against anyway). A non-LFS file of one chunk still
+  pays the probe.
+- **Not verified:** a real server that refuses ranges (local origin only); a
+  repo with more shards than connections beyond two (the 236-shard case);
+  Windows, including `cargo clippy` for `infr-hub`, which cannot build on this
+  Linux host (a C dependency needs `lib.exe`).
 
 ### B60 — three CPU-vs-Vulkan tests still pass or fail on a whole-vocab logit cosine (2026-08-11)
 
@@ -1188,7 +1798,7 @@ Still on a flat or tiled grid, each needing real shader rework:
 
 | Sites                                                                                                                      | Grid                                                        | Overflows when                                                                 |
 | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM, mmq q4k / q6k / `mmq_at`, `fma_at`                  | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
+| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM                                                      | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
 | i8cm (three variants)                                                                                                      | ⌈m/128⌉·(n/16)                                              | m = 1,024 with n > 131,070                                                     |
 | f8cm (two variants), bf16cm                                                                                                | tiles                                                       | not computed                                                                   |
 | `attention_kv_split_impl`                                                                                                  | rows·nh·4, shared memory                                    | rows·nh > 16,383 (small-m decode path)                                         |
@@ -1772,10 +2382,11 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
 - **`cpu_committed_bytes` prices the KV cache at f16**, the CPU default; a
   user-named f32 KV is under-priced. It goes through `kv_bytes_estimate`, the
   function the GPU fit uses, so V4's compressed caches are priced at what the
-  session allocates for them (`dsv4_comp_bytes`), and the raw cache is priced at
-  the whole context without the sliding-window ring the CPU uses, which
-  over-prices it (conservative). The 1 GiB activation reserve is a reserve, not
-  a measurement per model.
+  session allocates for them (`dsv4_comp_allocs`, each buffer
+  `Dsv4CompBuf::bytes`), and the raw cache is priced at the whole context
+  without the sliding-window ring the CPU uses, which over-prices it
+  (conservative). The 1 GiB activation reserve is a reserve, not a measurement
+  per model.
 - **A V4 prompt of several chunks now prefills layer-major and reads each routed
   expert once (2026-11-17); what that left.** `docs/deepseek.md` § "Layer-major
   prefill on the CPU" has the design, the tests and the runs. On the real file a
@@ -2069,12 +2680,13 @@ actually has such limits. What is left:
   256-thread build, so such a device is refused at the first norm. Vulkan only
   guarantees 128; desktop drivers report 1024 or more. A 128-thread twin would
   close it if such a device ever matters.
-- **`maxComputeWorkGroupCount[0]`** is not read: `Recorder::MAX_GROUP_COUNT_X`
-  stays at the spec minimum, so every dispatch wider than that takes the 2-D
-  split (`dispatch_wide`) even on RDNA3, whose limit is far higher. Correct
-  everywhere; whether the split costs anything measurable has never been
-  profiled, and that measurement is the blocker. The flat grids that do not go
-  through `dispatch_wide` at all are B65.
+- **`maxComputeWorkGroupCount[0]`** is read (`KernelLimits::workgroup_count_x`)
+  only by the batched-MoE expert GEMMs' refusal (B-EXPERT-GRID-Z):
+  `Recorder::MAX_GROUP_COUNT_X` stays at the spec minimum for `dispatch_wide`,
+  so every dispatch wider than that takes the 2-D split (`dispatch_wide`) even
+  on RDNA3, whose limit is far higher. Correct everywhere; whether the split
+  costs anything measurable has never been profiled, and that measurement is the
+  blocker. The flat grids that do not go through `dispatch_wide` at all are B65.
 - **`minStorageBufferOffsetAlignment`** is not queried: 256, the spec's maximum
   for it, is used everywhere (`BDA_WEIGHT_ALIGN`, `vkb`'s ranges). Correct on
   every device; the over-alignment's cost is unmeasured.
@@ -2713,20 +3325,131 @@ milliseconds against seconds of load. Four more `tensors().iter().find` scans in
 infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
 only after measuring total name-lookup time on a model with about 2000 tensors.
 
-### B62 — KV spill comes before the context clamp when overflow is on (2026-08-12, traced 2026-11-12)
+### B-KV-TIERS — KV cache tiers: disk is planned, remote is not (2026-11-25)
 
-**Tag:** vram · kv · **Needs:** a decision
+**Owner's decision, 2026-11-25** (given in answer to issue 109, "tiered KV
+cache", which asks for KV spill to system RAM and to remote stores such as
+Redis, in the manner of LMCache):
 
-User, 2026-08-12: _"Only spill K/V cache to system ram when absolutely
-necessary."_ The intended ladder is SWA → q8 → clamp → stream → KV-overflow
-last. Traced in `SeamModel::clamp_default_ctx`: auto-q8 is tried before the
-spill, as intended, but with `kv.overflow` on the default window is KEPT and
-spilled instead of clamped — so the clamp does not come before the spill.
-Options: (a) clamp the auto-sized window and spill only for an explicit `--ctx`,
-which matches the instruction; (b) keep today's spill-instead-of-clamp, on the
-reading that turning overflow on is asking for the full window; (c) a separate
-knob. Whichever is chosen wants a test of the order: spilling is invisible in
-output and only shows as throughput.
+- The KV cache is to have the same tiers the weights have: VRAM, system RAM and
+  disk.
+- **VRAM to system RAM is built** for dense models (`kv.overflow`; what it
+  leaves open is B62 below).
+- **The disk tier is planned and not designed.** Nothing in the tree spills or
+  persists KV rows to disk. What a design has to settle: which rows leave RAM
+  first (the oldest positions are read on every token by full attention, so a
+  disk tier is only cheap for rows a sliding window or a compressed tier no
+  longer reads, or for a parked session's whole cache), the block size and the
+  read path back (the weight path's `FileBlockIo` and `HostPager` are the
+  existing pieces to compare against), and how the three placements are priced
+  by one rule, as `kv_spill_split` does for two.
+- **A remote KV cache has no plan.** Not declined: not designed. The questions
+  put to the issue's author: network latency on a path read every token, what a
+  generation does when the store is slow or gone, and how stored state is keyed
+  and invalidated across models, quantizations and KV formats.
+
+The author has an experimental refactor on a fork that unifies the tiers; it was
+not read. Replies on the issue state the above.
+
+### B62 — what the overflow spill still leaves open (2026-11-25)
+
+**Tag:** vram · kv · **Blocked on:** nothing
+
+The spill itself ships: under `kv.overflow` an explicit window no cache format
+fits beside the weights, and the auto-sized minimum when nothing fits, open and
+run with the part of the cache that does not fit in system RAM. One rule says
+how much of a cache goes to device memory (`seam::kv_spill_split` over
+`infr_vulkan::kv_vram_bytes`, the rule the allocation applies buffer by buffer,
+`kv_stays_in_vram`), one figure says what it leaves free
+(`seam::kv_spill_reserve`), and the fit before the load, dense placement's spill
+rung, the re-clamp and the backend (`Backend::set_kv_spill_reserve`) all read
+them. GPU tests in `vram_limit_tests` (`overflow_*`,
+`spilled_kv_gives_the_logits_of_a_resident_one`). Left:
+
+- **The two sides read "explicit" from different places** (read in code, not
+  run). Before the load it is which entry point was called:
+  `SeamModel::vulkan_session_on` and the token-count arm of
+  `SeamModel::vulkan_slot_ctx` go through `fit_explicit_ctx`. After it,
+  `seam::reclamp_ctx_to_live_room` reads `ec.device.ctx.is_some()`. So
+  `vulkan_session(N)` on a model whose config sets no `device.ctx` (tests can do
+  this) is explicit before the load and auto-sized after it: the pre-load side
+  keeps N (`Spill(N)` under `kv.overflow`, `Serve(N)` without it) and the
+  re-clamp cuts it to the fit. That second case predates S3. A percentage
+  context goes through `vulkan_session_frac` (or `vulkan_slot_ctx`'s percentage
+  arm), which has no pre-load ladder, yet the re-clamp takes it as explicit
+  because `device.ctx` is set. The product path (`chat::vulkan`'s
+  `ensure_session`) sets `device.ctx` exactly when it calls the explicit entry
+  point, so it is consistent there.
+  `preload_and_post_load_agree_for_the_same_room` passes the same flag to both
+  sides, so it cannot see this.
+- **The ladder covers single-slot, auto-sized sessions only** (read in code, not
+  run). `vulkan_slot_ctx` with more than one slot, or with a percentage, divides
+  the fit by the slot count and floors it at `MIN_SESSION_CTX` without
+  `preload_ctx`: no q8_0 rung, no refusal, and `kv.overflow` is not read before
+  the load, so a slot opens at the minimum whether or not it fits. An explicit
+  token count with N slots does go through the ladder (`fit_explicit_ctx` with
+  `n_slots`), and under `kv.overflow` the forks spill past the one reserve the
+  backend holds (`overflow_spills_a_second_slot_past_the_reserve`, RX 7900 XTX).
+- **Some refusals come at the first generation, not at session open.** The
+  streaming-floor refusal is before any weight is uploaded (dense placement runs
+  first; `overflow_refuses_what_cannot_stream_before_the_load` checks the room
+  did not move), but the session object opened, so `infr serve` reports it at
+  its warmup or first request. Moving it to the open needs the streaming floor
+  priced before the load: the binder's pool grouping (`vulkan_moe_binder`'s
+  `pools`, `stream_floor`) factored into a function the fit before the load can
+  call. The re-clamp's two spill checks (the measured room under the spill
+  reserve; the spilled part past what the host may give it beside the weights'
+  host tier) come after the weight upload and before any KV buffer: they catch
+  what the pricing before the load cannot see, first-fit tails past
+  `weight_arena_floor` and the driver's own memory, so they cannot move earlier
+  without pricing those.
+- **The host check before the load counts no host tier.** Placement sizes one
+  only for streamed weights, after the fit; it and the re-clamp check the spill
+  again with the tier counted (`host_tier_bytes`). The tier is sized with half
+  of what is free left alone and does not know about the spill, so a streamed
+  spill can be refused where a smaller tier would have let it run; sizing the
+  tier net of the spilled part would fix that.
+- **The streamed spill's window is narrow.** Qwen3-1.7B Q4_K_M, ctx 40960, RX
+  7900 XTX, 2026-11-25: 1800 MiB of room left the arenas short of their floor,
+  1850 and 1900 streamed with the whole cache in system RAM, 1950 kept the
+  weights resident. The test derives its room from the spill rung's own pricing
+  (`spill_resident_room`) and skips, saying so, where no window exists. The
+  reserve's layer-major term is priced at the whole window, which a short prompt
+  never uses.
+- **Forks after startup are not host-checked.** `ParallelSeam::init_slots`
+  checks the forks it makes at boot (`refuse_unhostable_forks`); a fork
+  `SlotPool::pick` makes on demand is not, and a host allocation it cannot get
+  fails the fork, which `pick` already degrades to recycling a slot. The check
+  also counts the diagnostic cap (`kv.overflow_vram_mb`) from the first fork,
+  where the allocation counts what the first slot placed too.
+- **The fork check over-counts a touched host tier.** After the warmup
+  generation part of the weights' host tier is touched and visible to the host
+  probe, and `host_tier_bytes` still counts all of it (doc of
+  `PlacementPins::host_tier_bytes`). Conservative; traced in code, not run.
+- **Spill before stream is unmeasured** (plan 13 S3's departure). Measure decode
+  speed of a resident-weights session with a spilled cache against the same
+  model streaming its weights with the cache resident, at shallow and deep
+  context (for example Qwen3-1.7B at 512 and 32768 tokens of depth, at a room
+  where both are possible), in a quiet window; if streaming wins at depth, the
+  rung should choose by the window.
+- **The spill at the minimum keeps the session's own format.** An auto-sized
+  window below the minimum in both formats spills f16 (`clamp_rung` tries q8_0
+  only for a whole fit), so more of it goes to system RAM than a q8_0 cache
+  would send. Measured 2026-11-25, Qwen3-0.6B at 1188 MiB of room on the RX 7900
+  XTX: 31 MB of the f16 minimum in VRAM, 86 MB in system RAM. Worth deciding
+  together with S3's "more memory can give fewer tokens" (B-PRELOAD-CLAMP).
+- **Multi-device sessions and MoE.** The multi-device wrappers (`tp`, `ep`,
+  `pipeline`) do not forward `set_kv_spill_reserve`, nor `device_alloc_room`, so
+  under `kv.overflow` their KV still fills each device to the guard. MoE
+  placement prices the whole cache in VRAM (`moe_expert_budget`) and has no
+  spill rung; the runner's reserve still applies to an MoE session's cache. Not
+  run on either.
+- **The refusal messages still suggest `INFR_KV_OVERFLOW=1` on a unified-memory
+  device**, where it changes no context decision.
+- **Not measured:** decode or prefill speed with a spilled cache (no hot path
+  changed: the KV read seam was always by device address; a spilled run reads
+  the spilled layers over PCIe), and the integrated GPU's behaviour under a real
+  (not `INFR_VRAM_LIMIT`) memory shortage.
 
 ### B63 — deep-context performance is unmeasured across the whole model matrix (2026-08-12)
 
@@ -2847,11 +3570,9 @@ a hot path
   stopped without measured throughput; full timing coverage is not claimed.
 - **Default-parallel local nextest exceeds available Windows commit capacity.**
   Validation hit allocation failures and `os error 1455` (paging file too
-  small), plus a downloader concurrency-floor failure under contention
-  (`pull::tests::a_finished_file_hands_over_its_connection` failed again on
-  2026-11-13 beside a release build, and passed five times alone). The whole
-  workspace passed with `--test-threads=1`; no assertions or system memory
-  settings were changed. Revisit parallel resource scheduling separately.
+  small). The whole workspace passed with `--test-threads=1`; no assertions or
+  system memory settings were changed. Revisit parallel resource scheduling
+  separately.
 
 ### B76 — the physical-core thread default is Windows-only until Linux is measured (2026-09-23)
 
@@ -3731,7 +4452,7 @@ pool. These were confirmed and left:
   host sampler, and the decode sampler needs a perf check afterwards.
 - **UMA budget drift.** On a unified-memory device without
   `VK_EXT_memory_budget`, spilled bytes are never added to `device_used` while
-  the total counts every heap (`vram_budget_fits`). Both GPUs here expose the
+  the total counts every heap (`budget_snapshot`). Both GPUs here expose the
   extension, so no test can fail here.
 - **The replay guard is silent.** A replay whose bound buffers differ from the
   recording now drops the tape and records again (`execute`) or declines
@@ -3844,21 +4565,12 @@ it. When a qwen35 chain stops early, the next turn restores a snapshot of the
 state taken at the previous turn's prefill boundary and prefills from there
 instead of from zero. Left:
 
-- **The snapshot and the fit ladder — needs a decision.** The snapshot is a
-  second copy of every DeltaNet layer's state, per slot:
-  `4 × ((ssm_d_conv − 1) × q35_conv_channels + q35_num_v_heads × q35_head_k_dim × q35_head_v_dim)`
-  bytes per layer, about 19.3 MiB for Qwen3.5-0.8B. Re-read 2026-11-12: the fit
-  does not count it, but `kv_bytes_estimate_fmt` already prices every DeltaNet
-  layer as a full per-token KV cache, which exceeds live state plus snapshot
-  above roughly 1.1k tokens at f16 — so an auto-sized context leaves room, and
-  adding a snapshot term there would count it twice. The gap is an explicit
-  `--ctx` that fills the device: the snapshot can then be refused, which is
-  handled (one warning, no snapshot on that slot, the next mid-chain turn
-  re-prefills from zero). The real fix is to price DeltaNet layers by
-  `kv_layer_alloc_bytes` plus the snapshot (when a chain or MTP can run), which
-  makes auto-sized qwen35 contexts LARGER — a visible change. Separately, the
-  MTP path's snapshot failure still fails the request (`?`) where the decode
-  loop degrades.
+- **The MTP path's snapshot failure still fails the request** (`?`) where the
+  decode loop degrades: one warning, no snapshot on that slot, and the next
+  mid-chain turn re-prefills from zero. The fit counts the snapshot (B13), so an
+  auto-sized context leaves room for it. The refuse rung does not, since the
+  decode loop survives its refusal, so an explicit `--ctx` that fills the device
+  can still have it refused.
 - **The MTP rollback can leave a half-restored state behind.**
   `mtp_restore_delta` (in `seam/weights.rs`, called from the MTP loop in
   `mtp/mod.rs` after a partial accept) copies the snapshot layer by layer and
@@ -4113,11 +4825,9 @@ the Apple target but were not run.
   Windows leg for the goldens is plan 11's S3.
 - **Tests that skip on an integrated GPU, and pass.** The qwen35 snapshot tests
   in `seam/runner.rs` (`with_q35_vulkan`) skip where `max_decode_chain` is 1,
-  because no chain runs and no snapshot is taken. Four prefill-chunk helper
-  tests in `seam/mod.rs` (`default_chunk_is_discrete`) skip once the process has
-  opened an integrated GPU, because the default chunk they assert follows the
-  process-global device class (see B145). Both print the reason on stderr even
-  without `--nocapture`; a run on the iGPU alone therefore checks neither.
+  because no chain runs and no snapshot is taken. They print the reason on
+  stderr even without `--nocapture`; a run on the iGPU alone therefore does not
+  check them.
 
 ### B141 — assertions weaker than the tests' names (2026-11-11)
 
@@ -4240,19 +4950,68 @@ they cannot show:
 - A kernel refused at build still panics (the kernel cache is infallible until
   B98 threads a `Result` through); only the lock is released first.
 
-### B145 — the device class is process-global, so tests see whichever GPU opened first (2026-11-12)
+### B-EXPERT-GRID-Z — the batched-MoE expert GEMM grid is refused past the x limit, not split (2026-11-25)
 
-`infr_vulkan::device_class()` is published once, by the first `VulkanBackend`
-the process opens, and `seam::default_ubatch_rows` reads it. In a test binary
-run with `--include-ignored` on `INFR_DEV=vulkan1`, the first GPU test opens the
-iGPU and every later test sees the integrated default chunk, including pure unit
-tests that never touch a GPU. Four of them asserted the discrete default and
-failed; they now skip instead (`default_chunk_is_discrete`, B140). The coupling
-itself is left: a test's outcome depends on which device the binary opened
-before it. Options: make the chunk default a parameter the tests pass, or scope
-the device class per backend instead of per process. A design decision about
-`device_class()`'s one production reader, `default_ubatch_rows` (read); not
-attempted.
+Plan 13 S9 split the dense tiled GEMMs without matrix units past the workgroup
+limit (`dispatch_wide`). The batched-MoE expert GEMMs (`matmul_mmq_experts`,
+`matmul_mmq_experts_paged`) put the expert id on `gl_WorkGroupID.y`, so that
+split cannot apply; their x count is refused by name instead, against the limit
+the device reports (`caps::KernelLimits::workgroup_count_x`, read by
+`Recorder::expert_grid_x_or_refuse`; predicate `expert_grid_x`): the dispatch is
+not recorded, the open command buffer is never submitted, and finishing the
+recorder returns the error. Both RADV devices here report 4,294,967,295, so the
+refusal can only fire on a device with a lower limit (Intel ANV reports the
+spec's 65,535). The refusal has run on both GPUs here only against a limit
+played smaller through `TEST_KERNEL_LIMITS`
+(`expert_grid_refusal_follows_the_device_limit`, resident twin only); the paged
+twin shares the check but no test drives it, and no real driver at the limit has
+been seen to refuse.
+
+Arithmetic, not measured: the x count is `ceil(rows/bm) * (n/bn)` with `rows`
+the chunk's token count. At the default chunk (1024 rows) it needs `n` past
+131,008 columns on 32-row tiles (262,080 on 64-row tiles), which no shipped
+expert width approaches. A Llama 4 Scout-shaped expert up projection (`n` =
+8192, `k` = 5120, 16 experts with one used: `bm` = 64 and `bn` = 64 by the tile
+rules in `matmul_mmq_experts`) passes the spec's 65,535 above 32,704 rows, so
+only a user-set `INFR_UBATCH` that large reaches it, and only on such a device.
+
+To lift it: put the extra rows on `.z` (the expert stays on `.y`) in the
+`EXPERT_GRID` arm of every `native_gemm_mmq_*` shader, rebuilding the x tile as
+`gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x`, with a matching 3-D
+split in both recorders; the work splitter's `Split::WideGrid` cuts only a grid
+of under two dimensions, so it would need a rule for this one. Test it as S9's
+`nc_gemm_split_grid_matches_unsplit` does, through `WIDE_SPLIT_AT`.
+
+### B-PINS-CLASS — what moving the device class into the pins left (2026-11-25)
+
+Plan 13 S4 made the default prefill chunk a field of `seam::PlacementPins`, set
+by `PlacementPins::for_caps` from the backend's `Capabilities`, and deleted
+`infr_vulkan::device_class()`. Each Vulkan entry point enters a scope made for
+its backend (`seam::enter_backend_scope`, or a session's own pins). Left:
+
+- **The guards are debug-only, and the runner's is a class match, not a scope
+  check.** `seam::debug_assert_pins_for` (the runner, every one-shot) only
+  compares the pins' default chunk with the backend's class, so a Vulkan
+  one-shot that forgot its scope passes on a discrete GPU, whose chunk is the
+  fallback's; it then writes its placement pins into the process-wide
+  `FALLBACK_PINS`, where the next unscoped call inherits them.
+  `seam::debug_assert_scope_for` (placement, `generate_dense_vulkan_session`,
+  the `SeamModel` fit helpers) requires a scope, but only on Vulkan-only
+  functions. A release build checks neither. Requiring a scope on the CPU and
+  Metal paths too would let the fallback go, at the cost of a scope at every
+  CPU/Metal entry point and test.
+- **One-shots no longer share pins across calls.** An unscoped Vulkan one-shot
+  (`SeamModel::generate_dense_vulkan`, `generate_vulkan_ids`, the verify and
+  forced runs, `greedy_tail_vulkan`, `bench_vulkan`, the MTP driver) used to
+  read and write the process fallback, so a chunk or auto-q8 pinned by one call
+  stuck for every later one in the process; each now gets fresh pins for its own
+  backend. Traced in code, not measured on a model that pins.
+- **Not run on the integrated GPU:** the MTP driver
+  (`generate_mtp_spec_vulkan_timed_on`), `bench_vulkan`, the DiffusionGemma
+  Vulkan session, `forced_run_vulkan` and `greedy_tail_vulkan` were changed but
+  not exercised on Vulkan1 by the runs that verified the slice; the multi-device
+  wrappers (`backend_chunk_scope`) were not changed beyond building their pins
+  with `for_caps`.
 
 ### B146 — Vulkan lowering review, 2026-11-12: what was fixed, refused and left (2026-11-12)
 
@@ -4269,16 +5028,6 @@ recorder dispatches from, `mmv_mrow_variant`); the rmsnorm family and
 `QkNormRope` head dim, `Sample` top-k range, Q8_0 `WriteKv` row width, the `Mla`
 cache dtype). Left:
 
-- **The non-coopmat GEMM (`matmul_mmq_at`, `matmul_fma_at`) refuses a grid past
-  the limit instead of splitting it.** Its mmq builds already use the y
-  dimension for the expert id, so the flat-index trick does not apply. No
-  default shape reaches it (it needs an output width of 262,144 at a 1024-row
-  chunk, and the prefill head runs on the last row only); a user-set
-  `INFR_UBATCH` on a very wide FFN can, on a discrete GPU without cooperative
-  matrices. Options if it matters: fall back to the per-row GEMV tier, or split
-  by m-tile across several dispatches. The guard repeats the recorder's
-  `ceil(m/64) * (n/64)` with its own literals; it should read the tile size from
-  one place.
 - **Refusals for shapes nothing emits today:** `QkNormRope` with both `x_stride`
   and `freq_factors`; a record-once `Rope` or interleaved `QkNormRope` writing K
   into a cache a sliding-window attention reads (those two kernels have no ring
@@ -4303,6 +5052,217 @@ cache dtype). Left:
 - To measure in a quiet window: per-op decode time for `rmsnorm` /
   `rmsnorm_wide` and `deltanet_norm` after the added uniform branch.
 
+### B-ATTN-TEMP — what `Op::AttnTemp` and the MLA magnitude left (2026-11-25)
+
+Plan 13 S5 added `Op::AttnTemp` (CPU, Vulkan `attn_temp.comp`, Metal
+`attn_temp_f32`), emitted on the MLA query for Mistral-Large-3's attention
+temperature (`Config::attn_temp_scale`) once a batch reaches its
+`temperature_length`; applies a DeepSeek MLA model's YaRN magnitude
+(`Config::mla_rope_magnitude`) as an `Op::MulVec` on the MLA query and, on
+deepseek32, the indexer query; and gives deepseek32 the reference's own YaRN
+attention-factor rule (`config::yarn_mscale_ratio`).
+
+- **The Metal kernel has only been compiled for `aarch64-apple-darwin`, never
+  run.** `attn_temp_matches_the_reference_factor` in
+  `infr-metal/tests/parity.rs` runs it in CI's macOS Metal job; the MSL source
+  itself is compiled only at run time on a Mac. Nothing runs a Mistral-Large-3
+  graph on Metal anywhere.
+- **A graph holding `Op::AttnTemp` loses the decode replay** on Vulkan
+  (`decode_refusal`, `NoDynKernel`) and on Metal (`replay_shape`,
+  `static_walk_live_positions`), because the op's position is baked in. Those
+  refusals can never fire for a decode: the record-once plan is built at
+  position 0 with one row, and the runner emits no `Op::AttnTemp` there. So the
+  runner keeps any model with a temperature off the replay plan itself
+  (`replay_plan_covers_every_step`, tested by
+  `a_temperature_keeps_decode_off_the_replay_plan`); the test bypass of
+  `mirror_admits` does not lift it. Mistral-Large-3 lost nothing by it: its
+  decode was already the per-token rebuild (`mirror_admits` excludes every
+  `deepseek2` model, and both backends refuse `Op::Mla`), which bakes each
+  step's position into the op. llama4 is capped before its temperature would
+  emit. A `_dyn` build reading the position from the replay params, as
+  `rope_f16_dyn` does, plus a plan that holds the op from position 0, would be
+  needed once MLA (or llama4's f16 K write) could otherwise replay.
+- **Not done: fold the decode temperature into `Op::Mla`'s scale.** For a
+  single-row decode the factor is one scalar, so past the length it could
+  multiply the MLA score scale instead of running an `Op::AttnTemp` dispatch,
+  saving one dispatch per layer per token. Not measured.
+- **Tensor parallelism refuses `Op::AttnTemp`** through the catch-all arm of
+  `TensorParallelBackend`'s lowering in `infr-vulkan/src/tp.rs`. The op is a
+  per-row scale, so a sharded input only needs its `n` divided by the world. A
+  Mistral-Large-3 run under `INFR_TENSOR_PARALLEL` is refused before any
+  lowering, as it was before this slice, by `dense_multi_gpu_guard` (it is MoE);
+  a dense `deepseek2` file with a temperature (none is known) would now be
+  refused at the `AttnTemp` op where it was refused at `Op::Mla`.
+- **The expert-parallel and pipeline wrappers have not run `Op::AttnTemp`.**
+  Both pass the op through unchanged (read); no test runs a Mistral-Large-3
+  graph through `INFR_EXPERT_PARALLEL` or `INFR_PIPELINE`, though the expert-
+  parallel path is the one a model of its size would take.
+- **The llama.cpp oracle checks the temperature one row at a time only.** The
+  oracle file's f32 expert banks have no batched MoE kernel, so every token
+  there is a one-row graph. A chunk straddling the length is checked against
+  that one-row path instead
+  (`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`, CPU
+  bit-exact; Vulkan at the default chunk too). Quantizing the oracle file's
+  experts to Q8_0 so llama.cpp sees the batched chunk was tried and left: infr's
+  CPU then missed llama.cpp by 2.08e-2 / 1.31e-2 / 7.5e-4 at 16 / 17 / 40 tokens
+  (f32 KV, flash attention off), with the temperature off as far apart at 16
+  tokens, so the gap is the expert activations' int8 rounding (infr's float
+  reference backend was 4.3e-2 to 5.2e-2 away), not the temperature, and too
+  wide to judge a row mapping (the per-head red moved the f32 oracle by 5.9e-3).
+  Measured 2026-11-25.
+- **No real Mistral-Large-3 file has been run.** The temperature is checked
+  against llama.cpp only on the synthetic file
+  (`synthetic_mistral_large3_cpu_matches_llama_cpp`); the real one is about
+  675B.
+- **The synthetic deepseek32 file does not load in llama.cpp** (`030ebb5`), so
+  the deepseek32 YaRN rule is checked against the reference's formula in f64
+  (`synthetic_deepseek32_yarn_rule_matches_the_reference`), not against the
+  engine. With the MLA cache keys added (`attention.head_count_kv` 1,
+  `key_length`, `value_length`) it fails `GGML_ASSERT(ggml_can_mul_mat(a, b))`;
+  with the indexer widened to 64 it fails a view-size assert instead. Not
+  investigated further.
+- **The `deepseek2` rule without a multiplier rounds differently from the
+  reference.** With YaRN and no `yarn_log_multiplier`, `llama-context.cpp` sets
+  `yarn_attn_factor = get_mscale(f, 1) · (1 / (1 + 0.1·ln f))`, which infr's MLA
+  score scale takes as exactly 1 (and the rope magnitude as `get_mscale(f, 1)`):
+  equal for `f ≥ 1` up to the rounding of that product, but for a YaRN factor
+  below 1 the reference's factor is `1 / (1 + 0.1·ln f)` and infr's is 1. Read,
+  not run; no file declares YaRN without a multiplier or with a factor below 1.
+- **llama.cpp's CPU flash-attention path rounds the query to f16**, which put it
+  4e-3 (max logit difference) from infr on the synthetic Mistral-Large-3 file at
+  an f32 KV cache; with `--flash-attn off` the two are 4e-6 apart (measured
+  2026-11-25, `030ebb5`). An oracle fixture that should judge differences below
+  that needs the flag, as `synthetic_mistral_large3_*` does.
+- **The MLA magnitude gain rows are synthetic weights**
+  (`mla_q_rope_gain_rows`), uploaded after the ones-vectors the same way. Not
+  run with a magnitude other than 1: the pipeline and expert-parallel wrappers,
+  and any real file (none has one).
+- **`synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference`
+  holds to `NO_MULTIPLIER_TOL` (2e-4) of the logit rms**, because moving the
+  twin's gain by one f32 ulp moved that file's logits by up to 1.12e-4 of their
+  rms (measured). The power-of-two cases agree to the bit.
+- **Validation finding, pre-existing and not introduced here:** under
+  `VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`,
+  `cargo test -p infr-vulkan --lib -- --include-ignored` reports
+  `VUID-vkDestroyDevice-device-05137` (child objects alive at device destroy)
+  once each in
+  `recorder::tests::embed_gather_refuses_a_forced_fold_on_an_unaligned_row`,
+  `moe_topk_refuses_above_the_expert_ceiling` and
+  `moe_topk_refuses_groups_it_cannot_route`, on both GPUs. Each test makes a
+  dispatch refuse with an error and drops its recorder without `finish` (read,
+  likely the cause, not confirmed); this slice's diff leaves those tests and the
+  methods they call untouched. Not run on HEAD.
+
+### B-PP-SLOW-RUNS — whole bench runs at two thirds or a quarter of the usual prefill speed (2026-11-25)
+
+**Kind:** surprise seen in a measurement, not diagnosed.
+
+`infr bench unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M -p 1024 -n 0 -r 3` on the RX 7900
+XTX, sixteen runs alternating two builds (HEAD `42178c70` and the tree that
+became the expert-width fix), load average 5 to 7 with a desktop session in use:
+thirteen runs read 4440 to 4536 t/s, and three read 2948, 2999 and 1208 t/s.
+Each slow run was slow in all three of its reps (spread 1.0% to 3.9%), so it is
+a state the whole process was in, not one slow rep; both builds had one or more,
+so it is not either build. Decode (`-p 0 -n 64`) on the same builds read 221.1
+to 222.1 t/s in all six runs. Not known: whether it is another client of the GPU
+(the desktop was in use), a clock or power state the card settles in for a
+process, or something infr decides once at start-up (a cold pipeline cache would
+not explain a spread that tight over three reps). What would settle it: the same
+loop with the desktop idle, and `INFR_PROF_OPS=1` on a slow run to see whether
+every kernel is slower or one is. Until then a single prefill figure from this
+card is not a measurement; alternate and repeat.
+
+### B-MOE-EXPERT-TILE — batched expert GEMMs take only whole 64-column tiles (2026-11-25)
+
+**Kind:** what the fix for the synthetic deepseek2 Q8_0 NaN left, and what it
+measured on the way.
+
+The batched `MoeFfn` arms' expert GEMMs (`Recorder::matmul_mmq_experts` and
+`matmul_mmq_experts_paged`, every `native_gemm_mmq_*` EXPERT_GRID build) cover
+`n` in whole `MOE_EXPERT_GEMM_TILE_N` tiles (`tilesN = n / BN` in the shaders,
+`expert_grid_x` on the host). An `n_ff_exp` of 32 got no workgroups and 96 lost
+its last 32 columns, so the synthetic deepseek2 file with Q8_0 banks
+(`n_ff_exp` 32) prefilled to NaN from the first chunk past `moe.small_m`. The
+fix sends such a width to the small-m id-GEMV arm
+(`infr_core::tensor::moe_expert_gemm_widths_ok`, read by both adapter arms),
+makes `expert_grid_x_or_refuse` refuse it by name, and caps the model's Vulkan
+prefill chunk at `MOE_SMALL_M_CHUNK_CAP` through the placement pins
+(`moe_small_m_chunk_cap`, read by `ubatch_rows`). Left:
+
+- **Kernel tail support was not written.** The other fix is a column guard in
+  every `native_gemm_mmq_*` shader: `tilesN` rounded up, the weight-column index
+  clamped to `n - 1` in the staging loops (the last expert's overread would
+  otherwise leave the bank), and the store skipped past `n`; the host grid would
+  use `n.div_ceil(bn)`. Declined for now because it changes the SPIR-V of every
+  shape that is already right (a `min` per staged column and a compare per
+  store, unmeasured) to serve shapes no known shipped file has; the gate costs
+  aligned shapes nothing (one host-side branch). With it, such a model would
+  also get its full prefill chunk back.
+- **The small-m recorders are not under the work-bounded submit splitter.**
+  `linear_native_id_multi`, `linear_native_id_multi_at` and
+  `linear_native_id_multi_paged` dispatch through `dispatch_wide` and never call
+  `work_next`/`tag_gemm` (read in `recorder.rs`, not run), so a small-m chunk's
+  cost is bounded only by the chunk height, which is why the capped model above
+  relies on the chunk cap rather than on the splitter.
+- **A device without `caps.i8_dot` runs every MoE model's prefill on the small-m
+  arm at full chunk height.** The resident and paged batched arms both require
+  `i8_dot`, and nothing caps the chunk for that case, so the watchdog exposure
+  `moe_small_m_threshold`'s doc records (a 1024-row chunk through that arm hung
+  the GPU) applies there to every MoE model, not just narrow ones. Read from
+  `adapter.rs` and the seam's chunk funnel; not run (no such device here).
+  `moe_small_m_chunk_cap` could take the device's `i8_dot` as a second reason to
+  cap.
+- **The capped path was run at toy sizes only.** `moe_batched_ffn_widths.rs` and
+  the synthetic deepseek2 tests (prompts to 198 tokens, three capped chunks and
+  a partial one, and the paged arm) cover it; no real-sized model with such a
+  width exists here to time or to check against the watchdog.
+- **Vulkan's small-m arm is up to 9.5e-2 of the logit RMS from the CPU on the
+  Q8_0-banked synthetic deepseek2 file** (`n_ff_exp` 32, prompts 1 to 66, both
+  GPUs), against 7.2e-2 for the batched arm at `n_ff_exp` 64. The op-level test
+  holds the small-m arm to `SMALL_M_MAX_REL` (1e-4 of the RMS) against an f64
+  reference with f32 activations, and it measured about 1e-6 there, so the gap
+  is presumably the CPU's int8 activation rounding compounding over two MoE
+  layers; not checked against the CPU's `reference()` mode.
+- **Validation layers do not see this class.** The pre-fix repro ran clean under
+  `VK_LAYER_KHRONOS_validation` on the discrete GPU: a zero-workgroup dispatch
+  is legal and an uninitialised read is not flagged. GPU-assisted validation was
+  not tried. The debug build's `alloc_uninit` poison (0xFF, NaN as f32) is what
+  made the symptom a deterministic NaN.
+- **Routing near-ties look like kernel errors on unbiased synthetic files.** A
+  sweep of the deepseek2 file with flat routing and no `exp_probs_b` showed
+  isolated prompt lengths 1.1 to 2.4 RMS away from the CPU on Vulkan (both arms,
+  Q8_0/Q5_0/Q4_K banks), with neighbours at 2e-2 to 7e-2; consistent with a
+  routing flip, not verified. The tests use `FORCE_BIAS` or a routing margin.
+
+### B-MLA-KV-SHIFT — a KV shift re-ropes cached K with the magnitude (2026-11-25)
+
+**Kind:** finding read from the reference, not verified by a run.
+
+llama.cpp's KV shift (`build_rope_shift` in `llama-kv-cache.cpp`) re-ropes the
+cached K with `ggml_rope_ext(…, yarn_ext_factor, yarn_attn_factor, …)`, so it
+puts the YaRN magnitude on the cached rotary half again. infr caches an MLA
+`k_pe` without the magnitude and puts `m²` on the query instead
+(`mla_q_rope_gain`), so a shift ported from the reference would have to leave
+the magnitude out (or account for it) to stay equal. It matters only if infr
+ever shifts an MLA cache of a file whose magnitude is not 1; infr has no KV
+shift today and no published file has such a magnitude.
+
+### B-DSV2-LINEAR-KQ-SCALE — a linearly scaled deepseek2 file runs with the wrong score scale (2026-11-25)
+
+**Kind:** finding read from the reference; infr's side checked by a load.
+
+For a `deepseek2` file with `rope.scaling.type = "linear"` and a factor `f`
+other than 1, the reference runs `ext_factor = 0`, so `llama-context.cpp` leaves
+`yarn_attn_factor = rope.scaling.attn_factor`, and `deepseek2.cpp` still
+multiplies it by `1 + 0.1·ln f` to form `attn_factor_org`, so its `kq_scale` is
+`(attn_factor·(1 + 0.1·ln f)·(1 + 0.1·log_mul·ln f))² / √head_k_mla`. infr's
+non-YaRN `mla_scale` is `rope_attn_factor² / √head_k_mla`. infr does not refuse
+or warn: a throwaway load of the config fixture with type `"linear"` and factor
+4 parsed with `rope_scaling_yarn = false`, factor 4, magnitude 1, and the runner
+then applies no frequency scaling either (B-DSV2-NONYARN-SCALE). The rope
+magnitude agrees (ggml adds `1 + 0.1·ln f` only when `ext_factor` is not 0). No
+published `deepseek2` file is known to declare a linear factor.
+
 ### B147 — seam emitters against llama.cpp, 2026-11-12: fixed, capped, refused and left (2026-11-12)
 
 Every graph emitter in `seam/runner.rs` was compared op by op with its llama.cpp
@@ -4320,37 +5280,17 @@ of implemented:
   its attention chunk). Past it the reference uses chunked attention
   (`LLAMA_SWA_TYPE_CHUNKED`) and a position-dependent temperature on the NoPE
   layers; the mask needs a new attention-mask kind in the CPU, Vulkan and Metal
-  kernels. Mistral-Large-3 (`deepseek2.attention.temperature_scale`) is capped
-  at its `temperature_length` the same way. Implementing either lifts the cap.
+  kernels. Implementing both lifts the cap (plan 13 S6).
 - **A `.scale` tensor the reference applies and infr does not is refused at
   load** (`applied_weight_scales`, one row per llama.cpp builder; scales the
   builder ignores load as before). This is the NVFP4 / ModelOpt case. Applying
   the scales would lift the refusal. The diffusion-gemma row copies gemma4's:
   the checkout has no builder for it.
-- **An MLA model whose YaRN magnitude is not 1 is refused** (`mla_rope_mscale`):
-  infr's `Op::Mla` / `Op::Rope` take frequency divisors only. Every DeepSeek V2
-  / V3 / V3.2, Kimi K2 and Mistral-Large-3 file evaluates to exactly 1.
-- **Needs a decision — deepseek32 with an unusual YaRN multiplier.** llama.cpp
-  applies its `mscale_all_dims` special case to `deepseek2` only, so a
-  deepseek32 file with stretching and a multiplier that is neither 0 nor 1 gets
-  a different attention factor there than the deepseek2 rule infr uses. Real
-  V3.2 declares 1 and is unaffected. The synthetic deepseek32 fixture uses
-  V2-Lite's multiplier and IS in that case, so refusing it fails the fixture's
-  locked-logit tests. Today such a file loads with one warning
-  (`deepseek32_yarn_rules_agree`). Options: change the fixture to the real
-  file's multiplier, re-bless its logits and refuse the case; or keep the
-  warning.
 - A qwen35 file whose `attention.recurrent_layers` is not the periodic layout is
   refused; no converter writes one.
 
 Left, confirmed by reading and not changed:
 
-- **qwen35 KV estimate.** `kv_bytes_estimate_fmt` prices every DeltaNet layer as
-  a full attention cache (`kv_row_elems` has no qwen35 branch) while
-  `kv_layer_alloc_bytes` allocates the fixed conv / S state — so the default
-  context clamps to a fraction of what fits and `moe_expert_budget`
-  over-reserves. Same decision as B131's snapshot bullet: fixing the estimate
-  makes qwen35 contexts much larger.
 - **`dsv4_plan.rs` is dead code and diverges from the reference** (no HCA dummy
   block when none completes; `n_kv` not padded to a multiple of 256). Part of
   the V4 compressed-tier feature.
@@ -4516,8 +5456,9 @@ Q4_K / Q6_K GEMV bodies read a weight row past the bank for an odd output width;
   job: on 2026-11-13 run 43369452255 failed once in `f16_native_probe`
   (`crates/infr-metal/tests/gemv_bw.rs`) with "dequant-cached f32 weight would
   exceed the GPU working set: 4.64 GiB allocated + 0.28 GiB … > 4.67 GiB
-  budget", and passed on a re-run with no code change, so the probe's memory use
-  depends on the runner it lands on. The allocation total suggests buffers
+  budget", and passed on a re-run with no code change (the same failure, at 4.54
+  GiB allocated, on 2026-11-25, passing on the next push), so the probe's memory
+  use depends on the runner it lands on. The allocation total suggests buffers
   accumulating across the probes in that test binary (not verified). The fix is
   to stop running assert-nothing probes in the CI test job, or to bound their
   allocations.
@@ -4646,9 +5587,10 @@ was re-read at its site afterwards; the rest is the reviewer's account.
   at small m) are gone; the opt-in tiers a streamed slot skips are in B193.
   Verified on `Vulkan0` and `Vulkan1` by `tests/streamed_nc_gemm.rs`. Not
   verified: Intel Arc; a device without int8 dot (the fma arm only); a whole
-  streamed model with bf16 weights; the oversized-grid fallback on a GPU (only
-  the host-side `tiled_gemm_fits` test covers the predicate, and nothing
-  dispatches a grid past the x limit).
+  streamed model with bf16 weights. A non-coopmat grid past the x limit no
+  longer leaves the tiled GEMM (plan 13 S9: it takes `dispatch_wide`'s split,
+  covered by `nc_gemm_split_grid_matches_unsplit` at a lowered split point); no
+  grid past the real limit has been dispatched on a GPU.
 - **Correctness, conditional, confirmed by re-reading:
   `native_gemv_rm_v2.comp`'s `VARIANT_REG` sizes `reg_part` for subgroups of at
   least 16** (`THREADS / 16u` slots, written by `gl_SubgroupID`), and
@@ -6946,22 +7888,100 @@ values. What it leaves:
   (`tolerance::metrics::RouteScore`); the synthetic MoE has a row and a gate
   test (`gpu_seam_tolerance_synthetic_moe`), and `docs/gpu-tolerance.md` has the
   mechanism, the measurements and the planted bugs. Open:
-  - **No real MoE model has a row or a gate test.** ERNIE-4.5-21B-A3B Q4_K_M was
-    measured on both RADV GPUs (`measure_gpu_tolerance`, key `ernie-21b-moe`;
-    the table in `docs/gpu-tolerance.md`, "Mutations"): forced along the
-    reference's routing its int8-free runs measure a worst KL of 6.1e-6 on the
-    RX 7900 XTX and 3.8e-6 on the integrated GPU (6.8e-3 unforced on the RX 7900
-    XTX), with at most 18 of 8802 selections differing, at margins up to 2.7e-5;
-    its shipped int8 runs measure 3.6e-3 and 1.3e-2, with up to 434 selections
-    differing at margins up to 3.2e-2, where a uniform share among its 64
-    experts is 1.6e-2. So an Int8 routing near tie set by the rule would hold
-    almost nothing there: either the Int8 class of a real MoE model gets no
-    routing check (its Float runs carry it), or the int8 activation error at the
-    router is looked into first. Needs a decision before its rows are set.
-    Qwen3-30B-A3B is cached and was not run. Adding a row is a measurement on
-    both GPUs plus a `gpu_seam_tolerance_*` test; whether the gate should carry
-    a 13 GB model is the owner's call (on the integrated GPU the test's memory
-    rule needs about 39 GB of free host memory for it).
+  - **No real MoE model has a row or a gate test; the routing investigation is
+    done, the decision is the owner's** (2026-11-25, `docs/gpu-tolerance.md`,
+    "MoE routing, int8 against float", which has the tables and commands).
+    ERNIE-4.5-21B-A3B and Qwen3-30B-A3B Q4_K_M (`measure_gpu_tolerance`, keys
+    `ernie-21b-moe` and `qwen3-30b-moe`) on both RADV GPUs, forced and unforced.
+    Verified in code: no router dispatch in `adapter.rs` reaches an int8 tier,
+    whatever the router's dtype, and the router reads the f32 `hn` before the
+    experts quantize theirs. Both files ship `ffn_gate_inp` as F32, which takes
+    `linear_f32r_*` in the shipped and the Float runs alike (kernel lists read
+    for both models). So "the router fed float activations" is what ships; no
+    switch was built (it would select no other kernel), and the int8 error
+    reaches the routers through the hidden state. Forced, shipped runs select
+    differently at 242 to 574 selections (margins up to 3.2e-2 on ERNIE, 1.7e-2
+    on Qwen3-30B-A3B), Float runs at 8 to 23 (up to 2.7e-5 and 3.4e-4). The
+    upstream share is per device: on the RX 7900 XTX the routed experts' int8
+    batched prefill GEMM is the larger part and the dense decode GEMVs the rest;
+    on the integrated GPU the dense prefill GEMM (the int8 `mmq` tile of
+    `nc_gemm_choice` whenever `i8_dot` is on and `mmq_fallback` is not off)
+    carries most of it: with the other two float 353 (ERNIE) and 389
+    (Qwen3-30B-A3B) selections still differ, and with `mmq_fallback` off as well
+    13 and 14, the Float run's figures exactly
+    (`gpu-ub32-both-float-nofallback`, measured directly). The decomposition is
+    closed on both devices. **Recommended: keep the default as shipped; give the
+    Int8 class of a real MoE row no routing check (its near tie would have to be
+    4.9e-2 on ERNIE and 2.5e-2 on Qwen3-30B-A3B, about three times a uniform
+    share, which holds nothing) and let its Float rows carry the routing, at
+    4.0e-5 (ERNIE) and 5.1e-4 (Qwen3-30B-A3B) by the 1.5x rule.** That needs
+    `route_near_tie` to be settable per class to "not checked", which `Entry`
+    cannot say today (`None` means "no router"). The owner may prefer instead to
+    move MoE models to float kernels, or to take the next item's upstream fix
+    first; what either costs is unmeasured. Adding a row is a measurement plus a
+    `gpu_seam_tolerance_*` test; whether the gate should carry a 13 to 19 GB
+    model is the owner's call (on the integrated GPU the test's memory rule
+    needs about 39 GB of free host memory for ERNIE, about 50 GB for
+    Qwen3-30B-A3B).
+  - **Candidate next slice: a more accurate `quant_q8` on the GPU, for the
+    steady-state routing gap and the first rows alike.** Every int8 family the
+    decomposition names quantizes through `quant_q8.comp` (one scale per 32
+    activations, `amax/127`, the scale and block sum stored as f16, no outlier
+    split). Options, none tried: (a) the CPU's outlier split
+    (`docs/cpu-activations.md`) in `quant_q8` and the kernels that read it; (b)
+    f32 block scales and sums in place of f16; (c) a finer activation format for
+    the routed experts' batched GEMM alone, the larger share on the RX 7900 XTX.
+    Each needs its accuracy measured by this harness (forced selections
+    differing and their widest margin, forced KL, the first rows, both GPUs,
+    both models) and its decode and prefill speed against today's in a quiet
+    window. Which kernel families an option touches decides the work: (a) and
+    (b) change every int8 GEMV and GEMM that reads the quantized activations.
+  - **Decode and prefill cost of the float alternatives: not timed.** Needs a
+    quiet window; the A/B commands are in `docs/gpu-tolerance.md`. The router
+    itself costs the same in every configuration (one F32 GEMV per routed layer
+    per token, no activation pass). Float loses the int8 dense decode GEMVs and,
+    with `i8_dot` off, the routed experts' batched prefill GEMM altogether
+    (every chunk then takes the per-row small-batch path), so its prefill cost
+    may be large.
+  - **Qwen3-30B-A3B's first rows are far off on the shipped GPU path**: 3.8e-2
+    (RX 7900 XTX) and 3.9e-2 (integrated GPU) worst KL in the first two
+    positions (`gpu-ub32`; position 0 on every prompt), three times the CPU
+    production's 1.1e-2; with the routed experts on float 1.8e-5 and 1.2e-3.
+    Candidate causes, untried: no outlier split in `quant_q8`, and its f16
+    `dact`/`sact`; the fix is the previous item's.
+  - **The CPU production path is far from the reference on both MoE models**:
+    forced along the reference's routing, 1003 (ERNIE) and 1135 (Qwen3-30B-A3B)
+    selections differ, at margins up to 1.5e-2 and 1.8e-2, and the worst KL from
+    position 2 on is 3.3e-2 and 5.2e-2, against at most 1.3e-2 and 3.4e-3 on the
+    shipped GPU. Candidate causes, inferred: `quantize_q8` takes one scale per
+    256 activations where `quant_q8.comp` takes one per 32; the outlier split
+    acts only above `HI_RATIO`; and the CPU quantizes every K-quant `Linear`,
+    the prefill's attention projections included, where the RX 7900 XTX keeps
+    its dense prefill on f16 cooperative-matrix GEMMs. **Partly tested**
+    (`cpu_act_quant`'s `per_position_against_the_reference`, its own four chat
+    prompts and 8 decoded tokens, routing forced, the simulation on dense
+    `Linear`s only, the expert banks and the router left float): the CPU
+    reference with its dense activations round-tripped through production's rule
+    (`256:2:16:127:1`) measures a mean KL from position 2 on of 1.8e-3, 1.9e-3,
+    4.2e-3 and 8.5e-4 on Qwen3-30B-A3B's four prompts (production: 4.0e-3,
+    2.6e-3, 4.9e-3, 1.9e-3), and through 32-element blocks (`32:0:0:127`)
+    3.9e-4, 4.2e-4, 7.6e-4 and 2.7e-4; on ERNIE 2.8e-3, 2.9e-3, 3.7e-3, 7.8e-4
+    (production 4.5e-3, 3.7e-3, 3.8e-3, 1.05e-3) against 6.3e-4, 4.5e-4,
+    6.25e-4, 1.4e-4. So the dense `Linear`s' 256-element blocks carry much of
+    production's distance and 32-element blocks would cut that part three to
+    seven times; the rest is the expert banks, which the simulation does not
+    reach (`linear_tap::simulated` is read in `Op::Linear` only). Routing
+    selections were not counted in the simulation. Next: the same with the
+    expert banks simulated, then a decision on the CPU block size with its speed
+    measured.
+  - **Unforced KL is a poor measure on a routed-expert model**: Float runs left
+    on their own routers measure up to 5.0e-2 (Qwen3-30B-A3B, integrated GPU),
+    worse than the shipped run's 2.2e-2 there. At that row (prompt 2, prefill
+    position 163) the routers first part from the reference's at layer 16 on a
+    4.1e-6 margin and nine later layers of the position follow; that the KL
+    comes from those differences is inferred, not shown by flipping one
+    selection. Any user-facing comparison of the two classes should use top-1
+    agreement or a forced run.
   - **The routing near tie has no rule for a model that never selects
     differently.** The synthetic row's is 1.5 times the one legitimate
     difference seen. A row whose legitimate runs show none would get 0 by that
@@ -7587,29 +8607,60 @@ reviewer, none was run.
   `gemv.kq_fma` device a paged model decodes on the int8 or dequant route while
   its resident twin runs fp32. `quant_linear`'s doc lists its exceptions and
   omits this one. Inherited from PR 107.
-- **About 55 GPU tests still skip silently.** `gpu_or_skip` now fails when
-  `INFR_DEV` names a device that does not open, but tests that call
-  `VulkanBackend::new()` themselves and return on an error do not go through it
-  (unit tests in `adapter.rs`, `lib.rs`, `pager.rs`, `kq_gemm_tests.rs`, and
-  `infr-llama`'s `seam/runner.rs` and `seam/weights.rs`).
+- **GPU skips: what the helper does not cover.** Every test that opened a Vulkan
+  backend or listed the devices and returned on an error now goes through
+  `infr_testkit::gpu_or_skip_noted` or `gpu_devices_or_skip_noted`
+  (`gpu_env.rs`), which fail when `INFR_FORCE_WAVE64` is set or `INFR_DEV` names
+  a Vulkan device, as `infr_core::config::vulkan_dev_spec` reads it (the
+  predicate `resolve_infr_dev_index` is built on, so a bare index or a padded
+  value counts). What is left:
+  - **Three skip policies, not one.** `tests/bench_support/mod.rs`
+    (`unavailable`) skips only on a no-driver or no-device message and fails on
+    any other init error, but only when no device is named;
+    `tests/work_split_parity.rs` fails when a device is present or named and the
+    backend did not open; the testkit helpers skip on any error unless a device
+    is named. Unifying them, and classifying "no driver, no device" against a
+    real init failure on a present GPU so that the latter fails with no device
+    named, is not done. There is no switch that makes a GPU test fail when none
+    opens and none is named (`INFR_TEST_REQUIRE_MODELS` is about models only).
+  - **A listing does not fail for a missing named device.**
+    `VulkanBackend::enumerate_devices` drops the pick error (`.ok()`) and
+    returns the list with no device marked `is_default_pick`. The tests that
+    list devices are refused in `gpu_devices_or_skip_noted` instead, which
+    panics when a Vulkan device is named and none of the listed ones is the
+    pick. The production listing is unchanged.
+  - **Left as they are, by design.** `resident_room`
+    (`infr-llama/tests/cpu_backend.rs`) treats a failed listing as "no verdict":
+    the load that follows reports the failure itself. `integrated()`
+    (`infr-vulkan/tests/work_split_parity.rs`) reads a failed listing as "not
+    integrated": the test has already opened its backend through that file's own
+    policy.
+  - **Not uniform under capture.** The integration tests under `crates/*/tests`
+    that already called `gpu_or_skip` still print their own skip line with
+    `eprintln!`, which libtest captures on a pass; only the unit tests and
+    `interconnect_probe.rs` use the noted helpers. nextest hides a passing
+    test's output either way.
+  - **Metal:** its tests open the backend with `expect` or `unwrap`; no test
+    there returns on a failed open, and no Metal skip helper exists.
+- **No host-referenced cover for windowed or canvas split-K spans.**
+  `tests/attn_split_host.rs` holds exactly-once scanning against a host
+  attention for full-causal spans only, and is ignored;
+  `tests/attn_decode_parity.rs` has windowed and ring cases but compares two
+  kernel builds. `the_chunks_cover_each_key_once`, which only checked a helper
+  of its own, is deleted.
 - **The AMD integrated `queue.family` row cannot be limited to Windows.** The
   tuning table's `Match` has no OS field, so an AMD integrated GPU on a Linux
   driver reporting the same driver id would get the compute-only family,
   unmeasured. The row also rests on one integrated GPU.
-- **`the_chunks_cover_each_key_once` cannot fail.** It checks a helper defined
-  in the test. The GPU test `attn_split_host` is the real cover check.
 - **`precise` does not cover every add in the kq_fma kernels.** `hsum`, the
   accumulator adds, the cross-subgroup sum and `subgroupAdd` are undecorated. No
   multiply is uncovered. The per-device parity tests are the guard.
 - **Smaller:** the two Q4_K kernels do not spell identical float operations (one
   multiplies by a power of two where the other shifts; equal except at subnormal
-  products); `QueueOutcome::reason` can contradict the family printed beside it;
-  `docs/config.md` says an untimed compute-only family is never picked, while
-  under `graphics` nothing warns and it is the last resort; bare literals for
-  the floor defaults and in several comments; `honour_env` carries `INFR_TUNE`
-  but not the `INFR_KQ_FMA_GEMV` and `INFR_GFX_QUEUE` aliases; the changelog
-  cites a depth-2048 figure as a floor effect where the chunk is the same at
-  either floor.
+  products); the `rule` strings of the tuning parameters in `tuning/families.rs`
+  still spell their defaults' digits beside the constants (the convention of
+  every parameter there, left alone), and comments in `adapter.rs` and
+  `recorder.rs` that spell the split policy's numbers were not touched.
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -8400,14 +9451,34 @@ work on the compute-only family under RADV. `lockup_timeout` reads empty in
 ms with the format `[GFX,Compute,SDMA,Video]`: on this kernel one default covers
 every ring.
 
-**Still not measured on Linux:** the same loop inside a desktop session (the
-script and the pinned binary are in `~/.cache/infr-queue-ab` on the Linux
-machine, `run.sh desktop`), any measure of desktop responsiveness, and the work
-bound's tests on the compute-only family. llama.cpp makes the same default
-choice (`ggml-vulkan.cpp`, `ggml_vk_find_queue_family_index` avoiding the
-graphics bit) and has the same escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`,
-commented "it can increase performance on RADV"; it does nothing else about the
-cost.
+**Measured on Linux, in a desktop session (2026-11-24).** The same pinned binary
+(`a66f3d06`) and script (`~/.cache/infr-queue-ab/run.sh desktop`), RADV (Mesa
+26.3.1, kernel 7.3.5), Hyprland running (Wayland, Xwayland beside it), DP-1
+connected on the RX 7900 XTX, Qwen3-1.7B Q4_K_M, 6 rounds with the first arm
+alternating, the CPU 99.4% to 99.7% idle in every reading before a sample.
+Medians, with the lowest and highest sample; the headless arm's medians beside
+them (a different window, so compare the changes, not the absolute figures):
+
+| Device                                    | What, t/s | `graphics`                      | `compute`                       | Change | Headless change (medians) |
+| ----------------------------------------- | --------- | ------------------------------- | ------------------------------- | ------ | ------------------------- |
+| RX 7900 XTX (RADV NAVI31)                 | tg128     | 476.02 (475.26 to 476.96)       | 466.11 (465.31 to 467.62)       | -2.1%  | 476.55 to 466.99, -2.0%   |
+| RX 7900 XTX (RADV NAVI31)                 | pp512     | 14805.47 (14611.26 to 14887.35) | 14718.94 (14636.36 to 14984.77) | -0.6%  | 15124.48 to 15134.65      |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | tg128     | 28.66 (28.64 to 28.68)          | 28.66 (28.65 to 28.69)          | 0      |                           |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | pp512     | 239.25 (239.04 to 239.31)       | 238.97 (238.83 to 239.13)       | -0.1%  |                           |
+
+So the compute-only family's decode cost on the RX 7900 XTX under RADV, about
+2%, is the same with and without a desktop session: it is not caused by the
+desktop sharing the GPU, and the hypothesis that it vanishes headless is
+refuted. Raw samples: `~/.cache/infr-queue-ab/headless.log` and `desktop.log`
+(the lines starting `sample dev=`).
+
+**Still not measured on Linux:** any measure of desktop responsiveness, and the
+work bound's tests on the compute-only family. The transfer-queue candidate
+(B230) and the Windows side (the display confound above) stay open. llama.cpp
+makes the same default choice (`ggml-vulkan.cpp`,
+`ggml_vk_find_queue_family_index` avoiding the graphics bit) and has the same
+escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`, commented "it can increase
+performance on RADV"; it does nothing else about the cost.
 
 **Decided (owner, 2026-11-22): no display detection.** The compute-only queue is
 the default, and a user who wants the last of the throughput at the desktop's
