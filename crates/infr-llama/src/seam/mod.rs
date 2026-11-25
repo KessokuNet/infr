@@ -1662,7 +1662,8 @@ pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
     }
 }
 
-/// KV formats for dense Vulkan placement, keeping explicit user choices in step with the runner.
+/// KV formats for Vulkan placement, dense and MoE alike, keeping explicit user choices in step
+/// with the runner.
 pub(crate) fn kv_placement_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DType, DType) {
     let side = |want: Option<DType>| match want {
         Some(dtype) => dtype,
@@ -1671,6 +1672,25 @@ pub(crate) fn kv_placement_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) 
     };
     let k = side(ec.kv.type_k);
     (k, kv_v_fmt(cfg, k, side(ec.kv.type_v)))
+}
+
+/// The KV bytes the MoE expert-placement budget holds back, at the pair the runner will allocate
+/// ([`kv_placement_fmts`]) — the MoE counterpart of the dense placement's pricing.
+///
+/// [`kv_bytes_estimate`] prices both sides as ONE format, which is only right while the user set
+/// neither side: an explicit `INFR_KV_TYPE_K`/`_V` pair (f32 both sides, or q8_0 on one) priced a
+/// cache the runner never allocates. Over-reserving pages experts for room the cache never took;
+/// under-reserving spends the difference and lands in the alloc-time VRAM guard mid-load, which is
+/// a backstop against over-commit, not a placement decision.
+pub(crate) fn moe_kv_estimate(
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+) -> u64 {
+    let (k, v) = kv_placement_fmts(cfg, ec, kv_auto_q8());
+    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k, v)
 }
 
 /// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
@@ -3334,12 +3354,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
                 let ring = kv_ring_wanted(cfg, ec);
-                // Route through the shared q8-aware helper (the dense placement path already does),
-                // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
-                // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
+                // Price the pair the runner will allocate: `kv_placement_fmts` walks the same
+                // ladder the runner's `parse_kv_fmt` does, so an explicit format reserves its own
+                // bytes instead of a single-format guess. That guess over-reserved ~2× for an
+                // explicit q8_0 pair (avoidable expert paging) and under-reserved the same for
+                // f32, leaving the alloc-time guard to refuse the real cache mid-load.
                 let kv_bytes: u64 = kv_device_bytes(
                     ec,
-                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8()),
+                    moe_kv_estimate(cfg, ec, want_ctx, ring, ubatch_rows(ec)),
                 );
                 // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
                 // dense sweeps below and the context-fit math: the last 256 MiB of "free" VRAM is
@@ -6109,6 +6131,57 @@ mod seam_helper_tests {
         assert_eq!(
             super::kv_placement_fmts(&cfg, &EngineConfig::default(), true),
             (DType::Q8_0, DType::Q8_0)
+        );
+    }
+
+    /// The MoE expert budget holds back the KV cache the runner will allocate, so it prices the
+    /// (K, V) pair the runner resolved, not one format for both sides. A single-format guess is
+    /// wrong in both directions: `INFR_KV_TYPE_K/_V=f32` allocates 4 B/elem but reserved 2, so
+    /// the expert arena is sized against a cache twice the real one and the over-commit lands on
+    /// the alloc-time VRAM guard; an explicit q8_0 pair allocates ~1.06 B/elem but reserved 2,
+    /// paging experts for room the cache never took.
+    #[test]
+    fn moe_budget_prices_the_kv_pair_the_runner_allocates() {
+        let cfg = Config {
+            n_layer: 1,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        let pair = |k: Option<DType>, v: Option<DType>| EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: k,
+                type_k_specified: k.is_some(),
+                type_v: v,
+                type_v_specified: v.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let estimate = |ec: &EngineConfig| super::moe_kv_estimate(&cfg, ec, 1000, false, 512);
+        let f16 = estimate(&pair(None, None));
+        // An absolute anchor: the ratios below hold on any geometry, so a config that priced
+        // nothing would pass all of them. 1064 rows (1000 ctx + `KV_SLOP_ROWS`) x 128 elems a
+        // side x 2 B x 2 sides.
+        assert_eq!(f16, 544_768, "f16, both sides, 1064 rows of 128 elems");
+        assert_eq!(
+            estimate(&pair(Some(DType::F32), Some(DType::F32))),
+            2 * f16,
+            "f32 prices 4 B/elem on both sides, double the f16 figure"
+        );
+        let q8 = estimate(&pair(Some(DType::Q8_0), Some(DType::Q8_0)));
+        assert!(q8 < f16 && q8 * 2 > f16, "q8_0 must be ~half of f16");
+        assert_eq!(
+            q8 * 32,
+            f16 * 17,
+            "q8_0 prices 34 B per 32-elem block: 17/32 of f16, not 1/2 and not 1"
+        );
+        assert_eq!(
+            estimate(&pair(Some(DType::Q8_0), None)) * 2,
+            f16 + q8,
+            "an explicit K alone leaves V at f16: exactly one side of each"
         );
     }
 
