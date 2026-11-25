@@ -8748,7 +8748,7 @@ reset rather than claiming a prefix it lacks; an unreadable extent drops its ind
 walk stops there; a lying `contains` never yields a restore that reports more tokens than it
 uploaded. Put the wrapper beside `BudgetedStore` in `crates/infr-llama/src/seam/kv_tier.rs`.
 
-### B245 — a captured ring block cannot seed a ring at a lower boundary, so the store never hits on SWA models (2026-11-25)
+### B245 — fixed: a captured ring block cannot seed a ring at a lower boundary, so the store never hit on SWA models (2026-11-25)
 
 **Tag:** kv · store · swa · restore · **Plan:** 19
 
@@ -8775,3 +8775,61 @@ the store instead of the restore.
 The test that can fail: a synthetic SWA model with a small ring, capture at a `written_end` past a
 block boundary, then restore a prompt whose match ends below that `written_end` — assert the restore
 uploads nothing and reports a miss, and that restoring at the captured end uploads and resumes.
+
+Fixed, and it had two more causes than the arithmetic above names. The shallow one: a chain's last
+block is the short tail of the capture, and `matched` only ever looked for a whole 128-token block,
+so a prompt continuing past the capture stopped at the last block boundary and could never reach the
+capture's end. `matched` now takes the longest stored prefix of each window (`longest_block`).
+
+The deep one: **a prefill writes whole chunks**, so the slot's write position runs past the tokens it
+accepted (`written_end = 2840` for a 2833-token prompt), and a ring's floor is `written_end - ring`,
+not `cached.len() - ring`. Capturing only up to `cached` therefore left every restore exactly
+`written_end - cached` rows short of a full window, and no match could ever fill it — the reported
+`need=4608..5632` was the symptom, not the cause. A capture now keeps those extra rows on the
+chain's last block (`BlockMeta::tail_rows`) and records the write position it saw
+(`BlockMeta::captured_end`, meta codec v3; v1/v2 blobs read as no tail), so a restore lays down the
+whole ring the source slot held and sets `written_end` back to it.
+
+With the floor in the block metadata, `seeds_window` refuses a match below `captured_end - ring`
+before a block is read, which is what the backlog asked for; a destination whose own cache had
+already wrapped is no longer refused outright either, since a full ring of rows replaces everything
+the window reads. Tests: `a_restore_below_the_rings_floor_misses_without_reading_a_block` (700
+tokens into a 256-row ring, a 512-token match a miss with `block_reads()` unmoved, the continuation
+restoring all 700) and `a_capture_keeps_the_rows_a_chain_wrote_past_the_prompt` (a 600-token
+conversation whose slot wrote 800 rows: the tail is stored, the restore claims 600 with
+`written_end == 800` and byte-identical rows over the whole ring, and a 512-token match is still a
+cheap miss). Measured on gemma-4-E2B qat UD-Q4_K_XL on the RX 580 with Valkey: a 2247-token
+conversation restored 2254 rows out of 18 extents in 112 ms against a 2950 ms cold prefill
+(`restored a stored prefix tokens=2247`), and a divergent match was refused with the Valkey `GET`
+counter unchanged.
+
+Still open, and its own item: the restored state has only been compared to a cold prefill on the
+*greedy token*, never on logits. A restored continuation and the same conversation continued from
+the live slot differ by ~0.01 nats on the first token, which is the size of the engine's own
+prefill-versus-decode variation for the boundary row — nothing has shown whether any of it is the
+store's. A test that compares the two within one process (restore, then the same prompt served from
+the slot) would settle it.
+
+### B246 — a recurrent model with a window ring cannot resume from the block store at all (2026-11-25)
+
+**Tag:** kv · store · swa · recurrent · **Plan:** 19
+
+Checked with B245's fix in place: gemma-4-E2B, gemma-4-E4B (a wrapped ring) and Qwen2.5-0.5B all
+restore out of Valkey now, but LFM3-1.7B never does, and the arithmetic says it cannot. A recurrent
+model resumes only at a snapshot, and prefill takes those every 1024 tokens, so the restore target
+is the last snapshot position — 2048 for a 2081-token prompt. That position's ring window starts at
+`2048 - 1280 = 768`, while the ring still held only `written_end - 1280 = 808`..`2088` when the
+capture ran: rows `768..808` were already recycled by the prefill's own padding, so no block can
+carry them. The restore is refused (from the index, no store reads) with `matched=2048 want=768
+ring=1280`.
+
+Nothing to fix in the store: keeping those rows would need the capture to run at the snapshot before
+the ring wraps past it, i.e. before the padding rows of the same prefill are written. Two ways out,
+both real work. **Capture at the snapshot**: hook the capture where the runner takes the snapshot
+(during prefill, before the chunk's padding is written), so the floor is `snapshot - ring` and the
+rows below it are still resident — that makes a recurrent model resumable, at the price of a second
+capture entry point beside the end-of-turn one. **Or accept the miss and say so**: log the reason at
+`info` when a recurrent model's store cannot serve, so a session does not look like a store that
+never hits. The test that can fail: a two-layer recurrent+ring slot (LFM3-shaped) whose capture
+happens after prefill writes a padded chunk; assert the restore at the snapshot either lands with
+every row identical to the source or is refused with the reason named.

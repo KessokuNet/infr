@@ -89,9 +89,16 @@ resumes through the ordinary prefix restore. This replaces the `kv_pool_exhauste
 every case except a single request larger than the pool.
 
 **Ring windows.** A prefix longer than a sliding-window ring is captured per block, and the block
-that straddles the window's start keeps the rows that are still resident. A restore refuses when
-the blocks cannot fill the destination's window, so a ring never claims rows attention would read
-from a hole.
+that straddles the window's start keeps the rows that are still resident. A ring is only
+self-consistent with the write position it was captured at, so a capture also keeps the rows a
+prefill wrote past the cached prefix (the chunk's padding rows occupy ring slots a decode reads) on
+the chain's last block, and every block's metadata carries that write position
+(`BlockMeta::captured_end`). A restore therefore lays down the whole ring as the source slot held
+it and answers a miss from the index, before a block is read, when the match ends below the floor
+the ring kept (`captured_end - ring`). A chain's last block is the short tail of whatever prefix was
+captured, so the walk matches the longest stored block at each position rather than only a whole
+one — without that, a prompt continuing past the capture never matched its tail and no ring restore
+ever landed (B245).
 
 ## Phases
 

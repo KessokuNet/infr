@@ -25,8 +25,9 @@ use std::sync::Arc;
 use super::weights::SlotView;
 use super::{
     kv_tier::{
-        decode_meta, encode_meta, is_live_window, Bounded, BudgetedStore, DeviceKv, Fnv, KvRows,
-        KvStore, RedbKv, RedisKv, Tiered, BLOCK_ID_FLOOR, FORMATS_META_ID, LIVE_WINDOW_BASE,
+        decode_meta, encode_meta, is_live_window, BlockMeta, Bounded, BudgetedStore, DeviceKv, Fnv,
+        KvRows, KvStore, RedbKv, RedisKv, Tiered, BLOCK_ID_FLOOR, FORMATS_META_ID,
+        LIVE_WINDOW_BASE,
     },
     pool::{PagedSlot, SlotMap},
     weights::{RecurrentSnap, SeamKv},
@@ -234,6 +235,11 @@ struct Entry {
     bytes: usize,
     /// A recurrent-state snapshot rides at the block's end inside the same extent.
     snap: bool,
+    /// The slot's write position when the block was captured (see [`BlockMeta::captured_end`]).
+    captured_end: usize,
+    /// Rows past the block's last token, on a chain's last block only (see
+    /// [`BlockMeta::tail_rows`]).
+    tail_rows: usize,
     /// The store holds the block's extent. `false` for a block only a resident page map holds.
     stored: bool,
 }
@@ -383,13 +389,15 @@ impl<S: KvStore> BlockCache<S> {
         for (id, meta) in ids.into_iter().zip(metas) {
             if let Some(blob) = meta {
                 match decode_meta(&blob) {
-                    Ok((tokens, snap, bytes)) => {
+                    Ok(m) => {
                         self.index.insert(
                             id,
                             Entry {
-                                tokens,
-                                bytes,
-                                snap,
+                                tokens: m.tokens,
+                                bytes: m.bytes,
+                                snap: m.snap,
+                                captured_end: m.captured_end,
+                                tail_rows: m.tail_rows,
                                 stored: true,
                             },
                         );
@@ -450,10 +458,17 @@ impl<S: KvStore> BlockCache<S> {
     ) -> Result<u64> {
         let bytes = rows.bytes() as u64;
         let snap = rows.snap.is_some();
+        let captured_end = rows.rows;
         self.store.put(id, 0, rows)?;
         if let Some(tokens) = meta {
-            self.store
-                .set_meta(id, &encode_meta(tokens, snap, bytes as usize))?;
+            let m = BlockMeta {
+                tokens: tokens.to_vec(),
+                snap,
+                bytes: bytes as usize,
+                captured_end,
+                tail_rows: 0,
+            };
+            self.store.set_meta(id, &encode_meta(&m))?;
         }
         self.mirror_written += bytes;
         Ok(bytes)
@@ -531,7 +546,12 @@ impl<S: KvStore> BlockCache<S> {
         let Some(blob) = self.store.meta(id)? else {
             return Ok(0);
         };
-        let (tokens, snap, _bytes) = decode_meta(&blob)?;
+        let BlockMeta {
+            tokens,
+            snap,
+            captured_end,
+            ..
+        } = decode_meta(&blob)?;
         // The rows were written under one pair of KV formats; another pair is not a cache miss
         // that a re-prefill repairs, it is a different row layout for the same extent.
         if self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
@@ -550,7 +570,18 @@ impl<S: KvStore> BlockCache<S> {
         }
         // A ring recycled the rows before `written_end`; a window that long is not in the store
         // either (its first rows were never mirrored).
-        if kv.window_ring_rows(be, cfg).is_some_and(|rows| n > rows) {
+        let ring = kv.window_ring_rows(be, cfg);
+        if ring.is_some_and(|rows| n > rows) {
+            return Ok(0);
+        }
+        // A ring keeps only its newest rows, so an extent captured after it wrapped no longer
+        // holds this window's first rows: nothing to adopt, and nothing worth reading.
+        if ring.is_some_and(|rows| captured_end > rows) {
+            tracing::debug!(
+                captured_end,
+                n,
+                "kv store: the stored window was captured below the rows this one reads"
+            );
             return Ok(0);
         }
         let mut rows = KvRows::default();
@@ -601,10 +632,19 @@ impl<S: KvStore> BlockCache<S> {
         Ok(n)
     }
 
-    /// Store block `id`'s rows and index it, replacing any block under the same id.
-    fn insert(&mut self, id: u64, tokens: Vec<u32>, rows: KvRows) -> Result<()> {
+    /// Store block `id`'s rows and index it, replacing any block under the same id. `rows` may
+    /// hold more than the block's tokens: a chain's last block also carries the rows a prefill
+    /// wrote past them.
+    fn insert(
+        &mut self,
+        id: u64,
+        tokens: Vec<u32>,
+        rows: KvRows,
+        captured_end: usize,
+    ) -> Result<()> {
         let bytes = rows.bytes();
         let snap = rows.snap.is_some();
+        let tail_rows = rows.rows.saturating_sub(tokens.len());
         self.store.put(id, 0, rows)?;
         self.index.insert(
             id,
@@ -612,6 +652,8 @@ impl<S: KvStore> BlockCache<S> {
                 tokens,
                 bytes,
                 snap,
+                captured_end,
+                tail_rows,
                 stored: true,
             },
         );
@@ -621,11 +663,12 @@ impl<S: KvStore> BlockCache<S> {
     /// Rewrite the block's extent with `snap` at its end, so the rows and their state evict
     /// together.
     fn attach(&mut self, id: u64, snap: Arc<RecurrentSnap>) -> Result<bool> {
-        let Some(len) = self.index.get(&id).map(|e| e.tokens.len()) else {
+        let Some(entry) = self.index.get(&id) else {
             return Ok(false);
         };
+        let (len, tail) = (entry.tokens.len(), entry.tail_rows);
         let mut rows = KvRows::default();
-        if !self.store.get(id, 0..len, &mut rows)? {
+        if !self.store.get(id, 0..len + tail, &mut rows)? {
             self.drop_entry(id);
             return Ok(false);
         }
@@ -644,7 +687,13 @@ impl<S: KvStore> BlockCache<S> {
         let Some(entry) = self.index.get(&id) else {
             return Ok(());
         };
-        let blob = encode_meta(&entry.tokens, entry.snap, entry.bytes);
+        let blob = encode_meta(&BlockMeta {
+            tokens: entry.tokens.clone(),
+            snap: entry.snap,
+            bytes: entry.bytes,
+            captured_end: entry.captured_end,
+            tail_rows: entry.tail_rows,
+        });
         self.store.set_meta(id, &blob)
     }
 
@@ -688,28 +737,45 @@ impl<S: KvStore> BlockCache<S> {
         let mut hits = Vec::new();
         while n < prompt.len() {
             let len = BLOCK_TOKENS.min(prompt.len() - n);
-            let block = &prompt[n..n + len];
-            id = block_id(id, block);
-            let stored = self.store.contains(id);
-            if !stored && !self.resident_covers(id) {
-                self.index.remove(&id);
-                break;
-            }
-            let Some(entry) = self.index.get_mut(&id) else {
+            let Some((next, take)) = self.longest_block(id, &prompt[n..n + len]) else {
                 break;
             };
-            // The store evicted it while a resident kept its rows: the next capture stores it again.
-            entry.stored &= stored;
-            if entry.tokens != block {
-                break;
-            }
+            id = next;
             hits.push(id);
-            n += len;
-            if len < BLOCK_TOKENS {
-                break;
-            }
+            n += take;
         }
         (n, hits)
+    }
+
+    /// The longest stored block whose tokens are a prefix of `window`, chained after `prev`.
+    ///
+    /// A chain's last block is the tail of whatever prefix was captured, so it can be shorter than
+    /// [`BLOCK_TOKENS`], and a prompt that continues past it still matches it — which is the whole
+    /// of a continuing conversation's reuse. Only the length actually stored has an entry, so the
+    /// scan costs one index lookup per length and no store call until one hits.
+    fn longest_block(&mut self, prev: u64, window: &[u32]) -> Option<(u64, usize)> {
+        for len in (1..=window.len()).rev() {
+            let id = block_id(prev, &window[..len]);
+            let Some(entry) = self.index.get(&id) else {
+                continue;
+            };
+            if entry.tokens != window[..len] {
+                continue;
+            }
+            let stored = entry.stored;
+            if stored && self.store.contains(id) {
+                return Some((id, len));
+            }
+            if self.resident_covers(id) {
+                if let Some(entry) = self.index.get_mut(&id) {
+                    entry.stored = false;
+                }
+                return Some((id, len));
+            }
+            // The store evicted it and no resident kept its rows: drop the dead entry.
+            self.index.remove(&id);
+        }
+        None
     }
 
     /// Copy the longest stored run of blocks into `kv` (a device upload per layer per run of
@@ -717,8 +783,9 @@ impl<S: KvStore> BlockCache<S> {
     ///
     /// A sliding-window ring is written at each block's own ring position (`start % rows`), so a
     /// prefix longer than the ring still seeds it: the newest blocks overwrite the oldest, which
-    /// is exactly the window attention will read. Only a destination whose own cache already
-    /// wrapped is refused — its rows no longer describe its `cached`.
+    /// is exactly the window attention will read. That also lets a destination whose own cache has
+    /// wrapped take a restore — the ring it lays down replaces every row the window reads — so the
+    /// only refusal is a match that ends below the rows its blocks kept.
     pub(crate) fn restore(
         &mut self,
         be: &dyn Backend,
@@ -741,12 +808,7 @@ impl<S: KvStore> BlockCache<S> {
             return Ok(0);
         }
         p = p.min(kv.max_ctx);
-        if kv
-            .window_ring_rows(be, cfg)
-            .is_some_and(|rows| kv.cached.len() > rows)
-        {
-            return Ok(0);
-        }
+        let ring = kv.window_ring_rows(be, cfg);
         let len = |id: &u64| self.index[id].tokens.len();
         let mut keep = Vec::new();
         let mut n = 0usize;
@@ -774,11 +836,30 @@ impl<S: KvStore> BlockCache<S> {
         let adopt = self.resident_for(kv, prompt, &keep);
         let first = adopt.map_or(0, |(_, pages)| pages * PAGE_ROWS);
         let tail = adopt.map_or(0, |(_, pages)| pages * BLOCKS_PER_PAGE);
+        // The last block of a chain carries the rows a prefill wrote past its tokens, so the ring
+        // a restore rebuilds ends where the captured slot's did, not at the match.
+        let claimed = n + keep.last().map_or(0, |id| self.index[id].tail_rows);
+        // A ring holds only the rows it had when its block was captured, so a match that ends
+        // below that floor would seed the window with rows from a conversation that is gone: the
+        // answer is a miss, and the index can give it before a block is read.
+        if let Some(ring) = ring {
+            let want = claimed.saturating_sub(ring).max(first);
+            if !self.seeds_window(&keep, want, ring) {
+                tracing::debug!(
+                    matched = n,
+                    want,
+                    ring,
+                    "kv store: the match ends below the rows the ring kept"
+                );
+                return Ok(0);
+            }
+        }
         let mut rows = KvRows::default();
         let mut n = first;
         for id in &keep[tail..] {
             let len = self.index[id].tokens.len();
-            match self.store.get(*id, 0..len, &mut rows) {
+            let read = len + self.index[id].tail_rows;
+            match self.store.get(*id, 0..read, &mut rows) {
                 Ok(true) => n += len,
                 // Adopted pages are a prefix on their own; the rest prefills.
                 Ok(false) if adopt.is_some() => break,
@@ -791,13 +872,18 @@ impl<S: KvStore> BlockCache<S> {
                 }
             }
         }
+        // What the store actually answered, rows past the match included.
+        let written = first + rows.rows;
         // Every row attention will read must be there: a window layer keeps only the newest rows
         // it has, and a restore that cannot fill that window must re-prefill instead.
         for l in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(l) {
                 continue;
             }
-            let need = kv.row_layout(be, cfg, l).oldest_resident(n).max(first)..n;
+            let need = kv
+                .row_layout(be, cfg, l)
+                .oldest_resident(written)
+                .max(first)..written;
             let held = need.start - first..need.end - first;
             if !need.is_empty() && !rows.layers.get(l).is_some_and(|r| r.covers(held)) {
                 tracing::debug!(layer = l, need = ?need, "kv store: the stored blocks miss the window");
@@ -810,10 +896,10 @@ impl<S: KvStore> BlockCache<S> {
             self.tick += 1;
             self.resident[i].tick = self.tick;
             // The tail's pages may be the ones another resident holds.
-            self.spill(page_deficit(p, first, n));
+            self.spill(page_deficit(p, first, written));
         }
-        if n > first {
-            if let Err(e) = upload_prefix(be, cfg, kv, first, n, rows) {
+        if written > first {
+            if let Err(e) = upload_prefix(be, cfg, kv, first, written, rows) {
                 // The map holds another conversation's rows now: give the pages back rather than
                 // leave the slot claiming a prefix it no longer has.
                 kv.reset();
@@ -827,20 +913,38 @@ impl<S: KvStore> BlockCache<S> {
             self.resident_tokens += first as u64;
             tracing::debug!(
                 adopted = first,
-                read = n - first,
+                read = written - first,
                 "kv store: resumed from resident pages"
             );
         }
-        kv.written_end = n;
+        kv.written_end = written;
         kv.cached = prompt[..n].to_vec();
         tracing::debug!(
             tokens = n,
+            written,
             adopted = first,
-            read = n - first,
+            read = written - first,
             elapsed_ms = started.elapsed().as_millis() as i64,
             "kv store: restore filled the window"
         );
         Ok(n)
+    }
+
+    /// Whether the chain holds the rows a window layer reads once `kv` claims `n` rows: the ring's
+    /// window starts at `want`, and a block keeps nothing from below the floor its own capture
+    /// left. The chain is captured front to back, so the block the window starts in carries the
+    /// highest floor of the blocks the window touches; the layers' own answer is checked again
+    /// once the rows are in hand.
+    fn seeds_window(&self, keep: &[u64], want: usize, ring: usize) -> bool {
+        let mut start = 0usize;
+        for id in keep {
+            let len = self.index[id].tokens.len();
+            if start + len > want {
+                return want >= self.index[id].captured_end.saturating_sub(ring);
+            }
+            start += len;
+        }
+        true
     }
 
     /// The resident holding the most whole pages of `keep`'s chain, and that page count. Only a
@@ -906,6 +1010,10 @@ impl<S: KvStore> BlockCache<S> {
                             tokens: block.to_vec(),
                             bytes: 0,
                             snap: false,
+                            // Pages only: this model has no layer outside the pool, so no ring
+                            // can have recycled a row (`retention_refusal`).
+                            captured_end: 0,
+                            tail_rows: 0,
                             stored: false,
                         },
                     );
@@ -1048,6 +1156,7 @@ impl<S: KvStore> BlockCache<S> {
         let tokens = &kv.cached[..p];
         let mut id = 0u64;
         let mut start = 0usize;
+        let mut last = 0usize;
         let mut missing: Vec<(usize, usize, u64)> = Vec::new();
         while start < p {
             let len = BLOCK_TOKENS.min(p - start);
@@ -1058,30 +1167,56 @@ impl<S: KvStore> BlockCache<S> {
             if !self.find(id, &tokens[start..start + len]) {
                 missing.push((start, len, id));
             }
+            last = start;
             start += len;
         }
-        if missing.is_empty() {
+        // The slot's write position, not `p`: a prefill writes whole chunks, so the rows between
+        // `p` and it belong to positions the conversation never had and sit in the ring slots a
+        // decode reads. Capturing only `p` would leave every ring restore a window short, and
+        // carrying them costs one chunk of rows on the chain's last block.
+        let written = kv.written_end.max(kv.cached.len()).min(kv.max_ctx);
+        let tail = if p == kv.cached.len() {
+            written.saturating_sub(p)
+        } else {
+            0
+        };
+        if missing.is_empty() && tail == 0 {
             self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, None)?;
             return Ok(0);
         }
         // One download per layer from the first new block; blocks already stored in between are
         // read and dropped, and rows a ring recycled come back absent.
-        let from = missing[0].0;
+        let from = missing.first().map_or(last, |m| m.0);
+        let end = p + tail;
         let started = std::time::Instant::now();
         tracing::debug!(
             from,
-            rows = p - from,
+            rows = end - from,
             blocks = missing.len(),
+            tail,
             "kv store: capture starts"
         );
         let mut all = KvRows::default();
-        DeviceKv::new(SLOT, be, cfg, kv).get(SLOT, from..p, &mut all)?;
+        DeviceKv::new(SLOT, be, cfg, kv).get(SLOT, from..end, &mut all)?;
         for (start, len, id) in &missing {
+            // The chain's last block is written below, with the rows past its tokens.
+            if tail > 0 && *start == last {
+                continue;
+            }
             let mut rows = KvRows::default();
             rows.append(&all, start - from..start - from + len)?;
             rows.snap = None;
             let block = tokens[*start..*start + *len].to_vec();
-            self.insert(*id, block, rows)?;
+            self.insert(*id, block, rows, written)?;
+        }
+        // The chain's last block carries the rows past its tokens, so a restore can rebuild the
+        // ring whole. Stored even when the block itself was already there: it gains the tail.
+        if tail > 0 {
+            let mut rows = KvRows::default();
+            rows.append(&all, last - from..end - from)?;
+            rows.snap = None;
+            self.insert(id, tokens[last..].to_vec(), rows, written)?;
+            tracing::debug!(at = last, tail, "kv store: kept the ring tail");
         }
         self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, all.snap.take())?;
         self.captures += 1;
@@ -1340,7 +1475,7 @@ mod tests {
                 rows: len,
                 ..KvRows::default()
             };
-            s.insert(id, block.to_vec(), rows).unwrap();
+            s.insert(id, block.to_vec(), rows, tokens.len()).unwrap();
             s.index.get_mut(&id).unwrap().bytes = bytes;
             s.write_meta(id).unwrap();
             ids.push(id);
@@ -1364,8 +1499,8 @@ mod tests {
         assert_eq!(s.matched(&a).0, 300);
         let mut extended = a.clone();
         extended.extend([7, 8, 9]);
-        // The short tail block only matches a prompt that ends there.
-        assert_eq!(s.matched(&extended).0, 256);
+        // The short tail block matches, and the prompt continues past it: prefill resumes at 300.
+        assert_eq!(s.matched(&extended).0, 300);
         let mut diverged = a.clone();
         diverged[150] = 99;
         assert_eq!(s.matched(&diverged).0, BLOCK_TOKENS);
@@ -1433,9 +1568,9 @@ mod tests {
         let snap = held(&mut s.store, id, BLOCK_TOKENS).snap;
         assert_eq!(snap.expect("the snapshot in the block extent").pos, 512);
         // The stored metadata names the snapshot, so a reload rebuilds the index.
-        let (_, snap_flag, bytes) = decode_meta(&s.store.meta(id).unwrap().unwrap()).unwrap();
-        assert!(snap_flag);
-        assert_eq!(bytes, 96);
+        let meta = decode_meta(&s.store.meta(id).unwrap().unwrap()).unwrap();
+        assert!(meta.snap);
+        assert_eq!(meta.bytes, 96);
     }
 
     #[test]
@@ -1880,16 +2015,38 @@ mod tests {
 
     /// A slot holding `n` tokens, every row written through its own layout.
     fn filled_slot(be: &dyn Backend, cfg: &Config, ring: bool, n: usize) -> SeamKv {
+        filled_slot_to(be, cfg, ring, n, n)
+    }
+
+    /// A slot holding `n` tokens whose buffers carry rows through `written`: a prefill writes whole
+    /// chunks, so the rows past the tokens are real rows in the ring at positions the conversation
+    /// never had.
+    fn filled_slot_to(
+        be: &dyn Backend,
+        cfg: &Config,
+        ring: bool,
+        n: usize,
+        written: usize,
+    ) -> SeamKv {
         let mut kv = SeamKv::for_test(be, cfg, 1024, ring, 56, DType::F16).unwrap();
         for l in 0..cfg.n_layer {
             let layout = kv.row_layout(be, cfg, l);
             for (side, buf) in [(0, &kv.kbufs[l]), (1, &kv.vbufs[l])] {
-                let data: Vec<u8> = (0..n).flat_map(|r| row_data(l, side, r)).collect();
-                write_rows(be, buf.as_ref(), DType::F16, ROW, &*layout, 0..n, &data).unwrap();
+                let data: Vec<u8> = (0..written).flat_map(|r| row_data(l, side, r)).collect();
+                write_rows(
+                    be,
+                    buf.as_ref(),
+                    DType::F16,
+                    ROW,
+                    &*layout,
+                    0..written,
+                    &data,
+                )
+                .unwrap();
             }
         }
         kv.cached = tokens(3, n);
-        kv.written_end = n;
+        kv.written_end = written;
         kv
     }
 
@@ -2003,6 +2160,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A capture keeps only the rows a ring still held at the slot's write position, so a prompt
+    /// whose match ends below that position cannot seed the ring: the answer comes from the index,
+    /// before a block is read. The prompt that replays the captured tokens still resumes (B245).
+    #[test]
+    fn a_restore_below_the_rings_floor_misses_without_reading_a_block() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(200);
+        let n = 700; // five full blocks and a 60-token tail: not a block boundary
+        let src = filled_slot(&be, &cfg, true, n);
+        assert_eq!(src.window_ring_rows(&be, &cfg), Some(256));
+        let mut s = cache();
+        assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
+        let ids = s.matched(&src.cached).1;
+        let meta = decode_meta(&s.store.meta(ids[2]).unwrap().unwrap()).unwrap();
+        assert_eq!(meta.captured_end, n, "the capture position is persisted");
+
+        // Four blocks match and the fifth differs: the window it would seed starts at 256, where
+        // the ring held nothing — its rows began at 444 (700 - 256).
+        let mut prompt = tokens(3, 512);
+        prompt.extend(tokens(4, 200));
+        assert_eq!(s.matched(&prompt).0, 512);
+        let reads = s.store.block_reads();
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, true, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), 0);
+        assert_eq!(s.store.block_reads(), reads, "the miss cost no block read");
+        assert_eq!((s.restores, s.restored_tokens), (0, 0));
+        assert!(dst.cached.is_empty());
+
+        // A prompt that continues the capture ends above the floor and reseeds the whole window.
+        let mut continued = src.cached.clone();
+        continued.extend(tokens(5, 40));
+        assert_eq!(
+            s.matched(&continued).0,
+            n,
+            "the short tail block is matched"
+        );
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &continued).unwrap(), n);
+        assert_eq!(dst.cached, continued[..n]);
+        for l in 0..cfg.n_layer {
+            let from = dst.row_layout(&be, &cfg, l).oldest_resident(n);
+            for side in 0..2 {
+                let want: Vec<u8> = (from..n).flat_map(|r| row_data(l, side, r)).collect();
+                assert_eq!(
+                    read_side(&be, &cfg, &dst, l, side, from..n),
+                    want,
+                    "layer {l} side {side} from row {from}"
+                );
+            }
+        }
+        assert_eq!(
+            dst.row_layout(&be, &cfg, 0).oldest_resident(n),
+            444,
+            "the ring's window is what a restore had to fill"
+        );
     }
 
     /// A paged slot of `n` written rows over `pool`, its pages reserved through `n`.
@@ -2462,21 +2675,54 @@ mod tests {
         assert!(dst.cached.is_empty());
     }
 
-    /// Decode can write rows past the tokens it accepted, so the ring recycles from the row count
-    /// actually written, not from the cached prefix.
+    /// A prefill writes whole chunks, so the slot's ring also holds rows for positions the
+    /// conversation never had. Those rows recycle real ones (the ring's floor comes from the row
+    /// count actually written, not the cached prefix) and a decode reads them, so the chain's last
+    /// block keeps them: a restore then rebuilds the ring the source had, whole (B245).
     #[test]
-    fn a_capture_skips_rows_a_chain_wrote_past_the_prompt() {
+    fn a_capture_keeps_the_rows_a_chain_wrote_past_the_prompt() {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(200);
-        let mut src = filled_slot(&be, &cfg, true, 600);
-        src.written_end = 800;
+        let src = filled_slot_to(&be, &cfg, true, 600, 800);
         let mut s = cache();
         assert_eq!(s.capture(&be, &cfg, &src, 600).unwrap(), 600);
         let ids = s.matched(&src.cached).1;
         assert_eq!(ids.len(), 5);
-        // Rows below 544 are gone: the block over 512..640 keeps only 544..600.
-        let rows = held(&mut s.store, ids[4], 88);
-        assert_eq!(rows.layers[0].runs, vec![32..88]);
+        // Rows below 544 are gone: the block over 512..640 keeps 544..600, then the 200 rows the
+        // prefill wrote past them.
+        let rows = held(&mut s.store, ids[4], 88 + 200);
+        assert_eq!(rows.layers[0].runs, vec![32..288]);
+        assert_eq!(s.index[&ids[4]].tail_rows, 200);
+        assert_eq!(s.index[&ids[3]].tail_rows, 0, "only the chain's last block");
+
+        // A match that stops at the fourth block leaves the tail behind, and its own ring window
+        // starts below the floor this capture left: a miss, decided before a block is read.
+        let shorter = tokens(3, 512);
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, true, 56, DType::F16).unwrap();
+        let reads = s.store.block_reads();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &shorter).unwrap(), 0);
+        assert_eq!(s.store.block_reads(), reads);
+        assert!(dst.cached.is_empty());
+
+        // The restore claims the 600 tokens and lays down the ring as it stood at 800.
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, true, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 600);
+        assert_eq!(dst.cached, src.cached);
+        assert_eq!(
+            dst.written_end, 800,
+            "the ring's write position came back too"
+        );
+        for l in 0..cfg.n_layer {
+            let from = dst.row_layout(&be, &cfg, l).oldest_resident(800);
+            for side in 0..2 {
+                let want: Vec<u8> = (from..800).flat_map(|r| row_data(l, side, r)).collect();
+                assert_eq!(
+                    read_side(&be, &cfg, &dst, l, side, from..800),
+                    want,
+                    "layer {l} side {side} from row {from}"
+                );
+            }
+        }
     }
 
     /// One block of the two-layer test slot, in bytes.
@@ -2717,6 +2963,17 @@ mod tests {
         out
     }
 
+    /// The metadata a store holds for `kv`'s whole live window, as `mirror_put` would write it.
+    fn window_meta(kv: &SeamKv, bytes: usize) -> Vec<u8> {
+        encode_meta(&BlockMeta {
+            tokens: kv.cached.clone(),
+            snap: false,
+            bytes,
+            captured_end: kv.written_end,
+            tail_rows: 0,
+        })
+    }
+
     /// Every step moves the whole window out to the store and back: both byte totals advance by
     /// the window's bytes, the extent in the store is that window, and the slot still holds it.
     #[test]
@@ -2758,9 +3015,10 @@ mod tests {
         // The metadata names the window's tokens, which is what a later process reads to decide
         // whether the extent applies at all.
         let blob = c.store.meta(id).unwrap().expect("the window has metadata");
-        let (tokens, snap, bytes) = decode_meta(&blob).unwrap();
-        assert_eq!(tokens, kv.cached);
-        assert_eq!((snap, bytes), (false, window));
+        let meta = decode_meta(&blob).unwrap();
+        assert_eq!(meta.tokens, kv.cached);
+        assert_eq!((meta.snap, meta.bytes), (false, window));
+        assert_eq!(meta.captured_end, kv.written_end);
     }
 
     /// A store that hands back something else than it was given: the slot must end up holding the
@@ -2955,9 +3213,7 @@ mod tests {
         let window = window_of(&be, &cfg, &kv, id);
         let bytes = window.bytes();
         store.rows.insert(id, window);
-        store
-            .metas
-            .insert(id, encode_meta(&kv.cached, false, bytes));
+        store.metas.insert(id, window_meta(&kv, bytes));
         let mut c = BlockCache::new(store, true);
         let mut fresh = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
         let mut prompt = kv.cached.clone();
@@ -3008,9 +3264,7 @@ mod tests {
         let window = window_of(&be, &cfg, &kv, id);
         let bytes = window.bytes();
         store.rows.insert(id, window);
-        store
-            .metas
-            .insert(id, encode_meta(&kv.cached, false, bytes));
+        store.metas.insert(id, window_meta(&kv, bytes));
         let mut c = BlockCache::new(store, true);
         let mut stale = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
         stale.cached = tokens(9, 5);
@@ -3071,7 +3325,7 @@ mod tests {
         let named = || {
             let mut c = shared.lock().unwrap();
             let blob = c.store.meta(id).unwrap().expect("the window has metadata");
-            decode_meta(&blob).unwrap().0
+            decode_meta(&blob).unwrap().tokens
         };
 
         mirror.step(&be, &cfg, kv.view()).unwrap();

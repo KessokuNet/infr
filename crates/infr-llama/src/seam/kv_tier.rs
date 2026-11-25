@@ -181,8 +181,13 @@ impl Fnv {
     }
 }
 
-/// Version of [`encode_rows`], [`encode_meta`] and the format blob.
+/// Version of [`encode_rows`] and the format blob.
 const CODEC_VERSION: u8 = 1;
+
+/// Version of [`encode_meta`]. `3` added [`BlockMeta::tail_rows`]; `2` added
+/// [`BlockMeta::captured_end`]. A `1` or `2` blob reads as a block holding its whole range and no
+/// tail, which is what every block of a model without a ring really does.
+const META_VERSION: u8 = 3;
 
 struct Writer {
     buf: Vec<u8>,
@@ -381,23 +386,47 @@ pub(crate) fn decode_rows(buf: &[u8]) -> Result<(usize, KvRows)> {
     Ok((first, KvRows { rows, layers, snap }))
 }
 
-/// Encode a block's index entry: its tokens, whether a snapshot rides the extent, and its bytes.
-pub(crate) fn encode_meta(tokens: &[u32], snap: bool, bytes: usize) -> Vec<u8> {
+/// A block's index entry as a store holds it beside its rows.
+pub(crate) struct BlockMeta {
+    pub(crate) tokens: Vec<u32>,
+    /// A recurrent-state snapshot rides at the block's end inside the same extent.
+    pub(crate) snap: bool,
+    /// Rows plus snapshot, what `stats` reports.
+    pub(crate) bytes: usize,
+    /// The slot's write position when the block was captured. A window layer kept only the rows
+    /// from `captured_end` back to the end of its ring, and nothing below that floor is meaningful
+    /// there — see `BlockCache::restore`.
+    pub(crate) captured_end: usize,
+    /// Rows stored past the block's last token, on a chain's last block only: a prefill writes
+    /// whole chunks, so the slot's ring holds rows for positions the conversation never had, and
+    /// they occupy ring slots a decode reads. Keeping them lets a restore rebuild that ring
+    /// exactly.
+    pub(crate) tail_rows: usize,
+}
+
+/// Encode a block's index entry.
+pub(crate) fn encode_meta(m: &BlockMeta) -> Vec<u8> {
     let mut w = Writer::new();
-    w.u8(CODEC_VERSION);
-    w.u32(tokens.len() as u32);
-    for &t in tokens {
+    w.u8(META_VERSION);
+    w.u32(m.tokens.len() as u32);
+    for &t in &m.tokens {
         w.u32(t);
     }
-    w.u8(u8::from(snap));
-    w.u64(bytes as u64);
+    w.u8(u8::from(m.snap));
+    w.u64(m.bytes as u64);
+    w.u64(m.captured_end as u64);
+    w.u64(m.tail_rows as u64);
     w.finish()
 }
 
 /// Decode a block's index entry.
-pub(crate) fn decode_meta(buf: &[u8]) -> Result<(Vec<u32>, bool, usize)> {
+pub(crate) fn decode_meta(buf: &[u8]) -> Result<BlockMeta> {
     let mut r = Reader::new(buf);
-    ensure!(r.u8()? == CODEC_VERSION, "kv tier meta version mismatch");
+    let version = r.u8()?;
+    ensure!(
+        (1..=META_VERSION).contains(&version),
+        "kv tier meta version mismatch"
+    );
     let n = r.u32()? as usize;
     ensure!(n <= 1 << 20, "kv tier meta claims {n} tokens");
     let mut tokens = Vec::with_capacity(n);
@@ -410,8 +439,19 @@ pub(crate) fn decode_meta(buf: &[u8]) -> Result<(Vec<u32>, bool, usize)> {
         v => bail!("kv tier meta names snapshot state {v}"),
     };
     let bytes = usize::try_from(r.u64()?)?;
+    let (captured_end, tail_rows) = match version {
+        1 => (0, 0),
+        2 => (usize::try_from(r.u64()?)?, 0),
+        _ => (usize::try_from(r.u64()?)?, usize::try_from(r.u64()?)?),
+    };
     r.finish()?;
-    Ok((tokens, snap, bytes))
+    Ok(BlockMeta {
+        tokens,
+        snap,
+        bytes,
+        captured_end,
+        tail_rows,
+    })
 }
 
 /// Extents of KV rows addressed by id. A call moves every layer at once.
