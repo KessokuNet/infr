@@ -16,7 +16,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `infr_llama::chat::ChatModel` gains `supports_logprobs` (default `false`).
   `ChatRequest` / `GenParams` now accept `logprobs` and `top_logprobs` (`0..=20`,
   default 20 when `logprobs` is true), where `logprobs: true` used to be a `400`.
-
+- **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
+  temperature, so an exhaustive match on `Op` must handle it.
+- **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
+  exhaustive match on it must handle them.
+- **`infr_llama::Config` gains `attn_temp_scale` and `attn_temp_floor_scale`**
+  (Mistral-Large-3's attention temperature), so a struct literal of it must set
+  them or use `..Default::default()`.
 - **`infr serve` checks the `Host` header on a keyless loopback server.** A
   request whose `Host` is not a loopback name (`localhost`, `*.localhost`,
   `127.0.0.1`, `[::1]`, or the bind host, on any port) now gets a `403` naming
@@ -190,6 +196,72 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (Vulkan, CPU, reference Metal); diffusion and speculative-Metal answer `400`.
   The EOS token is not included, and a grammar-forced tool-call span produces no
   entries because the model did not sample it.
+- **`infr_vulkan::VramInfo` gains `limited_from`** and **`DeviceInfo` gains
+  `vram_limit`**, both public, so struct literals of either must set them (both
+  structs have only public fields, so callers can build them).
+
+- **`infr_vulkan::DeviceClass` and `infr_vulkan::device_class()` are removed.**
+  The process-wide record of the first Vulkan device's class is gone; a
+  backend's class is its `Capabilities::integrated` and
+  `Capabilities::compute_units` (`Backend::capabilities`), which is what the
+  seam now sizes the default prefill chunk from.
+
+- **Weight files are read through the descriptors the model was mapped from.**
+  `infr_gguf::Gguf::shards` is replaced by `Gguf::shard_handles`, which returns
+  each shard's open `File`, path and `infr_core::blockio::FileStamp` (its length
+  and mtime when it was mapped) as an `infr_core::blockio::ShardHandle`.
+  `infr_core::blockio::FileBlockIo::open_shards` is replaced by
+  `FileBlockIo::from_handles`, and `FileBlockIo::verify_unchanged` is removed:
+  every block read now checks the file itself. `WeightWatch::check` now says
+  "modification time moved, size unchanged" where it said "contents were
+  rewritten in place". New: `infr_plat::fileio::reopen_for_reads`,
+  `infr_gguf::watch::WeightWatch::for_model`, which watches a loaded `Gguf`'s
+  own files against the stamps it took when mapping them.
+
+### Added
+
+- **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
+  position-dependent attention temperature (`llm_graph_input_attn_temp`), which
+  scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.
+  Mistral-Large-3 emits it (below). A graph holding it does not take the Vulkan
+  or Metal decode replay, since its position is baked in; a DeepSeek MLA model's
+  decode does not replay on either backend anyway. The Metal kernel has never
+  been compiled or run: MSL is compiled at run time on a Mac, and only the Rust
+  side of the Metal backend has been type-checked.
+- **DeepSeek-family files whose YaRN magnitude is not 1 load and run.** ggml's
+  rope scales the rotary halves of the MLA query and key (and V3.2's indexer
+  query and key) by that magnitude; infr now multiplies the query's rotary
+  columns by its square, which gives the same scores. 0.3.0 refused these files.
+  Every published DeepSeek V2, V3, V3.2, Kimi K2 and Mistral-Large-3 file has
+  magnitude 1 and builds the same graph as before.
+- **`Backend::set_kv_spill_reserve`** and **`Backend::kv_spill_armed`**; on
+  Vulkan **`kv_spill_armed`**, **`kv_stays_in_vram`**, **`kv_vram_bytes`**,
+  **`kv_overflow_vram_cap`** and **`VulkanBackend::kv_spill_counts`**; and
+  **`infr_core::hostmem::spare_bytes`**: the device memory a `kv.overflow` spill
+  must leave free (default no-op), whether a backend spills at all (not on
+  unified memory, nor without a live memory budget), the placement rule a KV
+  buffer is placed by under it and the bytes of a whole cache it keeps in device
+  memory, the `kv.overflow_vram_mb` cap in bytes, where the backend has placed
+  its KV buffers so far, and the host memory a run may take beside the headroom
+  host arenas leave (`auto_arena_bytes` without its worth-building floor).
+- **`infr_vulkan::VulkanBackend::weight_load_cost`** returns a `WeightLoadCost`:
+  the resident weight arena's upload alignment and block size, and the upload
+  staging ring's bytes where the device's budget counts them, which the context
+  fit prices before a load.
+- **`INFR_VRAM_LIMIT` (`kernels.vulkan.vram_limit`): run as if the GPU had less
+  memory.** A size (`4g`, `1536m`, or a percentage) that caps the total and free
+  memory a Vulkan device reports, so the context fit, the KV format rungs, the
+  placement budgets and the allocation guard all decide as they would on a
+  device that small, on the real GPU. It only lowers: a limit at or above the
+  device's memory does nothing. It applies to each device a run opens, to the
+  figure the guard counts there (every heap on an integrated GPU).
+  `infr devices` prints the limit under each device it lowers, the startup log
+  says what a run budgets against beside the device's own figure, and a guard
+  refusal under a limit names both, as do the `ctx clamp` warning and the "no
+  usable KV cache fits" refusal. Zero, or a value that is not a size, is an
+  error. For testing memory pressure. With debug logging on, the
+  `KV cache allocated` line now also prints `kv_committed_bytes`, what the KV
+  allocation took from the device's budget. New: `VramInfo::limit_note`.
 
 - **`infr tune check <model>`: is this GPU still within tolerance of the CPU
   reference?** It scores a Vulkan device, under the tuning in effect (table
@@ -281,10 +353,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of
   `graphics`. `infr tune show` prints the value, where it came from and the
   family picked, and the startup log says the same. A COMPUTE-only family that
-  writes no timestamps is never used, with a warning, since the submit splitter,
-  the work bound, the dropped-work check and `INFR_PROF_OPS` read timestamps
-  from the submit queue. The generation golden and the tolerance tests run on
-  both devices pass unchanged on the compute-only family.
+  writes no timestamps is passed over for the universal one, with a warning,
+  since the submit splitter, the work bound, the dropped-work check and
+  `INFR_PROF_OPS` read timestamps from the submit queue; it is taken only where
+  no other family can compute. The generation golden and the tolerance tests run
+  on both devices pass unchanged on the compute-only family.
 
 - **Tuning parameter `gemv.kq_fma`: fp32 decode GEMVs for GPUs without an
   accelerated int8 dot.** Three decode (one-row) kernels, on by default where
@@ -314,13 +387,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   discrete device in the slow class (no matrix units and no accelerated int8
   dot, or wave64-only): on an RX 580 under RADV that took
   gemma-4-E4B-it-qat-UD-Q4_K_XL decode from 39.24 to 45.74 tok/s at depth 16 and
-  from 40.73 to 41.45 at depth 2048 (`docs/perf/vulkan-decode-attn-chunk.md`).
-  Every other device keeps 64, the floor before this, so its decode output is
-  unchanged. The floor sets the chunk of every span under 32 times its value, so
-  16 changes the last bits of decode attention up to 2047 keys of context, not
-  only under 512. MTP verify batches take the same floor as decode. The combine
-  pass (`attn_combine.comp`) now issues the partial loads of 8 chunks before
-  testing their weights, on every device, with the same sums in the same order.
+  from 43.09 to 43.50 at depth 512 (`docs/perf/vulkan-decode-attn-chunk.md`; its
+  depth-2048 row, 40.73 to 41.45, is not an effect of the floor, since from 2048
+  keys up the chunk is the same at either floor). Every other device keeps 64,
+  the floor before this, so its decode output is unchanged. The floor sets the
+  chunk of every span under 32 times its value, so 16 changes the last bits of
+  decode attention up to 2047 keys of context, not only under 512. MTP verify
+  batches take the same floor as decode. The combine pass (`attn_combine.comp`)
+  now issues the partial loads of 8 chunks before testing their weights, on
+  every device, with the same sums in the same order.
 
 - **GPU logits held to the CPU reference within a tolerance.** New public module
   `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
@@ -621,8 +696,86 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `dense_stream_slot_align`, the dtypes the dense streaming planner accepts and
   the slot alignment each needs.
 
+- **`infr_core::config::vulkan_dev_spec` and `PartialConfig::copy_path_to`.**
+  `vulkan_dev_spec` says which `INFR_DEV` / `--dev` values name a Vulkan device
+  (anything but unset, empty, `metal` and `cpu`); the Vulkan backend's device
+  resolver now decides that through it, with the same results as before.
+  `copy_path_to` copies what a config layer set at one dotted path onto another
+  layer as the typed value.
+
 ### Changed
 
+- **Mistral-Large-3's context is no longer capped at its
+  `attention.temperature_length`.** infr now applies the model's attention
+  temperature (`deepseek2.attention.temperature_scale`) the way llama.cpp does,
+  so a session can open past that length. Below it the factor is exactly 1 and
+  the graph is the one 0.3.0 built. Checked against llama.cpp on a synthetic
+  file of that shape; no real Mistral-Large-3 file has been run.
+- **A `deepseek32` file with a YaRN multiplier other than 1 gets llama.cpp's
+  `deepseek32` attention factor**, where it got the `deepseek2` one with a load
+  warning. llama.cpp keys that rule on the arch string, and only `deepseek2`
+  cancels the multiplier's ratio, so such a file now runs at a different score
+  scale and rope magnitude than in 0.3.0. DeepSeek V3.2 declares a multiplier of
+  1, where the two rules agree, and is unchanged.
+- **A batched-MoE prefill chunk whose expert GEMM grid passes the device's
+  workgroup limit is refused by name.**
+  `vulkan recorder: batched-MoE expert GEMM … needs N workgroups in one grid dimension, past this device's maxComputeWorkGroupCount[0] of L — run prefill in smaller batches (a smaller INFR_UBATCH)`.
+  The limit is the one the device reports, so a driver with a higher limit (RADV
+  reports 4,294,967,295) runs every shape it ran before. On a device at the
+  65,535 the spec guarantees (Intel ANV), such a grid was an invalid dispatch
+  the driver could truncate or reject; it is now this error. Only a chunk far
+  above the default reaches it there (a Llama 4 Scout-shaped expert up
+  projection passes 65,535 above 32,704 rows).
+
+- **`INFR_KV_OVERFLOW` spills the KV cache on a dense model, and no longer keeps
+  a default context that does not fit VRAM.** On Vulkan, with `kv.overflow` on,
+  a context infr sizes itself (no `--ctx` / `INFR_CTX`) is clamped to what fits
+  in VRAM, exactly as without the flag; it used to keep the model's whole
+  trained window and fail at load with a "below the streaming floor" error
+  (Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT` with 1880 MiB of room now opens at
+  6 174 tokens on the integrated GPU and 6 956 on the RX 7900 XTX). Below the
+  1024-token minimum a q8_0 cache that holds it is tried first, and when neither
+  format does the session opens at the minimum with its cache spilled to system
+  RAM. A context you set is never cut: q8_0 is tried first, then it is kept as
+  asked with its cache spilled. A spilled cache now runs, where on a dense model
+  it failed at weight placement or at the first allocation after the cache:
+  placement keeps the weights resident when they fit without the cache, and
+  streams them with the whole cache in system RAM when they do not and the cache
+  would leave the streaming arenas less than their floor; the cache takes only
+  the device memory the rest of the run is priced to need after it leaves free
+  (the activation reserve, the driver's own later allocations and
+  `kv.overflow_reserve_mb`), and runs at the shortest prefill chunk unless
+  `INFR_UBATCH` pins one. On the RX 7900 XTX, Qwen3-0.6B's 40960-token trained
+  window at 1880 MiB of room ran with 755 MB of its f16 cache in VRAM and 3.94
+  GB in system RAM, and gave the logits of the same cache wholly in VRAM bit for
+  bit. What cannot be served even spilled is refused, naming the sizes: before
+  the load, a spilled part larger than what the host can spare a run (after the
+  headroom host weight arenas leave the rest of the machine); before any weight
+  is uploaded, weights that leave the streaming arenas less than their floor
+  with the whole cache spilled; and after the weights are uploaded but before
+  any of the cache is allocated, a device whose measured free memory is below
+  what the run needs after the cache, or a spilled part that no longer fits the
+  host beside the weights' host tier. A cache the ladder serves whole is
+  allocated as without the flag; with more than one `infr serve` slot, a slot
+  that does not fit spills past the same reserve, its host part checked before
+  it is forked. `kv.overflow` does nothing (no context decision changes and no
+  KV buffer is placed in system RAM) on a unified-memory device (an integrated
+  GPU), where system RAM counts in the same budget as device memory so a spill
+  frees nothing, nor on a driver without `VK_EXT_memory_budget`, where the free
+  memory measured after the load does not see what infr has allocated. Without
+  `kv.overflow` nothing changes.
+- **`kv.overflow_reserve_mb` (`INFR_KV_OVERFLOW_RESERVE_MB`) is read.** It is
+  the device memory, in MiB, a cache `kv.overflow` spills leaves free on top of
+  what the run is priced to need after it; unset adds nothing, and a cache that
+  fits is sized without it. Nothing read the key before, so the documented
+  default of max(12% of VRAM, 2 GiB) was never applied.
+- **An `INFR_CACHE` (`paging.cache`) percentage is of the allocatable VRAM.**
+  `INFR_CACHE=80%` now means 80% of what the Vulkan allocator can still hand out
+  when placement runs (free VRAM less the allocation guard's 256 MiB headroom),
+  the same room every other placement budget uses, where it used to be 80% of
+  the free figure, so `INFR_CACHE=100%` no longer asks for memory the guard
+  refuses. Each percentage now yields 256 MiB times the percentage less than
+  before. An absolute size (`INFR_CACHE=8g`) is unchanged.
 - **`strftime_now` in chat templates is formatted by the C library, and accepts
   fewer conversions.** The date a template stamps (Llama 3.x and SmolLM3 write
   `Today Date:` with it) now comes from the C library's local-time conversion
@@ -1123,14 +1276,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Q4_K_M 610.0 and 620.9 to 680.6 and 672.1 (the LFM3 means include a cold first
   rep near 160 t/s; the warm reps reached 774.2 and 790.4 before, 863.5 and
   865.5 after). Decode is unchanged.
-- **The KV-cache estimate prices a recurrent layer at its fixed state size.**
-  The context fit and the placement sweep used to price a qwen35 DeltaNet layer
-  as if it cached K and V per token, so a qwen35 session's default context was
-  sized against memory the runner never allocates. They now price its conv and
-  `S` state (and LFM3's convolution history) at what is allocated, twice over:
-  the live state and the one snapshot of it a slot keeps for MTP rollback and
-  for resuming at a prefill boundary. The snapshot's allocation fails the
-  request when refused, so the fit now keeps room for it.
+- **The KV-cache estimate is the allocation, and auto-sized Qwen3.5 / Qwen3.6
+  contexts are about 3.4 to 3.5 times larger.** The context fit, the placement
+  sweeps and the MoE expert budget used to price a model of the cache: every
+  layer as per-token K and V rows, plus 64 spare rows per layer. They now sum
+  the buffers a session allocates, through the functions that allocate them, at
+  the backend's own row alignment, each buffer priced at what the device commits
+  for it (the new `Backend::kv_alloc_cost`, which Vulkan measures; see the
+  dedicated KV allocations under Fixed). A qwen35 DeltaNet layer (and an LFM3
+  short-convolution layer) is priced at its fixed-size state, twice over: the
+  live state and the one snapshot of it a slot keeps for MTP rollback and for
+  resuming at a prefill boundary, so a context fitted to fill the device leaves
+  room for the snapshot. Where the default context is clamped to VRAM it grows:
+  computed from the files' own geometry, Qwen3.5-0.8B Q4_K_M with 4 GiB free
+  fits 221 497 tokens where the old pricing gave 65 860, and Qwen3.5-4B
+  UD-Q4_K_XL with 8 GiB free fits 131 265 where it gave 37 924 (the old figures
+  are the old KV pricing under today's activation reserve). A device with room
+  for the trained context is unchanged, and a qwen35moe model keeps more experts
+  resident. Every other model's fit moves by the 64 rows per layer it no longer
+  reserves.
 - **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
   when the expert cache can hold the whole model.** A MoE layer decodes without
   reading its router ids back only once every one of its experts is in VRAM, and
@@ -1258,6 +1422,146 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Vulkan prefill of a MoE model whose expert width (`n_ff_exp`, or the model
+  width) is not a multiple of 64 no longer gives NaN or wrong logits.** The
+  batched expert GEMMs that run prefill chunks of more than `moe.small_m` rows
+  cover their output width in whole 64-column tiles; a width under one tile got
+  no workgroups and a longer one lost its last partial tile, so the expert FFN
+  read uninitialised scratch there. Shorter chunks were right. Such a model now
+  prefills on Vulkan in chunks of at most 64 rows (an explicit `INFR_UBATCH`
+  included), all through the small-m expert path, which is slower than the
+  batched GEMMs, and the recorder refuses a partial-tile width by name. Files
+  whose widths are multiples of 64 are unchanged — Qwen3-30B-A3B (768 and 2048)
+  and ERNIE-4.5-21B-A3B (1536 and 2560) are; no shipped MoE file is known that
+  is not. The failure was seen on a synthetic DeepSeek-V2 file with
+  `n_ff_exp` 32.
+- **`infr pull` gives the connections a finished file frees to the files still
+  downloading, whatever mode they started in.** A file of more than one 64 MiB
+  range now starts as ranges whenever the server serves them, even when every
+  connection is busy on other files; on one connection it is one request for the
+  whole file. It used to stream in that case, and a stream never takes a second
+  connection, so the tail of a shard set finished on one connection per file
+  while the rest of `hub.pull_jobs` sat idle. Now a file still downloading takes
+  freed connections at its chunk boundaries, up to one per 64 MiB range it has
+  left. Files that start together also split the spare connections
+  (`ceil(spare / starting files)` each) instead of the first one taking them
+  all. A server that answers a range with fewer bytes than asked keeps the whole
+  ranges it sent and is asked again for the rest. `hub.pull_jobs` of 0 or 1
+  still means one stream and one request per file for a fresh download (a ranged
+  partial already on disk is finished as ranges on that one connection).
+  Measured on `Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M` (4.68 GB, two shards),
+  cold, two alternated runs each: at `hub.pull_jobs = 2`, 62.3 / 91.2 s before
+  against 64.5 / 62.7 s after; at the default 8, 58.3 / 59.3 s against 59.0 /
+  64.4 s. The link (about 80 MB/s) capped both, so the gain shows only when one
+  connection is slow.
+- **A weight file that changes under a streaming run now fails the read that
+  touches it, instead of serving other bytes as weights.** With host or disk
+  paging on (`INFR_DRAM_CACHE`, or the streamed Vulkan tiers), each block read
+  re-stats the shard it read and fails with
+  `model file changed while it was being streamed: <path> (size changed A -> B bytes | modification time moved, size unchanged) …`
+  when the file was truncated or rewritten in place since the model was loaded
+  (`cp new.gguf live.gguf` is both). The pager's reader also no longer re-opens
+  the model by path: a model replaced by rename (`infr pull`'s way of installing
+  a file) between the load and the first paged read used to be read at the old
+  file's offsets when the two were the same size; it now keeps reading the file
+  that was loaded, as the mapping does. A file changed between the load and the
+  reader's creation is refused with
+  `model file changed after it was loaded, before it was streamed`.
+
+- **A prefill on a Vulkan GPU without cooperative matrices no longer refuses a
+  wide GEMM.** The tiled GEMMs that tier runs (the int8-dot `mmq` builds of
+  every quantised format, and the float `fma` GEMM for f16 / bf16 / f32 weights)
+  failed with
+  `vulkan adapter: non-coopmat prefill GEMM (m=…, out_f=…) needs N workgroups in one grid dimension, past the 65535 every Vulkan device guarantees`
+  once `ceil(m/64) * (out_f/64)` passed that limit, which a user-set
+  `INFR_UBATCH` on a very wide projection could reach. They now split such a
+  grid in two dimensions, as the other wide kernels do, with byte-identical
+  output. The resident Q4_K `mmq` GEMM a coopmat device takes for some Q4_K
+  shapes had no check at all and could be truncated by a driver that enforces
+  the limit (Intel ANV); it splits too (as does its Q6_K twin, which only tests
+  call). Grids under the limit are dispatched as before.
+
+- **Each backend in a process gets the default prefill chunk of its own device
+  class.** The default chunk came from the class of the first Vulkan device the
+  process opened, so a session on an integrated GPU opened after one on a
+  discrete card (`infr multi` with a model on each) prefilled at the discrete
+  chunk, which can trip the integrated GPU's watchdog, and a CPU run after an
+  integrated GPU took the integrated GPU's smaller chunk. A process with one
+  backend gets the same chunk as before.
+- **gemma4 files whose KV-sharing layers omit their K/V tensors now load.** A
+  file that declares `gemma4.attention.shared_kv_layers` may leave `attn_k`,
+  `attn_v` and `attn_k_norm` out of the layers that read an earlier layer's
+  cache, as llama.cpp allows; the `gemma-4-E4B-it-qat-GGUF` files checked
+  (unsloth UD-Q2_K_XL, prithivMLmods Q2_K) drop them from 18 of 42 layers. The
+  loader required `attn_k` and `attn_k_norm` on every attention layer and
+  refused such a file with `tensor not found: blk.24.attn_k.weight`. They are
+  now loaded on a sharing layer only when present; a layer that computes its own
+  K/V still refuses a missing one by name, and files that ship them on every
+  layer (gemma-4-E2B) load exactly as before.
+- **A Vulkan context is sized before the weights load as the load will leave it,
+  so a device too small for a usable window is refused before the weights load,
+  and no run keeps a context too small to use.** The fit before the load (the
+  default context's clamp and its q8_0 and refuse rungs, the explicit `--ctx`
+  q8_0 rung, `--ctx N%`, and `infr serve --parallel`'s per-slot window) held
+  back only the weights' file bytes, so it promised a window that the re-clamp
+  after the load then cut, or refused after a full weight load. It now also
+  holds back the weight arena's block rounding (at the least), the upload
+  staging ring and the reserve the re-clamp keeps for the driver's later
+  allocations. The re-clamp never keeps less than 1024 tokens, or the window
+  asked for when that is smaller: below it, a session whose cache format is
+  unset is served with a q8_0 cache if that holds the minimum,
+  `INFR_KV_OVERFLOW` keeps the minimum with the cache spilled, and otherwise the
+  run is refused naming what fits and what to try. On the integrated GPU under
+  `INFR_VRAM_LIMIT`, Qwen3-0.6B Q4_K_M was refused after a full load at 1000 MiB
+  above what was in use and ran with 524 and 980 tokens at 1100 and 1150 MiB; it
+  is now refused before the load at 1000 and 1100 MiB and runs with 1641 tokens
+  in q8_0 at 1150. Qwen3.5-0.8B Q4_K_M was refused after a full load at 1100 and
+  1200 MiB and is now refused before it. Where the clamp binds, the context is
+  now 108 tokens (Qwen3-0.6B) and 780 to 816 tokens (Qwen3.5-0.8B) smaller than
+  before, because that device charges about 12.4 MB less for the staging ring
+  than its size; on the RX 7900 XTX, which charges the ring in full, the sweep's
+  contexts end within 276 tokens of the old ones, above or below, varying
+  between runs. Two format choices move with the honest figure: a default
+  context whose q8_0 cache used to reach the trained window before the load (so
+  q8_0 was pinned, then cut after it) may now miss it, and then stays f16 at
+  fewer tokens; and an explicit `--ctx` close to the device's limit gets a q8_0
+  cache where it got f16, which would have used the driver's reserve. Without a
+  limit both models keep their trained window.
+- **Vulkan KV cache buffers each get their own device allocation, so a context
+  the fit accepts is no longer refused, or over-committed, over a shared
+  block.** A KV buffer below the 32 MiB dedicated threshold (every buffer of a
+  context clamped small, recurrent states, snapshots) was sub-allocated from
+  gpu-allocator's shared 256 MiB blocks, and a buffer that opened a new block
+  committed all of it, which neither the context fit nor the VRAM guard priced.
+  Every `BufferUsage::KvCache` buffer is now its own `vkAllocateMemory`, and
+  `Backend::kv_alloc_cost` (an `infr_core::KvAllocCost`) prices one: its size
+  rounded up by a step for small buffers and one for buffers of 2 MiB and more,
+  plus a fixed cost per allocation, all measured when the backend is built off
+  the process heap usage of a few probe allocations. On the integrated GPU
+  (RADV, RAPHAEL_MENDOCINO) that is a 4096-byte step in both classes and no
+  overhead; the RX 7900 XTX and other drivers were not probed, and a device that
+  cannot report its heap usage is priced by a guess (a 64 KiB and a 2 MiB step).
+  On the integrated GPU with Qwen3-0.6B Q4_K_M, `INFR_VRAM_LIMIT` from 2660 to
+  2730 MiB used to refuse the run at the guard and now runs (2640 to 2740 MiB,
+  contexts 13 060 to 13 974); what the KV allocation took from the device beyond
+  the estimate fell from 112 779 264 and 276 389 888 bytes (at 2640 and 2740
+  MiB) to 335 872 at every limit. A KV allocation that would pass the device's
+  `maxMemoryAllocationCount` is refused with the count and the limit.
+- **The Vulkan VRAM guard charges a pooled buffer what it commits.** A
+  device-local buffer below the dedicated threshold (activations, attention and
+  MoE scratch) is sub-allocated from one of gpu-allocator's shared blocks, which
+  the driver's live budget counts whole from the moment the block is opened. The
+  guard charged the buffer its own size on top, so near the budget it refused a
+  buffer that fit in an open block and committed nothing, and admitted one that
+  opened a new 256 MiB block when only the buffer's size was left. Under
+  `INFR_VRAM_LIMIT` on the RX 7900 XTX, an 8 MiB activation buffer was refused
+  with 4 186 112 bytes of room in a block that had room for it, and one that
+  opened a block left the device 130 027 520 bytes past the budget; the
+  integrated GPU did the same. The guard now keeps a copy of gpu-allocator's
+  shared blocks and charges nothing for a buffer that fits an open block and the
+  whole block for one that opens a block, whatever the buffer's size; its
+  refusal names the block. A device without `VK_EXT_memory_budget` is charged as
+  before.
 - **The production CPU's int8 activations keep the rest of a block that holds an
   outlier.** The int8 activation quantizer for K-quant, IQ, TQ and 256-wide Q8_0
   weights (`quantize_q8`) took one scale per 256 activations from the block's

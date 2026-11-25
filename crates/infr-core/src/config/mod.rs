@@ -182,7 +182,8 @@ cfg_struct! {
 cfg_struct! {
     /// Weight/expert paging and the VRAM-first spill budgets.
     PagingCfg / PartialPagingCfg {
-        /// `INFR_CACHE`: paged expert-cache budget.
+        /// `INFR_CACHE`: paged expert-cache budget. A percentage is of the allocatable room (free
+        /// VRAM less the allocation guard's headroom) when placement runs.
         cache: Option<SizeSpec> = None,
         /// `INFR_PAGER_RING`: upload staging ring. `None` = the budget-fraction policy.
         ring: Option<SizeSpec> = None,
@@ -510,6 +511,13 @@ cfg_struct! {
         pipeline_cache_disk: bool = true,
         /// `INFR_NO_VRAM_GUARD` — sanctioned negative field.
         no_vram_guard: bool = false,
+        /// `INFR_VRAM_LIMIT`: the most device memory each Vulkan device reports, in the shared
+        /// size grammar (a percentage is of the device's own figure). Caps the total and free
+        /// bytes `VulkanBackend::vram` returns, so the context fit, the placement budgets and the
+        /// allocation guard all budget against it; a limit at or above the device's memory does
+        /// nothing. Applied per device, to the figure the guard counts (every heap on a
+        /// unified-memory part). For testing memory pressure on a device with room to spare.
+        vram_limit: Option<SizeSpec> = None,
         /// `INFR_NO_MOE_SM_POOL` — sanctioned negative field.
         no_moe_sm_pool: bool = false,
         /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field. Read `is_ok()` in the Vulkan
@@ -834,8 +842,13 @@ cfg_struct! {
         ///   reassembled (measured on that object through `infr pull` itself, same 60-second
         ///   window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole 161 GB pull ran at
         ///   80.0 MB/s end to end);
-        /// * and the tail of a shard set, where fewer files remain than there are connections,
-        ///   gives the leftovers to the files still going.
+        /// * files that start together split the connections left over between them;
+        /// * and a connection freed by a finished file goes to the files still going, so the
+        ///   last file of a shard set ends up on every connection — as long as it still has that
+        ///   many 64 MiB ranges left to fetch; a file nearly done uses no more than its remaining
+        ///   ranges. Every file larger than one range is fetched as ranges for that reason, even
+        ///   one that starts with no connection to spare (on one connection it is still one
+        ///   request).
         ///
         /// ONE number for both because the axes MULTIPLY: a per-file bound and a per-range bound
         /// of 8 each is 64 sockets on a repo whose file count is the publisher's choice
@@ -843,9 +856,12 @@ cfg_struct! {
         /// each file holds a temp file and a progress LINE — a bar block taller than the terminal
         /// is the first of those to stop being free.
         ///
-        /// `0` and `1` both mean strictly one connection: one file at a time, never split. That is
-        /// the pre-concurrency behaviour, and the value to set when a proxy or a metered link wants
-        /// exactly one connection.
+        /// `0` and `1` both mean strictly one connection, one file at a time. A FRESH download is
+        /// then one request per file, with no probe — the pre-concurrency behaviour, and the value
+        /// to set when a proxy or a metered link wants exactly one connection. A ranged partial
+        /// already on disk (left by an interrupted run at a higher setting) is finished as ranges
+        /// on that one connection rather than thrown away: one request per run of missing ranges,
+        /// plus the probe `HEAD`.
         pull_jobs: usize = 8,
     }
 }
@@ -1211,6 +1227,17 @@ pub fn parse_device_spec(spec: &str, min: usize) -> Result<Vec<usize>, String> {
         ));
     }
     Ok(devs)
+}
+
+/// The part of a raw `device.dev` spec (`INFR_DEV`, `--dev`) that names a Vulkan device: the spec
+/// trimmed, or `None` when it is unset, empty, or names another backend (`metal` or `cpu`, in any
+/// case). What is left is a Vulkan index to `infr-vulkan`'s resolver (`VulkanN` or a bare `N`; an
+/// unparseable one is its hard error). That resolver and the test kit's "a Vulkan device was
+/// named" check (`infr_testkit::gpu_or_skip`) both decide through this, so they cannot disagree.
+pub fn vulkan_dev_spec(spec: Option<&str>) -> Option<&str> {
+    let s = spec?.trim();
+    let other_backend = s.eq_ignore_ascii_case("metal") || s.eq_ignore_ascii_case("cpu");
+    (!s.is_empty() && !other_backend).then_some(s)
 }
 
 /// The closest known config path to `typo`, for a did-you-mean suggestion. `None` when nothing is

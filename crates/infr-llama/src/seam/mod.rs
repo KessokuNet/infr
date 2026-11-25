@@ -320,7 +320,8 @@ fn cpu_paged_store(
         return Ok(None);
     };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::from_handles(&gguf.shard_handles())
+            .map_err(|e| anyhow!("{e}"))?,
     );
     let trace = infr_core::pager::trace::TraceFile::for_config(ec.paging.trace.as_deref())
         .map_err(|e| anyhow!("{e}"))?;
@@ -502,7 +503,7 @@ fn vulkan_host_tier(
                     anyhow::bail!("{what} host tier: streaming from disk needs GGUF shard ranges");
                 };
                 let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&gguf.shards())
+                    infr_core::blockio::FileBlockIo::from_handles(&gguf.shard_handles())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 tracing::info!(
@@ -574,7 +575,8 @@ fn vulkan_host_tier(
         return Ok(unpaged());
     };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::from_handles(&gguf.shard_handles())
+            .map_err(|e| anyhow!("{e}"))?,
     );
     let mut arena = 0usize;
     let mut out = Vec::with_capacity(classes.len());
@@ -1389,14 +1391,63 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
-/// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) takes the 1024 branch — byte-identical to before this existed, so
-/// no tuned dGPU shape moves.
+/// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed) takes the 1024
+/// branch — byte-identical to before this existed, so no tuned dGPU shape moves.
 fn default_ubatch_rows() -> usize {
-    match infr_vulkan::device_class() {
-        Some(d) => default_ubatch_rows_for(d.integrated, d.compute_units),
-        None => default_ubatch_rows_for(false, 0),
+    let (integrated, compute_units) = FIRST_DEVICE.get().copied().unwrap_or((false, 0));
+    default_ubatch_rows_for(integrated, compute_units)
+}
+
+/// The class of the first Vulkan device this process opened, recorded by `open_backend`. An
+/// un-pinned [`ubatch_rows`] has no backend to ask, so it needs one process-wide answer; a
+/// multi-device run does not rely on it (`backend_chunk_scope`, `PlacementPins::for_caps` size
+/// every wrapper from its own `Capabilities`).
+static FIRST_DEVICE: std::sync::OnceLock<(bool, u32)> = std::sync::OnceLock::new();
+
+/// Record a backend's class for [`default_ubatch_rows`]. First one wins.
+pub(crate) fn record_device_class(caps: &infr_core::backend::Capabilities) {
+    let _ = FIRST_DEVICE.set((caps.integrated, caps.compute_units));
+}
+
+/// Is a [`PlacementScope`] active on this thread?
+pub(crate) fn in_placement_scope() -> bool {
+    CURRENT_PINS.with(|c| c.borrow().is_some())
+}
+
+impl PlacementPins {
+    /// Fresh pins (nothing pinned) sized for a backend reporting `caps`: its default prefill
+    /// chunk is that backend class's.
+    pub(crate) fn for_caps(caps: &infr_core::backend::Capabilities) -> Self {
+        let pins = Self::default();
+        pins.ubatch.store(
+            default_ubatch_rows_for(caps.integrated, caps.compute_units),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pins
     }
+}
+
+/// The placement scope a one-shot entry point on `be` runs in: the caller's when one is active,
+/// else a fresh one sized for `be` ([`backend_chunk_scope`]), held for the whole call.
+pub(crate) fn enter_backend_scope(be: &dyn Backend) -> Option<PlacementScope> {
+    if in_placement_scope() {
+        None
+    } else {
+        Some(backend_chunk_scope(&be.capabilities()))
+    }
+}
+
+/// The host-memory check upstream ran before the first fork of a spilled engine. The fork's spill
+/// is placed per buffer against the declared `[[kv.window]]` (`alloc_kv_planned`, `kv_placement_fits`
+/// at open), so a session never allocates past a window it was admitted with: nothing to check here.
+pub(crate) fn refuse_unhostable_forks(
+    _be: &dyn Backend,
+    _cfg: &Config,
+    _ec: &EngineConfig,
+    _slot: &crate::seam::SeamKv,
+    _n_forks: usize,
+) -> AResult<()> {
+    Ok(())
 }
 
 /// [`default_ubatch_rows`] for a device of the given class (`compute_units` 0 = unknown).
@@ -5923,8 +5974,8 @@ mod seam_helper_tests {
     /// stderr; a CPU-only or discrete run checks them.
     fn default_chunk_is_discrete(test: &str) -> bool {
         use std::io::Write;
-        match infr_vulkan::device_class() {
-            Some(d) if d.integrated => {
+        match super::FIRST_DEVICE.get() {
+            Some(&(true, _)) => {
                 let _ = writeln!(
                     std::io::stderr().lock(),
                     "skip: {test} asserts the discrete default prefill chunk, and this process \
@@ -6660,6 +6711,7 @@ mod seam_helper_tests {
             available,
             live: true,
             uma: false,
+            limited_from: None,
         }
     }
 

@@ -4079,6 +4079,10 @@ pub(crate) fn generate_dense_backend_bound(
                             neox: true,
                             backward: false,
                         });
+                        // The fork applies the MLA YaRN magnitude by folding `mscale²` into
+                        // `Op::Mla`'s score scale (see `mla_scale` below), not by scaling the
+                        // query's rotary half — so no `Op::MulVec` gain is emitted here.
+                        // `docs/backlog.md` B246 carries the divergence and what closes it.
                         // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
                         // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
                         // llama.cpp folds it too ("pre-scale weights to avoid scaling operations
@@ -4242,6 +4246,28 @@ pub(crate) fn generate_dense_backend_bound(
                     let mscale = c.rope_attn_factor;
                     mscale * mscale / ((qk_nope + qk_rope) as f32).sqrt()
                 };
+                // The MLA query's rotary magnitude is folded into `Op::Mla`'s score scale below
+                // (`mla_scale`), the fork's implementation of it; no query-side gain is emitted.
+                // Mistral-Large-3's attention temperature (`Config::attn_temp_scale`). The
+                // reference multiplies each row of the absorbed query `[q_nope·wk_b | rope(q_pe)]`
+                // by its position's factor; absorption and rope are linear in the query, so
+                // scaling the query before the kernel does both gives the same scores. Every
+                // factor is exactly 1 until a row's position reaches the floor scale, so a batch
+                // wholly before it emits nothing and builds the graph it always did.
+                if c.attn_temp_scale != 0.0 && start_pos + batch > c.attn_temp_floor_scale as usize
+                {
+                    g.push(Op::AttnTemp {
+                        x: mla_q,
+                        dst: mla_q,
+                        rows: batch as u32,
+                        n: qrow,
+                        pos: start_pos as u32,
+                        floor_scale: c.attn_temp_floor_scale,
+                        scale: c.attn_temp_scale,
+                        // `deepseek2.cpp`'s `f_attn_temp_offset`.
+                        offset: 0,
+                    });
+                }
                 g.push(Op::Mla {
                     q: mla_q,
                     k_cache: k_cache[l],
