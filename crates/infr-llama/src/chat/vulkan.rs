@@ -193,7 +193,17 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
-        self.model.embed_vulkan(text, dimensions)
+        self.model
+            .embed(text, dimensions, crate::EmbedBackend::Vulkan)
+    }
+
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.model.preflight_images(images)
+    }
+
+    fn embed_image(&self, image: &[u8], dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.model
+            .embed_image(image, dimensions, crate::EmbedBackend::Vulkan)
     }
 
     fn generate(

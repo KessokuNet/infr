@@ -1,9 +1,10 @@
-//! `POST /v1/embeddings` — the OpenAI feature-extraction endpoint: one vector per input text, from
-//! an embedding model (EmbeddingGemma 2 — `docs/plan/22-embedding-models.md`).
+//! `POST /v1/embeddings` — the OpenAI feature-extraction endpoint: one vector per input, from an
+//! embedding model (EmbeddingGemma 2 — `docs/plan/22-embedding-models.md`).
 //!
 //! The vectors are the model's own pooled output: mean over the prompt's tokens, L2-normalized.
 //! `dimensions` truncates to the leading entries (Matryoshka) and renormalizes, matching what the
-//! model card requires of a shortened vector.
+//! model card requires of a shortened vector. An input is a text string or an `image_url` part
+//! (a base64 `data:` URI), the same image shape a chat message carries.
 
 use super::*;
 
@@ -15,8 +16,10 @@ const MAX_EMBEDDING_INPUTS: usize = 256;
 pub(crate) struct EmbeddingsRequest {
     #[serde(default)]
     model: String,
-    /// A string, or an array of strings. Token-id arrays are refused: embedding a caller's ids
-    /// would skip the model's own `<bos>`/`<eos>` framing, which changes the vector.
+    /// A string, an array of strings, or an array of content parts (`{"type":"text","text":…}`,
+    /// `{"type":"image_url","image_url":{"url":"data:…"}}`). Token-id arrays are refused:
+    /// embedding a caller's ids would skip the model's own `<bos>`/`<eos>` framing, which changes
+    /// the vector.
     input: serde_json::Value,
     #[serde(default)]
     dimensions: Option<usize>,
@@ -24,29 +27,64 @@ pub(crate) struct EmbeddingsRequest {
     encoding_format: Option<String>,
 }
 
+/// One decoded input: a text to embed, or an image's bytes for the vision encoder.
+pub(crate) enum EmbedItem {
+    Text(String),
+    Image(Arc<[u8]>),
+}
+
 impl EmbeddingsRequest {
-    /// The texts to embed, validated: non-empty, string-only, and within the batch cap.
-    fn texts(&self) -> Result<Vec<String>, ParamError> {
+    /// The inputs to embed, validated: non-empty strings or data-URI images, within the request's
+    /// batch and image caps.
+    fn items(&self) -> Result<Vec<EmbedItem>, ParamError> {
         let bad = |message: String| ParamError {
             param: "input",
             message,
         };
-        let one = |v: &serde_json::Value| match v {
-            serde_json::Value::String(s) if s.is_empty() => {
-                Err(bad("input: an empty string cannot be embedded".to_string()))
+        let one = |v: &serde_json::Value| -> Result<EmbedItem, ParamError> {
+            match v {
+                serde_json::Value::String(s) if s.is_empty() => Err(bad(
+                    "input: an empty string cannot be embedded".to_string(),
+                )),
+                serde_json::Value::String(s) => Ok(EmbedItem::Text(s.clone())),
+                serde_json::Value::Number(_) | serde_json::Value::Array(_) => Err(bad(
+                    "input: token ids are not supported — send text, so the model's own <bos>/<eos> \
+                     framing is applied"
+                        .to_string(),
+                )),
+                serde_json::Value::Object(_) => match v.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => match v.get("text").and_then(|t| t.as_str()) {
+                        Some(t) if !t.is_empty() => Ok(EmbedItem::Text(t.to_string())),
+                        _ => Err(bad("input: a text part needs a non-empty `text`".to_string())),
+                    },
+                    Some("image_url") | Some("image") => {
+                        let url = v
+                            .get("image_url")
+                            .and_then(|u| u.get("url").or(Some(u)))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("");
+                        Ok(EmbedItem::Image(decode_image_data_uri(url, "input")?))
+                    }
+                    // An OpenAI-style `image_url` object without a `type` is still unambiguous.
+                    _ if v.get("image_url").is_some() => {
+                        let url = v
+                            .get("image_url")
+                            .and_then(|u| u.get("url").or(Some(u)))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("");
+                        Ok(EmbedItem::Image(decode_image_data_uri(url, "input")?))
+                    }
+                    _ => Err(bad(
+                        "input: a part needs `type` `text` or `image_url`".to_string(),
+                    )),
+                },
+                _ => Err(bad(
+                    "input: expected a string, or an array of strings or content parts".to_string(),
+                )),
             }
-            serde_json::Value::String(s) => Ok(s.clone()),
-            serde_json::Value::Number(_) | serde_json::Value::Array(_) => Err(bad(
-                "input: token ids are not supported — send text, so the model's own <bos>/<eos> \
-                 framing is applied"
-                    .to_string(),
-            )),
-            _ => Err(bad(
-                "input: expected a string or an array of strings".to_string()
-            )),
         };
-        let texts = match &self.input {
-            serde_json::Value::String(_) => vec![one(&self.input)?],
+        let items = match &self.input {
+            serde_json::Value::String(_) | serde_json::Value::Object(_) => vec![one(&self.input)?],
             serde_json::Value::Array(items) => {
                 if items.is_empty() {
                     return Err(bad("input: the array is empty".to_string()));
@@ -61,17 +99,27 @@ impl EmbeddingsRequest {
             }
             _ => {
                 return Err(bad(
-                    "input: expected a string or an array of strings".to_string()
+                    "input: expected a string, or an array of strings or content parts".to_string(),
                 ));
             }
         };
+        let images = items
+            .iter()
+            .filter(|i| matches!(i, EmbedItem::Image(_)))
+            .count();
+        if images > infr_engine::MAX_REQUEST_IMAGES {
+            return Err(bad(format!(
+                "input: {images} images exceeds the {}-image cap",
+                infr_engine::MAX_REQUEST_IMAGES
+            )));
+        }
         if self.dimensions == Some(0) {
             return Err(ParamError {
                 param: "dimensions",
                 message: "dimensions: must be at least 1".to_string(),
             });
         }
-        Ok(texts)
+        Ok(items)
     }
 
     /// Whether the vectors go out as base64 of the little-endian f32 bytes (OpenAI's non-default
@@ -107,8 +155,8 @@ pub(crate) async fn embeddings_handler(
         Ok(j) => j,
         Err(e) => return param_error(None, e.body_text()),
     };
-    let texts = match req.texts() {
-        Ok(t) => t,
+    let items = match req.items() {
+        Ok(i) => i,
         Err(e) => return param_error(Some(e.param), e.message),
     };
     let base64 = match req.base64_encoding() {
@@ -122,6 +170,20 @@ pub(crate) async fn embeddings_handler(
             "embeddings: no model is loaded".to_string(),
         );
     };
+    // A model without a vision projector refuses images here, on the headers, before any work:
+    // the same `validate_images` the chat route gates on.
+    let images: Vec<Arc<[u8]>> = items
+        .iter()
+        .filter_map(|i| match i {
+            EmbedItem::Image(b) => Some(b.clone()),
+            EmbedItem::Text(_) => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        if let Err(e) = engine.validate_images(&images) {
+            return param_error(Some("input"), format!("input: {e}"));
+        }
+    }
     // One permit per request, the same bound generation uses: a CPU embedding forward would
     // otherwise pile a burst of requests onto the CPU at once.
     let permit = match entry.slots.clone().acquire_owned().await {
@@ -137,9 +199,12 @@ pub(crate) async fn embeddings_handler(
     let started = std::time::Instant::now();
     let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(Vec<f32>, usize)>> {
         let _permit = permit;
-        let mut out = Vec::with_capacity(texts.len());
-        for text in &texts {
-            out.push(engine.embed(text, dims)?);
+        let mut out = Vec::with_capacity(items.len());
+        for item in &items {
+            out.push(match item {
+                EmbedItem::Text(text) => engine.embed(text, dims)?,
+                EmbedItem::Image(bytes) => engine.embed_image(bytes, dims)?,
+            });
         }
         Ok(out)
     })
@@ -232,6 +297,24 @@ mod tests {
                 v.truncate(d);
             }
             Ok((v, text.len()))
+        }
+
+        fn validate_images(&self, _images: &[Arc<[u8]>]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn embed_image(
+            &self,
+            image: &[u8],
+            dimensions: Option<usize>,
+        ) -> anyhow::Result<(Vec<f32>, usize)> {
+            // A marker distinct from the text path's, plus the byte length, so a test can tell
+            // an image row from a text row.
+            let mut v = vec![22.0, image.len() as f32, 0.0];
+            if let Some(d) = dimensions {
+                v.truncate(d);
+            }
+            Ok((v, image.len()))
         }
 
         fn chat(
@@ -393,5 +476,63 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("does not support embeddings"), "{message}");
+    }
+
+    /// `data:image/png;base64,` + four bytes.
+    const TINY_PNG_URI: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    #[tokio::test]
+    async fn an_image_input_is_embedded_through_the_vision_hook() {
+        let body_json = serde_json::json!({
+            "input": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]
+        });
+        let (status, body) = post(router(Arc::new(EmbedGen)), &body_json.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The image marker (22.0) and the decoded byte count (8), not the text path's (11.0).
+        assert_eq!(
+            body["data"][0]["embedding"],
+            serde_json::json!([22.0, 8.0, 0.0])
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 8);
+    }
+
+    #[tokio::test]
+    async fn text_and_image_parts_keep_their_order() {
+        let body_json = serde_json::json!({
+            "input": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_URI}},
+            ]
+        });
+        let (status, body) = post(router(Arc::new(EmbedGen)), &body_json.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"][0]["embedding"][0], 11.0);
+        assert_eq!(body["data"][1]["embedding"][0], 22.0);
+    }
+
+    #[tokio::test]
+    async fn a_model_without_vision_refuses_an_image_before_any_work() {
+        let body_json = serde_json::json!({
+            "input": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]
+        });
+        let (status, body) = post(router(Arc::new(NoEmbedGen)), &body_json.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["param"], "input");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_image_data_uri_is_a_400() {
+        for url in [
+            "data:image/png;base64",
+            "data:image/png,notbase64",
+            "https://example.com/x.png",
+        ] {
+            let body_json = serde_json::json!({
+                "input": [{"type": "image_url", "image_url": {"url": url}}]
+            });
+            let (status, body) = post(router(Arc::new(EmbedGen)), &body_json.to_string()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+            assert_eq!(body["error"]["param"], "input", "{url}");
+        }
     }
 }

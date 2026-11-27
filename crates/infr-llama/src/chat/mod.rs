@@ -107,6 +107,20 @@ pub trait ChatModel {
         anyhow::bail!("this model does not support embeddings")
     }
 
+    /// Whether this backend can accept images in a prompt at all, and whether these bytes are a
+    /// usable image for it — the pre-header check `infr serve` runs before it commits to a request
+    /// (and before the vision tower runs). Default: refuse, which is every model without an
+    /// `mmproj`.
+    fn validate_images(&self, _images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        anyhow::bail!("image input is not supported by this model/backend")
+    }
+
+    /// Embed one image through the `mmproj` vision encoder (P4). Default: refuse, with the reason a
+    /// decoder would have no encoder anyway.
+    fn embed_image(&self, _image: &[u8], _dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this model does not support image embeddings")
+    }
+
     /// Drop any persistent KV-session state so the NEXT `generate` re-prefills its prompt from
     /// scratch. The serve-side forced-tool fallback uses this: after a constrained attempt has
     /// advanced the session past the primed `<tool_call>` opener, resetting before the unconstrained

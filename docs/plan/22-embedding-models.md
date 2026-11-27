@@ -1,9 +1,10 @@
 # Plan 22: embedding models
 
-Status: P1–P3 shipped (`infr embed` and `POST /v1/embeddings` on CPU and Vulkan, cosine
-0.9993–0.9999 against `llama-embedding`); P4 (image input) open. Scope fixed by cappy on 2026-11-27:
-text first, then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an
-upstream PR; expose `/v1/embeddings`; CPU and Vulkan (Metal last).
+Status: P1–P4 shipped. `infr embed` and `POST /v1/embeddings` serve text and images on CPU and
+Vulkan; text matches `llama-embedding` at cosine 0.9993–0.9999 and image embedding is 0.9998 across
+the two backends. Audio is its own task (INFR-71). Scope fixed by cappy on 2026-11-27: text first,
+then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an upstream PR;
+expose `/v1/embeddings`; CPU and Vulkan (Metal last).
 
 ## Problem
 
@@ -74,10 +75,12 @@ a table handle and make it optional; the E2B prologue already runs the model-lev
 RMSNorm as graph ops (`per_layer_model_proj` / `per_layer_proj_norm` uploads,
 `crates/infr-llama/src/seam/runner.rs:1488`), which is the half this model has.
 
-**Surface.** `infr embed -m <gguf> -p <text> [--dimensions N]` prints one JSON vector per input;
-`POST /v1/embeddings` takes the OpenAI shape (`input`: string or array, `model`, `dimensions`,
-`encoding_format`), returns `object: "list"`, per-item `index`, and `data[].embedding`. Prefixes stay
-caller-side and get documented.
+**Surface.** `infr embed -m <gguf> -p <text> [--image <path>] [--dimensions N]` prints one JSON vector
+per input; `POST /v1/embeddings` takes the OpenAI shape (`input`: a string, or an array of strings and
+`{"type":"text"|"image_url"}` parts, `model`, `dimensions`, `encoding_format`), returns
+`object: "list"`, per-item `index`, and `data[].embedding`. Images are base64 `data:` URIs, the same
+shape a chat message carries, and need the model's `mmproj`. Prefixes stay caller-side and get
+documented.
 
 ## Phases
 
@@ -95,13 +98,23 @@ caller-side and get documented.
   seam, so `/v1/embeddings` reaches the device without a second embeddings engine. GPU vs CPU
   0.9995–0.9999, GPU vs `llama-embedding` 0.9998–0.9999.
 - **P4 — image input.** EmbeddingGemma 2's `mmproj` is Gemma 4's vision (170M) plus audio (300M)
-  encoders; vision rides the existing `serve.mmproj` plumbing from INFR-46 for image inputs to the
-  embeddings route. Audio is its own task.
+  encoders. Vision rides the `serve.mmproj` plumbing from INFR-46: `SeamModel::embed_image` enters a
+  `MediaScope`, `encode_prompt` runs the tower and lays out `<|image>` + soft tokens + `<image|>`,
+  and the batched forward splices the rows through `TokenEmbd::prompt_rows`. The route takes an
+  `image_url` content part beside text ones (`infr embed --image` on the CLI). Three things this
+  phase had to fix, all latent because no image had ever run through the seam: `encode_prompt` now
+  frames the sequence with `<bos>`/`<eos>` BEFORE recording the placeholder spans (the embedding
+  pass wants the specials, a chat template already renders them); `validate_token_ids` accepts
+  media ids, which are above the vocabulary but never reach the table; and the serialised
+  `SeamGenerator` gained `validate_images`, so a serve with a projector accepts images at all.
+  CPU vs Vulkan on the same image: 0.999805 and 0.999833; two different images: 0.7775; one image
+  is bit-identical run to run. Video is frames through this path plus audio, so it is not separate
+  code; audio is INFR-71.
 
 ## Non-goals
 
 - Generation from an embedding model (no canvas, no chat template, no sampling).
-- Audio embeddings in P1–P4.
+- Audio, and therefore video, embeddings — split out as INFR-71.
 - Model conversion; the GGUF is the input format.
 
 ## Verification

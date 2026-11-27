@@ -43,7 +43,16 @@ impl ChatModel for CpuDenseChat {
     fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
         // The reference forward is the CPU one even when `metal` drives generation: the embedding
         // pass is a single batched forward and Metal's embedding path is P3+'s work.
-        self.model.embed_cpu(text, dimensions)
+        self.model.embed(text, dimensions, crate::EmbedBackend::Cpu)
+    }
+
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.model.preflight_images(images)
+    }
+
+    fn embed_image(&self, image: &[u8], dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.model
+            .embed_image(image, dimensions, crate::EmbedBackend::Cpu)
     }
 
     fn generate(

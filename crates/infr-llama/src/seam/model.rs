@@ -63,6 +63,14 @@ pub struct BenchPlacement {
     pub submit_cap: usize,
 }
 
+/// Which backend an embedding pass runs on (`docs/plan/22-embedding-models.md`): both reach the
+/// same batched all-rows forward, and the pooling stays on the host either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedBackend {
+    Cpu,
+    Vulkan,
+}
+
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
@@ -1160,7 +1168,7 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         // Images (if any) become placeholder ids + an embedding override the runner reads; the
         // guard keeps that override published for exactly this generation.
-        let (prompt_tokens, _media) = self.encode_prompt(prompt, session.max_ctx, req)?;
+        let (prompt_tokens, _media) = self.encode_prompt(prompt, session.max_ctx, req, false)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = crate::StreamOffsets::default();
         let slot = session
@@ -1342,12 +1350,17 @@ impl SeamModel {
     /// mtmd and HF's Gemma 4 processor both produce), and the returned guard publishes the encoded
     /// image rows for the runner until it drops. A prompt without markers is plain [`encode`].
     ///
+    /// `frame` wraps the whole sequence in the model's `<bos>`/`<eos>` (as the embedding pass wants)
+    /// BEFORE the placeholder spans are recorded, so the positions stay right; the chat paths pass
+    /// `false` because their template already renders the specials.
+    ///
     /// [`encode`]: Self::encode
     pub(crate) fn encode_prompt(
         &self,
         prompt: &str,
         max_ctx: usize,
         req: Option<&crate::sampling::RequestCtx>,
+        frame: bool,
     ) -> Result<(Vec<u32>, Option<crate::media::OverrideScope>)> {
         use crate::media::{
             current_media, EmbedOverride, OverrideScope, IMAGE_MARKER, MEDIA_ID_BASE,
@@ -1368,10 +1381,19 @@ impl SeamModel {
             ));
         }
         let counts = self.image_token_counts(&media)?;
-        let text: Vec<Vec<u32>> = parts
+        let mut text: Vec<Vec<u32>> = parts
             .iter()
             .map(|part| self.encode_text(part))
             .collect::<Result<_>>()?;
+        if frame {
+            let md = self.weights.metadata();
+            if let (Some(bos), Some(first)) = (special_bos(md), text.first_mut()) {
+                first.insert(0, bos);
+            }
+            if let (Some(eos), Some(last)) = (special_eos(md), text.last_mut()) {
+                last.push(eos);
+            }
+        }
         let text_len = text
             .iter()
             .try_fold(0usize, |n, p| n.checked_add(p.len()))
@@ -1555,58 +1577,92 @@ impl SeamModel {
         )
     }
 
-    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s embedding-model twin: one bidirectional
-    /// prefill of `text` and the model's own pooling (mean, then L2 normalize), on the CPU
-    /// reference backend. `dimensions` truncates the vector (Matryoshka) and renormalizes. Returns
-    /// the vector and the number of prompt tokens it was pooled over (the server's `usage`). See
-    /// `docs/plan/22-embedding-models.md`.
+    /// Embed one prompt on `backend` (`docs/plan/22-embedding-models.md`): the model's own pooling
+    /// over one bidirectional batched pass. `prompt` may carry [`media::IMAGE_MARKER`]s when the
+    /// caller has entered a [`media::MediaScope`] for this thread — [`embed_image`](Self::embed_image)
+    /// is the one-image wrapper. `dimensions` truncates the vector (Matryoshka) and renormalizes;
+    /// the token count is what `usage` reports.
     ///
-    /// Tokenized with the model's special tokens — `<bos>`…`<eos>` for EmbeddingGemma 2 — exactly
-    /// as the reference embedding tool's `common_tokenize(vocab, text, true, true)` does. The EOS
-    /// is one of the rows that gets pooled, so leaving it out moves the vector by ~0.1 cosine.
-    pub fn embed_cpu(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
-        let tokens = self.embedding_tokens(text)?;
-        let vector = crate::seam::embed_cpu(
-            &*self.weights,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &tokens,
-            dimensions,
-        )?;
+    /// Tokenized with the model's special tokens — `<bos>`…`<eos>` for EmbeddingGemma 2 — exactly as
+    /// the reference embedding tool's `common_tokenize(vocab, text, true, true)` does. The EOS is one
+    /// of the pooled rows, so leaving it out moves the vector by ~0.1 cosine.
+    pub fn embed(
+        &self,
+        prompt: &str,
+        dimensions: Option<usize>,
+        backend: EmbedBackend,
+    ) -> Result<(Vec<f32>, usize)> {
+        let (tokens, _override) = self.embedding_tokens(prompt)?;
+        let vector = self.embed_tokens(&tokens, dimensions, backend)?;
         Ok((vector, tokens.len()))
     }
 
-    /// [`embed_cpu`](Self::embed_cpu) on the Vulkan backend: the same batched all-rows forward, one
-    /// device, the host pooling unchanged (`docs/plan/22-embedding-models.md` P3).
-    pub fn embed_vulkan(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
-        let tokens = self.embedding_tokens(text)?;
-        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
-            .map_err(|e| anyhow!("vulkan init: {e}"))?;
-        let vector = crate::seam::embed_vulkan(
-            &vk,
-            &*self.weights,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &tokens,
-            dimensions,
-        )?;
-        Ok((vector, tokens.len()))
+    /// Embed one image (PNG/JPEG/GIF/WebP bytes) through the `mmproj` vision encoder: the rows are
+    /// spliced into the bidirectional pass the same way an image reaches a chat prompt
+    /// (`docs/plan/22-embedding-models.md` P4).
+    pub fn embed_image(
+        &self,
+        image: &[u8],
+        dimensions: Option<usize>,
+        backend: EmbedBackend,
+    ) -> Result<(Vec<f32>, usize)> {
+        let image: std::sync::Arc<[u8]> = std::sync::Arc::from(image);
+        self.preflight_images(std::slice::from_ref(&image))?;
+        let _media = crate::media::MediaScope::enter(vec![image]);
+        self.embed(crate::media::IMAGE_MARKER, dimensions, backend)
     }
 
-    /// An embedding input's token ids: the model's `<bos>`/`<eos>` framing around the text, which is
-    /// what the reference embedding tool feeds (`common_tokenize(vocab, text, true, true)`). The EOS
-    /// is one of the pooled rows, so dropping it moves the vector by ~0.1 cosine.
-    fn embedding_tokens(&self, text: &str) -> Result<Vec<u32>> {
+    /// The batched forward itself, on the backend the caller named.
+    fn embed_tokens(
+        &self,
+        tokens: &[u32],
+        dimensions: Option<usize>,
+        backend: EmbedBackend,
+    ) -> Result<Vec<f32>> {
+        match backend {
+            EmbedBackend::Cpu => crate::seam::embed_cpu(
+                &*self.weights,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                tokens,
+                dimensions,
+            ),
+            EmbedBackend::Vulkan => {
+                let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+                    .map_err(|e| anyhow!("vulkan init: {e}"))?;
+                crate::seam::embed_vulkan(
+                    &vk,
+                    &*self.weights,
+                    &self.cfg,
+                    &self.ecfg,
+                    self.embd(),
+                    self.per_layer_embd.as_ref(),
+                    tokens,
+                    dimensions,
+                )
+            }
+        }
+    }
+
+    /// An embedding input's token ids: the model's `<bos>`/`<eos>` framing around the text (or
+    /// around the image's `<|image>`…`<image|>` span), which is what the reference embedding tool
+    /// feeds. The returned guard publishes the vision rows for the forward and must outlive it.
+    fn embedding_tokens(
+        &self,
+        prompt: &str,
+    ) -> Result<(Vec<u32>, Option<crate::media::OverrideScope>)> {
         let md = self.weights.metadata();
+        if prompt.contains(crate::media::IMAGE_MARKER) {
+            let (ids, scope) = self.encode_prompt(prompt, self.cfg.n_ctx_train, None, true)?;
+            return Ok((ids, scope));
+        }
         let mut tokens = Vec::new();
         tokens.extend(special_bos(md));
-        tokens.extend(self.encode(text)?);
+        tokens.extend(self.encode(prompt)?);
         tokens.extend(special_eos(md));
-        Ok(tokens)
+        Ok((tokens, None))
     }
 
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s MTP Phase 1 twin (issue #33,

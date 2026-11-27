@@ -202,6 +202,17 @@ pub trait ChatGenerator: Send + Sync {
     fn embed(&self, _text: &str, _dimensions: Option<usize>) -> anyhow::Result<(Vec<f32>, usize)> {
         anyhow::bail!("this model does not support embeddings")
     }
+
+    /// Embed one image (raw PNG/JPEG/GIF/WebP bytes) through the model's `mmproj` vision encoder.
+    /// Default: refuse — a decoder brand has no embeddings at all, and an embedding model without a
+    /// projection refuses here too (`docs/plan/22-embedding-models.md` P4).
+    fn embed_image(
+        &self,
+        _image: &[u8],
+        _dimensions: Option<usize>,
+    ) -> anyhow::Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this model does not support image embeddings")
+    }
     /// Ready a request before it waits for a slot, and before a stream's `200` goes out: render
     /// its prompt, count it, build whatever it needs to generate, and hand all of that back as a
     /// [`PreparedRequest`] the server passes to [`chat_prepared`](Self::chat_prepared), so the
@@ -3566,6 +3577,39 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
+/// Decode an `image_url` `data:` URI into image bytes, with the size caps every image path shares.
+/// Only `data:` URIs are accepted — the server never fetches a URL on a client's behalf — and the
+/// decoded bytes are checked against [`infr_engine::MAX_IMAGE_BYTES`] after the (4/3) base64 bound.
+pub(crate) fn decode_image_data_uri(
+    url: &str,
+    param: &'static str,
+) -> Result<Arc<[u8]>, ParamError> {
+    use base64::Engine as _;
+    let bad = |message: String| ParamError { param, message };
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Err(bad(
+            "image_url must be a base64 data: URI (remote image URLs are not fetched)".into(),
+        ));
+    };
+    let Some((meta, data)) = rest.split_once(',') else {
+        return Err(bad("malformed image data: URI".into()));
+    };
+    if !meta.ends_with(";base64") {
+        return Err(bad("image data: URI must be base64-encoded".into()));
+    }
+    let data = data.trim();
+    if data.len() > infr_engine::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
+    if bytes.len() > infr_engine::MAX_IMAGE_BYTES {
+        return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+    }
+    Ok(Arc::from(bytes))
+}
+
 /// [`flatten_content`], keeping images: each `image_url` part becomes an
 /// [`infr_engine::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`,
 /// so the two stay in the same order. Only `data:` URIs are accepted — the server never fetches
@@ -3575,7 +3619,6 @@ pub fn flatten_content_media(
     v: &Option<serde_json::Value>,
     images: &mut Vec<Arc<[u8]>>,
 ) -> Result<String, ParamError> {
-    use base64::Engine as _;
     let marker = infr_engine::IMAGE_MARKER;
     let strip = |t: &str| t.replace(marker, "");
     let Some(serde_json::Value::Array(parts)) = v else {
@@ -3595,36 +3638,13 @@ pub fn flatten_content_media(
                     .and_then(|u| u.get("url").or(Some(u)))
                     .and_then(|u| u.as_str())
                     .unwrap_or("");
-                let bad = |message: String| ParamError {
-                    param: "messages",
-                    message,
-                };
                 if images.len() >= infr_engine::MAX_REQUEST_IMAGES {
-                    return Err(bad("at most four images are allowed per request".into()));
+                    return Err(ParamError {
+                        param: "messages",
+                        message: "at most four images are allowed per request".into(),
+                    });
                 }
-                let Some(rest) = url.strip_prefix("data:") else {
-                    return Err(bad(
-                        "image_url must be a base64 data: URI (remote image URLs are not fetched)"
-                            .into(),
-                    ));
-                };
-                let Some((meta, data)) = rest.split_once(',') else {
-                    return Err(bad("malformed image data: URI".into()));
-                };
-                if !meta.ends_with(";base64") {
-                    return Err(bad("image data: URI must be base64-encoded".into()));
-                }
-                let data = data.trim();
-                if data.len() > infr_engine::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
-                }
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
-                if bytes.len() > infr_engine::MAX_IMAGE_BYTES {
-                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
-                }
-                images.push(Arc::from(bytes));
+                images.push(decode_image_data_uri(url, "messages")?);
                 out.push_str(marker);
             }
             _ => {}

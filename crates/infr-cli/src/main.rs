@@ -576,14 +576,18 @@ enum Cmd {
         #[command(flatten)]
         device: DeviceOpts,
     },
-    /// Embed text with an embedding model (EmbeddingGemma 2): one mean-pooled, L2-normalized
-    /// vector per input, printed as JSON. CPU reference backend only for now — the Vulkan kernel
-    /// for the symmetric window is `docs/plan/22-embedding-models.md` P3.
+    /// Embed text or images with an embedding model (EmbeddingGemma 2): one mean-pooled,
+    /// L2-normalized vector per input, printed as JSON. `--dev vulkan` runs the same batched
+    /// forward on the device (`docs/plan/22-embedding-models.md`); images need the model's `mmproj`.
     Embed {
         model: String,
         /// Text to embed; repeat the flag for several inputs.
-        #[arg(short = 'p', long = "prompt", value_name = "TEXT", num_args = 1.., required = true)]
+        #[arg(short = 'p', long = "prompt", value_name = "TEXT", num_args = 1..)]
         input: Vec<String>,
+        /// Image to embed (PNG/JPEG/GIF/WebP); repeatable. Read through the model's `mmproj`
+        /// (`serve.mmproj`, or an `mmproj*.gguf` beside the checkpoint).
+        #[arg(long = "image", value_name = "PATH")]
+        images: Vec<PathBuf>,
         /// Truncate each vector to this many leading dimensions (Matryoshka) and renormalize.
         #[arg(long)]
         dimensions: Option<usize>,
@@ -895,9 +899,10 @@ fn dispatch(
         Cmd::Embed {
             model,
             input,
+            images,
             dimensions,
             ..
-        } => cmd_embed(&model, &input, dimensions, cfg),
+        } => cmd_embed(&model, &input, &images, dimensions, cfg),
         Cmd::Compare {
             models,
             sweep,
@@ -2378,6 +2383,18 @@ impl infr_server::ChatGenerator for SeamGenerator {
         lock_recovered(&self.model).embed(text, dimensions)
     }
 
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> anyhow::Result<()> {
+        lock_recovered(&self.model).validate_images(images)
+    }
+
+    fn embed_image(
+        &self,
+        image: &[u8],
+        dimensions: Option<usize>,
+    ) -> anyhow::Result<(Vec<f32>, usize)> {
+        lock_recovered(&self.model).embed_image(image, dimensions)
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -3145,28 +3162,42 @@ fn cmd_perplexity(
 }
 
 // `infr embed`: one mean-pooled, L2-normalized vector per input, as an OpenAI-shaped JSON list.
+// Texts come first, then the `--image` files, each keeping its own order.
 fn cmd_embed(
     model: &str,
     inputs: &[String],
+    images: &[std::path::PathBuf],
     dimensions: Option<usize>,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
+    if inputs.is_empty() && images.is_empty() {
+        anyhow::bail!("`infr embed` needs at least one `-p/--prompt` or `--image`");
+    }
     let (gguf, tok) = resolve(model, cfg)?;
     let watch = infr_llama::WeightWatch::open_model(&gguf)?;
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let mut data = Vec::with_capacity(inputs.len());
-    // `--dev vulkan` runs the same batched forward on the device; the CPU reference backend is the
-    // default. Both pool on the host, so the vectors differ only by the kernels' rounding.
-    let on_vulkan = matches!(selected_backend(cfg)?, Backend::Vulkan(_));
+    let backend = match selected_backend(cfg)? {
+        Backend::Vulkan(_) => infr_llama::EmbedBackend::Vulkan,
+        Backend::Cpu => infr_llama::EmbedBackend::Cpu,
+        Backend::Metal => {
+            anyhow::bail!("`infr embed` has no Metal embedding path yet — use --dev cpu")
+        }
+    };
+    let mut data = Vec::with_capacity(inputs.len() + images.len());
     for (index, text) in inputs.iter().enumerate() {
-        let (embedding, _tokens) = if on_vulkan {
-            loaded.embed_vulkan(text, dimensions)?
-        } else {
-            loaded.embed_cpu(text, dimensions)?
-        };
+        let (embedding, _tokens) = loaded.embed(text, dimensions, backend)?;
         data.push(serde_json::json!({
             "object": "embedding",
             "index": index,
+            "embedding": embedding,
+        }));
+    }
+    for (n, path) in images.iter().enumerate() {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let (embedding, _tokens) = loaded.embed_image(&bytes, dimensions, backend)?;
+        data.push(serde_json::json!({
+            "object": "embedding",
+            "index": inputs.len() + n,
             "embedding": embedding,
         }));
     }

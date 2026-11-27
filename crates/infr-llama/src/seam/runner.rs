@@ -99,8 +99,16 @@ fn qwen35_gguf_tensor_name<'a>(g: &dyn WeightSource, c: &Config, name: &'a str) 
 /// out of bounds and panic; surface a clean error instead. Only caller-supplied ids (prompt,
 /// denoise canvas) can be arbitrary — generated ids are always sampling/grammar-bounded to
 /// `< vocab`, so the decode loop never needs this.
+///
+/// Image placeholder ids ({`\u{2265}` [`crate::media::MEDIA_ID_BASE`]}) are legal despite being far
+/// above the vocabulary: they never reach the table. `TokenEmbd::prompt_rows` swaps the vision
+/// rows in, the per-layer gather maps them to pad id 0, and a chunk carrying them forces the
+/// host-embed path instead of the on-device gather.
 fn validate_token_ids(ids: &[u32], vocab: usize) -> AResult<()> {
-    if let Some(&bad) = ids.iter().find(|&&t| t as usize >= vocab) {
+    if let Some(&bad) = ids
+        .iter()
+        .find(|&&t| t as usize >= vocab && !crate::media::is_media_id(t))
+    {
         return Err(anyhow!(
             "token id {bad} out of range for vocab size {vocab}"
         ));
@@ -6024,7 +6032,10 @@ pub(crate) fn generate_dense_backend_bound(
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
-        let vf_hidden = token_embd.rows(&prompt[start..], ne, vf_scale)?;
+        // `prompt_rows`, not `rows`: a multmodal request (an image embedding) has vision rows
+        // published for placeholder positions above the vocabulary.
+        let vf_hidden =
+            token_embd.prompt_rows(&prompt[start..], start, ne, vf_scale, media.as_deref())?;
         let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
         let vf_hidden_buf = be
             .alloc(m * ne * 4, BufferUsage::Staging)
@@ -7634,8 +7645,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_token_ids_accepts_image_placeholders() {
+        // The vision splice replaces these rows; they must not be treated as vocabulary ids.
+        let tag = crate::media::MEDIA_ID_BASE | 17;
+        assert!(validate_token_ids(&[0, 1, tag], 100).is_ok());
+    }
+
+    #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
-        assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+        // Below the media base but far past the vocabulary: still a real id, still refused.
+        assert!(validate_token_ids(&[crate::media::MEDIA_ID_BASE - 1], 100).is_err());
     }
 
     // ── what a slot reuses across turns ───────────────────────────────────────────────────────

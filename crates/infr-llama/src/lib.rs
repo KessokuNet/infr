@@ -17,7 +17,7 @@ pub mod arch;
 pub mod chat;
 mod config;
 pub mod seam;
-pub use seam::model::{BenchPlacement, PplReport, SeamModel};
+pub use seam::model::{BenchPlacement, EmbedBackend, PplReport, SeamModel};
 pub mod diffusion;
 mod util;
 pub(crate) use util::*;
