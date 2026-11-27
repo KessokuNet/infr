@@ -1773,6 +1773,34 @@ impl MetalBackend {
         self.encode_tg_w(r, pso, bufs, u32::MAX, params, threads, tg);
     }
 
+    /// The split-KV kernel to run for `hd`, with its simdgroups-per-threadgroup count: the
+    /// 32-wide variant when it fits this device's threadgroup cap (a paravirtual/CI GPU can cap
+    /// below its 1024 threads), else the 8-wide one. Both non-causal masks (canvas and banded)
+    /// route through their own dedicated kernels and share this choice.
+    fn split_kv_kernel(
+        &self,
+        name32: &'static str,
+        name8: &'static str,
+        hd: usize,
+    ) -> Result<(&'static str, usize)> {
+        let fits = |name: &'static str, threads: u64| -> Result<bool> {
+            Ok(self
+                .pipelines
+                .get(name)?
+                .max_total_threads_per_threadgroup()
+                >= threads)
+        };
+        if hd <= 128 && fits(name32, 1024)? {
+            Ok((name32, 32))
+        } else if fits(name8, 256)? {
+            Ok((name8, 8))
+        } else {
+            Err(Error::Unsupported(format!(
+                "metal attention: split kernel {name8} doesn't fit this device's threadgroup cap"
+            )))
+        }
+    }
+
     /// `encode_tg` with an explicit WRITE mask (bit i = `bufs[i]` is written by the dispatch).
     /// The mask only matters on the decode replay tape, where it drives exact barrier placement
     /// under the concurrent encoder — un-annotated dispatches replay serialized.
@@ -4274,10 +4302,19 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Canvas { lo } => Some(lo),
                     _ => None,
                 };
+                // EmbeddingGemma 2's symmetric band (`AttnMask::Banded`,
+                // docs/plan/22-embedding-models.md): row `ti` attends
+                // `[abs-half, min(kv_len, abs+half+1))` — per-row bounds, neither causal nor fixed,
+                // so no ordinary tier expresses it. Routed to its own split-KV kernel below.
+                let banded_half = match mask {
+                    infr_core::graph::AttnMask::Banded { half } => Some(half),
+                    _ => None,
+                };
                 let window: u32 = match mask {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                     infr_core::graph::AttnMask::Canvas { .. } => 0,
+                    infr_core::graph::AttnMask::Banded { .. } => 0,
                 };
                 // Canvas is a denoise-prefill mask, never autoregressive decode, so it should
                 // never reach the record-once replay tape (rows==1, dyn-pos) — no dyn-pos canvas
@@ -4292,14 +4329,15 @@ impl MetalBackend {
                 // Q8_0's attention family (attention_q8kv/attnvec_q8kv/attnflash2_q8kv_*) has no
                 // split-canvas sibling — only the f16 path below (native cache or the
                 // dequant-prepass scratch, which covers every other KV dtype) supports canvas.
-                if canvas_lo.is_some()
+                if (canvas_lo.is_some() || banded_half.is_some())
                     && (g.desc(k_cache).dtype == DType::Q8_0
                         || g.desc(v_cache).dtype == DType::Q8_0)
                 {
                     return Err(Error::Unsupported(
-                        "metal attention: AttnMask::Canvas over a Q8_0 KV cache has no kernel yet \
-                         — f16 cache (native or block-quant dequant-prepassed) only so far"
-                            .into(),
+                        "metal attention: AttnMask::Canvas/Banded over a Q8_0 KV cache has no \
+                         kernel yet — f16 cache (native or block-quant dequant-prepassed) only so \
+                         far"
+                        .into(),
                     ));
                 }
                 // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) and the CSA top-k
@@ -4311,9 +4349,9 @@ impl MetalBackend {
                 // — so route here unconditionally and refuse the shapes this family cannot serve.
                 if sinks.is_some() || key_bias.is_some() {
                     let (kdt, vdt) = (g.desc(k_cache).dtype, g.desc(v_cache).dtype);
-                    if canvas_lo.is_some() || r.posbuf.is_some() {
+                    if canvas_lo.is_some() || banded_half.is_some() || r.posbuf.is_some() {
                         return Err(Error::Unsupported(
-                            "metal attention: sinks/key_bias under AttnMask::Canvas or on a \
+                            "metal attention: sinks/key_bias under AttnMask::Canvas/Banded or on a \
                              decode-replay tape have no kernel (that family is causal/SWA, static)"
                                 .into(),
                         ));
@@ -4671,6 +4709,43 @@ impl MetalBackend {
                 // (Q8_0 was rejected earlier — no split-canvas sibling for it yet).
                 // UNVERIFIED: this whole branch is Phase D's blind Metal work — never run on
                 // hardware; CPU + Vulkan remain the validated references for Canvas.
+                if let Some(half) = banded_half {
+                    // EmbeddingGemma 2's symmetric band: per-row `[abs-half, abs+half+1)`, so the
+                    // dedicated band kernel (ATTNSPLIT_BAND_KERNEL) — the ordinary tiers derive a
+                    // causal end from `pos + ti` and cannot reach FORWARD. Params below are the
+                    // struct's own fields (no repurposing, unlike canvas): `kv_len` is the real
+                    // cache length, `window` the half-width, `pos` the batch's first position.
+                    let split32_name = if f16 {
+                        "attention_band32_f16kv"
+                    } else {
+                        "attention_band32_f32"
+                    };
+                    let split_name = if f16 {
+                        "attention_band_f16kv"
+                    } else {
+                        "attention_band_f32"
+                    };
+                    let (kern, nsg) = self.split_kv_kernel(split32_name, split_name, hd)?;
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&(half as u32).to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), k_raw, v_raw, bd.as_ref()],
+                        &p,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 if let Some(lo) = canvas_lo {
                     let split32_name = if f16 {
                         "attention_canvas32_f16kv"
@@ -4682,26 +4757,7 @@ impl MetalBackend {
                     } else {
                         "attention_canvas_f32"
                     };
-                    // Same threadgroup-cap gating as the ordinary split32/split kernels below
-                    // (maxTotalThreadsPerThreadgroup is per-pipeline; a paravirtual/CI device can
-                    // cap it below the 32-wide kernel's 1024 threads, degrading to the 8-wide one).
-                    let fits = |name: &'static str, threads: u64| -> Result<bool> {
-                        Ok(self
-                            .pipelines
-                            .get(name)?
-                            .max_total_threads_per_threadgroup()
-                            >= threads)
-                    };
-                    let (kern, nsg) = if hd <= 128 && fits(split32_name, 1024)? {
-                        (split32_name, 32usize)
-                    } else if fits(split_name, 256)? {
-                        (split_name, 8usize)
-                    } else {
-                        return Err(Error::Unsupported(format!(
-                            "metal attention: canvas split kernel {split_name} doesn't fit this \
-                             device's threadgroup cap"
-                        )));
-                    };
+                    let (kern, nsg) = self.split_kv_kernel(split32_name, split_name, hd)?;
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     // Repurposed `kv_len` slot (dead in this kernel — see the macro's doc): the
@@ -5904,6 +5960,13 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Causal => (0u32, 0u32, 0u32),
                     infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32, 0u32),
                     infr_core::graph::AttnMask::Canvas { lo } => (2u32, 0u32, lo as u32),
+                    infr_core::graph::AttnMask::Banded { .. } => {
+                        return Err(Error::Unsupported(
+                            "metal Op::Mla: AttnMask::Banded — the MLA kernel carries no \
+                             symmetric-window mode (and no MLA arch is an embedding model)"
+                                .into(),
+                        ));
+                    }
                 };
                 let bq = self.ensure_device(r, q)?;
                 let bcache = metal_buf(

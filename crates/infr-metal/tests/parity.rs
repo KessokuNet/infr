@@ -4689,6 +4689,9 @@ fn mla_mask_ring_parity() {
             (abs + 1).saturating_sub(w)..(abs + 1).min(kv_len)
         }
         infr_core::graph::AttnMask::Canvas { lo } => lo..kv_len,
+        infr_core::graph::AttnMask::Banded { half } => {
+            abs.saturating_sub(half)..(abs + half + 1).min(kv_len)
+        }
     };
 
     let cases = [
@@ -6062,4 +6065,44 @@ fn gather_rows_parity() {
     let bound = vec![(s, f32_bytes(&src)), (i, i32_bytes(&[0, 3]))];
     let mtl = run(&mtl_be, &g, &bound, dst, 4);
     assert_eq!(mtl, vec![1.0, 2.0, -7.0, -7.0]);
+}
+
+// `AttnMask::Banded` (EmbeddingGemma 2's symmetric window, docs/plan/22-embedding-models.md):
+// row `ti` at absolute position `pos + ti` attends `[abs - half, min(kv_len, abs + half + 1))`.
+// `rows` is small enough that the band's forward reach crosses rows written LATER in the same
+// batch — the property the ordinary causal tiers cannot express and the reason for a dedicated
+// kernel.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_banded_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos, half) =
+        (5usize, 64usize, 4usize, 2usize, 64usize, 10usize, 8usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Banded { half },
+        pos: pos as u32,
+        sinks: None,
+        key_bias: None,
+        comp: None,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 192))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 193))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }

@@ -1,9 +1,10 @@
 # Plan 22: embedding models
 
-Status: P1–P4 shipped, plus the Metal backend (implemented, `cfg(target_os = "macos")`, unverified here
-— no macOS host in this lab). `infr embed` and `POST /v1/embeddings` serve text and images on CPU and
-Vulkan; text matches `llama-embedding` at cosine 0.9993–0.9999 and image embedding is 0.9998 across
-the two backends. Audio is its own task (INFR-71). Scope fixed by cappy on 2026-11-27: text first,
+Status: P1–P4 shipped and verified on this host (text and image embeddings on CPU and Vulkan; text
+matches `llama-embedding` at cosine 0.9993–0.9999, GPU-vs-CPU 0.9994–0.9999, image 0.9998 across the
+two backends), plus the Metal backend, which has its own banded kernel and a CPU-vs-Metal parity test
+run by the macOS CI job — no Apple hardware in this lab, so its end-to-end corpus check is INFR-120.
+Audio is its own task (INFR-71). Scope fixed by cappy on 2026-11-27: text first,
 then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an upstream PR;
 expose `/v1/embeddings`; CPU and Vulkan (Metal last).
 
@@ -114,9 +115,15 @@ documented.
 
 - **Metal (last).** `EmbedBackend::Metal`, `SeamModel::embed_metal` and the two Metal chat models'
   `embed`/`embed_image`/`validate_images`, all under `cfg(target_os = "macos")` and mirroring the
-  Vulkan path. NOT compiled or run in this lab: the host is Linux, and a cross `cargo check
-  --target aarch64-apple-darwin` dies in `esaxx-rs`/`ring` C++ builds that need a macOS SDK. Verify
-  on Apple hardware with the same corpus (CPU vs Metal cosine ≥ 0.999).
+  Vulkan path. The band itself is `ATTNSPLIT_BAND_KERNEL` in `shaders/attention.metal` (a split-KV
+  kernel with per-row `[abs-half, abs+half+1)` bounds, routed from `exec.rs` before the causal
+  tiers; canvas and banded now share `split_kv_kernel`'s threadgroup-cap choice) and
+  `AttnOp::Mla` refuses the mask it can never see.
+  No Apple hardware in this lab: the crate and its tests are cross-checked here with the CI's
+  `cargo clippy --target aarch64-apple-darwin` set, and the numerics are covered by
+  `attention_banded_matches_reference` in `crates/infr-metal/tests/parity.rs`, which the macOS
+  runner executes under `cargo test -p infr-metal -- --include-ignored`. Still to do on real Apple
+  hardware: the same corpus (CPU vs Metal cosine ≥ 0.999), tracked as INFR-120.
 
 ## Non-goals
 
