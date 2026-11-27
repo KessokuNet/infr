@@ -40,6 +40,12 @@ impl ChatModel for CpuDenseChat {
         self.model.config().qwen4_exp.is_none()
     }
 
+    fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        // The reference forward is the CPU one even when `metal` drives generation: the embedding
+        // pass is a single batched forward and Metal's embedding path is P3+'s work.
+        self.model.embed_cpu(text, dimensions)
+    }
+
     fn generate(
         &mut self,
         prompt: &str,

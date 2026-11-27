@@ -2526,10 +2526,12 @@ impl CpuBackend {
                     // `pos`); `Canvas` (DiffusionGemma denoise — see `AttnMask::Canvas`'s doc)
                     // ignores `pos` entirely and gives every row the SAME fixed bidirectional
                     // range `[lo, kv_len)`.
-                    let (window, canvas_lo) = match mask {
-                        AttnMask::Causal => (0usize, None),
-                        AttnMask::SlidingWindow(w) => (w, None),
-                        AttnMask::Canvas { lo } => (0usize, Some(lo)),
+                    let (window, canvas_lo, band) = match mask {
+                        AttnMask::Causal => (0usize, None, 0usize),
+                        AttnMask::SlidingWindow(w) => (w, None, 0),
+                        AttnMask::Canvas { lo } => (0usize, Some(lo), 0),
+                        // non-causal symmetric window: both ends clip at `±half`.
+                        AttnMask::Banded { half } => (0usize, None, half),
                     };
                     let mut out = rc.for_overwrite(rows * nh * hd);
                     // Each (ti, h) pair writes exactly one hd-sized output slice with no
@@ -2543,6 +2545,10 @@ impl CpuBackend {
                         let (lo, hi) = match canvas_lo {
                             // bidirectional: every row attends the same fixed [lo, kv_len).
                             Some(clo) => (clo, kv_len),
+                            // non-causal symmetric band: [abs - half, abs + half] in both directions.
+                            None if band > 0 => {
+                                (abs.saturating_sub(band), (abs + band + 1).min(kv_len))
+                            }
                             // causal (± SWA): [lo, abs] — SWA clips lo to abs-window+1.
                             None => {
                                 let lo = if window > 0 && abs + 1 > window {
@@ -4101,6 +4107,10 @@ impl CpuBackend {
                         AttnMask::Causal => (0usize, None),
                         AttnMask::SlidingWindow(w) => (w, None),
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
+                        // `Banded` is the embedding-model mask; no MLA arch is non-causal.
+                        AttnMask::Banded { .. } => {
+                            panic!("cpu backend: AttnMask::Banded on Op::Mla")
+                        }
                     };
                     let hf = qkr / 2; // rope pair count
                     let mla_freqs = self.rope_freqs(theta, qkr);

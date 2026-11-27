@@ -35,11 +35,12 @@ compares against.
 
 ## Design
 
-**The forward pass is the existing dense prefill.** No new graph, no sampling loop, no KV
-persistence: tokenize, run one prefill over the whole prompt with `max_new = 0`, and read the
-per-position head rows through the existing `prefill_logits` tap
-(`crates/infr-llama/src/seam/runner.rs:621`, `[positions * head_rows]`). An embedding request is a
-one-shot batch, so the prefill chunking, the slot machinery and the cache are all unchanged.
+**The forward pass is the existing dense forward, taken whole.** No new graph, no sampling loop,
+no persistent KV: tokenize, run ONE batched pass over the whole prompt with `max_new = 0`, and read
+the per-position head rows from that pass's `verify` output (`[tokens * head_rows]`). The ordinary
+prefill path is not it — it withholds the last prompt token for the decode loop, which a `max_new =
+0` request never runs, so the batched teacher-forced (`verify`) branch is what covers every row in
+one go. It is dense-only, which every embedding arch is.
 
 **The head is the embedding projection.** `output.weight` is `[768, 512]`, not `[vocab, n_embd]`.
 `Config::head_rows()` returns `n_embd_out` when the GGUF carries `embedding_length_out` and

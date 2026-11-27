@@ -29,7 +29,10 @@ use anyhow::{anyhow, Result as AResult};
 pub(super) fn expected_weight_shape(c: &Config, name: &str) -> Option<Vec<usize>> {
     let ne = c.n_embd;
     match name {
-        "token_embd.weight" | "output.weight" => return Some(vec![ne, c.vocab]),
+        "token_embd.weight" => return Some(vec![ne, c.vocab]),
+        // An embedding model projects to `n_embd_out` instead of the vocabulary; the head's width
+        // is what the graph's `Op::Linear` indexes, so the two must agree here.
+        "output.weight" => return Some(vec![ne, c.head_rows()]),
         "output_norm.weight" => return Some(vec![ne]),
         // V4's hyper-connection head, collapsing the `hc_mult` residual streams before
         // `output_norm`.

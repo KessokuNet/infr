@@ -40,6 +40,14 @@ pub enum AttnMask {
     /// `lo` from the prompt length `P` and the layer's SWA window; this variant only carries the
     /// already-resolved value.
     Canvas { lo: usize },
+    /// Embedding-model symmetric band: every query row `i` attends the keys at absolute positions
+    /// `[i - half, i + half]`, clipped to `[0, kv_len)`. This is llama.cpp's
+    /// `LLAMA_SWA_TYPE_SYMMETRIC` under `causal = false` (`src/llama-hparams.h:553`: masked when
+    /// `|p0 - p1| > n_swa / 2`), which is how a non-causal Gemma SWA layer sees its window —
+    /// [`AttnMask::SlidingWindow`] is the same window clipped causally and is wrong for that arch.
+    /// EmbeddingGemma 2 sets `half = swa_window / 2` on its sliding-window layers; its
+    /// full-attention layers take [`AttnMask::Canvas`] with `lo = 0`.
+    Banded { half: usize },
 }
 
 /// Activation used by the gated FFN (`act(gate) * up`).

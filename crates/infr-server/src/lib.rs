@@ -10,6 +10,7 @@
 //!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
 //!   POST /v1/completions        -> text_completion | SSE text_completion stream (raw prompt, no template) (auth)
+//!   POST /v1/embeddings         -> { object: "list", data: [{ object, index, embedding }], usage }   (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
@@ -52,6 +53,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 mod completions;
+mod embeddings;
 mod host;
 mod idle;
 #[cfg(test)]
@@ -193,6 +195,13 @@ pub trait ChatGenerator: Send + Sync {
     /// computed once rather than counting the vocabulary each time.
     fn vocab_size(&self) -> usize;
 
+    /// Embed one text for `/v1/embeddings`: the pooled vector (already L2-normalized, and
+    /// truncated + renormalized to `dimensions` when given) and the prompt's token count for
+    /// `usage`. The default refuses: a decoder generator has no embedding head, and only the CPU
+    /// dense seam names one (`docs/plan/22-embedding-models.md`).
+    fn embed(&self, _text: &str, _dimensions: Option<usize>) -> anyhow::Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this model does not support embeddings")
+    }
     /// Ready a request before it waits for a slot, and before a stream's `200` goes out: render
     /// its prompt, count it, build whatever it needs to generate, and hand all of that back as a
     /// [`PreparedRequest`] the server passes to [`chat_prepared`](Self::chat_prepared), so the
@@ -2165,6 +2174,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/completions",
             post(completions::completions_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
+        )
+        .route(
+            "/v1/embeddings",
+            post(embeddings::embeddings_handler)
                 .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
         )
         // Images arrive inline as base64 data URIs, so a chat request can be megabytes; axum's

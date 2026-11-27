@@ -235,6 +235,7 @@ pub fn op_label(op: &Op, g: &Graph) -> String {
                 AttnMask::Causal => "causal",
                 AttnMask::SlidingWindow(_) => "swa",
                 AttnMask::Canvas { .. } => "canvas",
+                AttnMask::Banded { .. } => "banded",
             }
         ),
         Op::MoeFfn {

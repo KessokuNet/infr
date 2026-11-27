@@ -19,6 +19,7 @@ use infr_gguf::{Gguf, TensorBytes};
 
 mod dsv4_emit;
 mod dsv4_plan;
+mod embed;
 mod kv_store;
 mod kv_tier;
 mod mirror;
@@ -31,6 +32,7 @@ mod sc;
 mod weights;
 mod wshape;
 
+pub(crate) use embed::embed_cpu;
 pub(crate) use kv_store::{capture_upto, prefix_store_for, store_key, BlockCache};
 pub(crate) use kv_tier::{KvStore, NoStore};
 pub(crate) use mirror::{attach as attach_mirror, LiveWindow};

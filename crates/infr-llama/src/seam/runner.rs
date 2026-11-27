@@ -678,6 +678,8 @@ pub(crate) fn generate_dense_backend_bound(
     // gemma4 E2B (gemma3n): per-layer input embeddings + KV-layer sharing.
     let e2b = c.n_embd_per_layer > 0;
     let npl = c.n_embd_per_layer;
+    // Width of the LM head's output: `vocab` for a decoder, `n_embd_out` for an embedding model.
+    let head = c.head_rows();
 
     // Session-stable derivations (per-layer tensor scans + real dequants, all pure in
     // `(caps, g, c, env)`): computed ONCE at cold init, stashed in `SeamKv`, and reused via `Arc`
@@ -733,8 +735,15 @@ pub(crate) fn generate_dense_backend_bound(
     // Op::EmbedGather, table = per_layer_token_embd, scale = sqrt(npl)) — the last host-side
     // per-token gather. Costs the quantized table's on-disk size in VRAM (uploaded once);
     // unlocks the chained decode for E2B (its host ipl gather was the stale-rows blocker).
+    // The per-layer TOKEN table gemma4 E2B gathers from. EmbeddingGemma 2 has the same per-layer
+    // inputs (`n_embd_per_layer`) but no table at all — its PLE is the model-level projection
+    // alone — so every gather/upload below gates on the table, not on the width.
+    let ple_table = e2b
+        && g.tensors()
+            .iter()
+            .any(|t| t.name == "per_layer_token_embd.weight");
     let gpu_ple = gpu_embed
-        && e2b
+        && ple_table
         && (c.n_layer * npl).is_multiple_of(32)
         && g.tensors()
             .iter()
@@ -1818,7 +1827,7 @@ pub(crate) fn generate_dense_backend_bound(
         };
         // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
         // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
-        let ipl_buf = if e2b && !gpu_ple {
+        let ipl_buf = if ple_table && !gpu_ple {
             Some(
                 be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -1827,7 +1836,7 @@ pub(crate) fn generate_dense_backend_bound(
             None
         };
         let logits_buf = be
-            .alloc(c.vocab * 4, BufferUsage::Readback)
+            .alloc(c.head_rows() * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
             weights,
@@ -2416,7 +2425,7 @@ pub(crate) fn generate_dense_backend_bound(
         // Internal filled by an Op::EmbedGather from the resident table — `pl_gathered` marks
         // that the driver must NOT bind it (DecodeHandles.pl_tok_in goes out as None).
         let pl_gathered = use_ids && gpu_ple;
-        let pl_tok_in = if e2b {
+        let pl_tok_in = if ple_table {
             Some(if pl_gathered {
                 g.internal(f32d(batch * c.n_layer * npl))
             } else {
@@ -2943,7 +2952,7 @@ pub(crate) fn generate_dense_backend_bound(
         // No logits Output is declared and the whole LM-head tail (output_norm RmsNorm over the
         // chunk, last-row Copy, vocab-wide Linear, Softcap, sampling ops) is skipped — the
         // graph's effect is purely its KV writes.
-        let logits = (logits_rows > 0).then(|| g.output(f32d(c.vocab * logits_rows)));
+        let logits = (logits_rows > 0).then(|| g.output(f32d(head * logits_rows)));
 
         // scratch (sized to the per-layer max × batch; ops reallocate dst, so these are upper bounds)
         let hn = g.internal(f32d(batch * ne));
@@ -3210,14 +3219,16 @@ pub(crate) fn generate_dense_backend_bound(
             }
         }
 
-        // gemma4 E2B prologue: compute the full per-(token,layer) input vector `per_layer_inp`
-        // ([batch, n_layer*npl]) that the layer loop below consumes, on the GPU — matches
-        // llama.cpp's split (host: gather+dequant the per-layer token embedding row; GPU: the
+        // gemma4 E2B / embeddinggemma-2 prologue: compute the full per-(token,layer) input vector
+        // `per_layer_inp` ([batch, n_layer*npl]) that the layer loop below consumes, on the GPU —
+        // matches llama.cpp's split (host: gather+dequant the per-layer token embedding row; GPU: the
         // model_proj GEMV + RMSNorm + combine). `hidden` here is already the scaled token
         // embedding (`emb = token_embd[tok] * embed_scale`), so it IS the `emb` the host version
-        // used to dot against `model_proj`.
-        let per_layer_inp =
-            if let (Some(mp_w), Some(pn_w), Some(pl_tok_in)) = (mp_w, pn_w, pl_tok_in) {
+        // used to dot against `model_proj`. EmbeddingGemma 2 ships no per-layer token table
+        // (`pl_tok_in` is `None`): its per-layer inputs are the projection alone, with no
+        // `(proj + emb)/√2` combine (`gemma-embedding2.cpp`'s `build_inp_per_layer`).
+        let per_layer_inp = match (mp_w, pn_w) {
+            (Some(mp_w), Some(pn_w)) => {
                 let nlnpl = c.n_layer * npl;
                 let acc = g.internal(f32d(batch * nlnpl));
                 g.push(Op::Linear {
@@ -3244,23 +3255,28 @@ pub(crate) fn generate_dense_backend_bound(
                     dim: npl as u32,
                     eps,
                 });
-                let ipl = g.internal(f32d(batch * nlnpl));
-                g.push(Op::Add {
-                    a: normed,
-                    b: pl_tok_in,
-                    dst: ipl,
-                    n: (batch * nlnpl) as u32,
-                });
-                g.push(Op::Scale {
-                    x: ipl,
-                    dst: ipl,
-                    s: 1.0 / 2f32.sqrt(),
-                    n: (batch * nlnpl) as u32,
-                });
-                Some(ipl)
-            } else {
-                None
-            };
+                match pl_tok_in {
+                    Some(pl_tok_in) => {
+                        let ipl = g.internal(f32d(batch * nlnpl));
+                        g.push(Op::Add {
+                            a: normed,
+                            b: pl_tok_in,
+                            dst: ipl,
+                            n: (batch * nlnpl) as u32,
+                        });
+                        g.push(Op::Scale {
+                            x: ipl,
+                            dst: ipl,
+                            s: 1.0 / 2f32.sqrt(),
+                            n: (batch * nlnpl) as u32,
+                        });
+                        Some(ipl)
+                    }
+                    None => Some(normed),
+                }
+            }
+            _ => None,
+        };
 
         // Phase-B perf: DiffusionGemma in-graph canvas embedding (ported from the reference's
         // `dg_canvas_embed` in diffusion-gemma.cpp — see docs/diffusion-gemma.md's Phase-B).
@@ -3447,6 +3463,18 @@ pub(crate) fn generate_dense_backend_bound(
                     0
                 };
                 AttnMask::Canvas { lo }
+            } else if c.non_causal {
+                // EmbeddingGemma 2: bidirectional. A full-attention layer sees the whole prompt
+                // (`Canvas`'s "every row attends [lo, kv_len)" with `lo = 0`); a sliding-window
+                // layer sees the SYMMETRIC window a non-causal model masks with —
+                // `|p0 - p1| <= n_swa / 2` (`src/llama-hparams.h:553`).
+                if swa {
+                    AttnMask::Banded {
+                        half: c.swa_window / 2,
+                    }
+                } else {
+                    AttnMask::Canvas { lo: 0 }
+                }
             } else if swa {
                 AttnMask::SlidingWindow(c.swa_window)
             } else {
@@ -5431,7 +5459,7 @@ pub(crate) fn generate_dense_backend_bound(
                 dst: logits,
                 m: logits_rows as u32,
                 in_f: ne as u32,
-                out_f: c.vocab as u32,
+                out_f: head as u32,
                 w_off: 0,
             });
             if c.final_softcap > 0.0 {
@@ -5439,7 +5467,7 @@ pub(crate) fn generate_dense_backend_bound(
                     x: logits,
                     dst: logits,
                     cap: c.final_softcap,
-                    n: (c.vocab * logits_rows) as u32,
+                    n: (head * logits_rows) as u32,
                 });
             }
             // GPU-resident sampling: pick the token ON the device so only the 4-byte id crosses
@@ -5453,7 +5481,7 @@ pub(crate) fn generate_dense_backend_bound(
                 g.push(Op::Argmax {
                     x: logits,
                     dst: tid,
-                    n: c.vocab as u32,
+                    n: head as u32,
                     rows: logits_rows as u32,
                 });
                 (Some(tid), None)
@@ -5464,7 +5492,7 @@ pub(crate) fn generate_dense_backend_bound(
                     x: logits,
                     u: uin,
                     dst: tid,
-                    n: c.vocab as u32,
+                    n: head as u32,
                     top_k: sampler.top_k as u32,
                     temp: sampler.temp,
                     top_p: sampler.top_p,
@@ -6005,7 +6033,7 @@ pub(crate) fn generate_dense_backend_bound(
             .alloc(m * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         let vf_logits_buf = be
-            .alloc(m * c.vocab * 4, BufferUsage::Readback)
+            .alloc(m * c.head_rows() * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
             .map_err(|e| anyhow!("{e}"))?;
@@ -6124,7 +6152,7 @@ pub(crate) fn generate_dense_backend_bound(
             be.download(ib.as_ref(), bytemuck::cast_slice_mut(out_ids))
                 .map_err(|e| anyhow!("{e}"))?;
         } else {
-            out_logits.resize(m * c.vocab, 0.0);
+            out_logits.resize(m * c.head_rows(), 0.0);
             be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
                 .map_err(|e| anyhow!("{e}"))?;
         }
@@ -6231,7 +6259,7 @@ pub(crate) fn generate_dense_backend_bound(
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
-    let mut logits = vec![0f32; c.vocab];
+    let mut logits = vec![0f32; c.head_rows()];
     // INFR_PROF_STAGES=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
     let prof = ec.prof.stages;
     let mut prompt_t = std::time::Duration::ZERO;
@@ -6637,7 +6665,7 @@ pub(crate) fn generate_dense_backend_bound(
                     let pf_logits_buf = match pf_h.logits {
                         Some(lg) => {
                             let buf = be
-                                .alloc(head_rows * c.vocab * 4, BufferUsage::Staging)
+                                .alloc(head_rows * head * 4, BufferUsage::Staging)
                                 .map_err(|e| anyhow!("{e}"))?;
                             Some((lg, buf))
                         }
@@ -6657,7 +6685,7 @@ pub(crate) fn generate_dense_backend_bound(
                         (prefill_logits.as_deref_mut(), &pf_logits_buf)
                     {
                         let at = tap.logits.len();
-                        tap.logits.resize(at + head_rows * c.vocab, 0.0);
+                        tap.logits.resize(at + head_rows * head, 0.0);
                         be.download(
                             buf.as_ref(),
                             bytemuck::cast_slice_mut(&mut tap.logits[at..]),

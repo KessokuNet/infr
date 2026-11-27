@@ -100,6 +100,13 @@ pub trait ChatModel {
         false
     }
 
+    /// Embed one text for `/v1/embeddings`, returning the pooled vector and the prompt's token
+    /// count. Default: refuse — a decoder has no embedding head, and a backend that has one names
+    /// it here (the CPU dense seam does; see `docs/plan/22-embedding-models.md`).
+    fn embed(&self, _text: &str, _dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this model does not support embeddings")
+    }
+
     /// Drop any persistent KV-session state so the NEXT `generate` re-prefills its prompt from
     /// scratch. The serve-side forced-tool fallback uses this: after a constrained attempt has
     /// advanced the session past the primed `<tool_call>` opener, resetting before the unconstrained

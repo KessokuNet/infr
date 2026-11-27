@@ -1555,6 +1555,33 @@ impl SeamModel {
         )
     }
 
+    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s embedding-model twin: one bidirectional
+    /// prefill of `text` and the model's own pooling (mean, then L2 normalize), on the CPU
+    /// reference backend. `dimensions` truncates the vector (Matryoshka) and renormalizes. Returns
+    /// the vector and the number of prompt tokens it was pooled over (the server's `usage`). See
+    /// `docs/plan/22-embedding-models.md`.
+    ///
+    /// Tokenized with the model's special tokens — `<bos>`…`<eos>` for EmbeddingGemma 2 — exactly
+    /// as the reference embedding tool's `common_tokenize(vocab, text, true, true)` does. The EOS
+    /// is one of the rows that gets pooled, so leaving it out moves the vector by ~0.1 cosine.
+    pub fn embed_cpu(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        let md = self.weights.metadata();
+        let mut tokens = Vec::new();
+        tokens.extend(special_bos(md));
+        tokens.extend(self.encode(text)?);
+        tokens.extend(special_eos(md));
+        let vector = crate::seam::embed_cpu(
+            &*self.weights,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &tokens,
+            dimensions,
+        )?;
+        Ok((vector, tokens.len()))
+    }
+
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s MTP Phase 1 twin (issue #33,
     /// docs/mtp.md): ALSO returns the LM-head INPUT row (post-`output_norm`, pre-lm_head) for the
     /// same last-prompt-token row the logits came from — the `h_p` primitive Phase 2's MTP driver
@@ -3266,6 +3293,13 @@ mod reply_budget_tests {
 }
 
 fn perplexity_bos(md: &infr_core::loader::Metadata) -> Option<u32> {
+    special_bos(md)
+}
+
+/// The BOS a GGUF asks a generic (non-chat) tokenizer to add: `tokenizer.ggml.add_bos_token`,
+/// defaulting to true for the SentencePiece (`tokenizer.ggml.model == "llama"`) family — the same
+/// rule llama.cpp's vocabulary applies. `None` when the file has no BOS or forbids adding it.
+fn special_bos(md: &infr_core::loader::Metadata) -> Option<u32> {
     use infr_core::loader::MetaValue;
     let add = match md.get("tokenizer.ggml.add_bos_token") {
         Some(MetaValue::Bool(b)) => *b,
@@ -3273,6 +3307,21 @@ fn perplexity_bos(md: &infr_core::loader::Metadata) -> Option<u32> {
     };
     add.then(|| {
         md.u64("tokenizer.ggml.bos_token_id")
+            .and_then(|n| u32::try_from(n).ok())
+    })
+    .flatten()
+}
+
+/// The EOS half of [`special_bos`]: `tokenizer.ggml.add_eos_token`, defaulting to false (llama.cpp
+/// adds an EOS only when the file says so).
+fn special_eos(md: &infr_core::loader::Metadata) -> Option<u32> {
+    use infr_core::loader::MetaValue;
+    let add = matches!(
+        md.get("tokenizer.ggml.add_eos_token"),
+        Some(MetaValue::Bool(true))
+    );
+    add.then(|| {
+        md.u64("tokenizer.ggml.eos_token_id")
             .and_then(|n| u32::try_from(n).ok())
     })
     .flatten()

@@ -63,6 +63,15 @@ pub const GEMMA3: &str = "gemma3";
 /// carries routed-expert tensors on the same string — `Config::gemma4_moe` detects them and swaps
 /// in diffusion-gemma's dual FFN (`FfnW::DiffusionMoe`) via `Config::dual_moe`, autoregressive.
 pub const GEMMA4: &str = "gemma4";
+/// EmbeddingGemma 2 (`EmbeddingGemma2Model` in llama.cpp's converter): the [`GEMMA4`] dense block
+/// verbatim — heterogeneous per-layer head dims, weightless V-norm, 1.0 attention scale, per-layer
+/// output scalars and projection-only per-layer input embeddings — with three differences that make
+/// it a feature extractor rather than a decoder: `attention.causal = false` (every layer attends
+/// bidirectionally, and the SWA layers' window is SYMMETRIC: `|p0-p1| <= swa_window/2`,
+/// `src/llama-hparams.h:553`), `embedding_length_out` replaces the vocab as the head's width (the
+/// `output.weight` projection to the embedding dimension), and pooling is mean (`pooling_type = 1`).
+/// See `docs/plan/22-embedding-models.md`.
+pub const GEMMA_EMBEDDING2: &str = "gemma-embedding2";
 /// Qwen3.5/3.6 gated-DeltaNet hybrid (DENSE FFN) — runs through `Config::from_gguf`'s `qwen35`
 /// fields + `MixerW::DeltaNet` (see `crate::qwen35::Cfg` for the raw metadata parse). NOT
 /// llama.cpp's `qwen3next` (a sibling arch with a different DeltaNet V-broadcast pattern) — that
@@ -163,6 +172,7 @@ pub const TRANSFORMER: &[&str] = &[
     QWEN3_MOE,
     GEMMA3,
     GEMMA4,
+    GEMMA_EMBEDDING2,
     DIFFUSION_GEMMA,
     BITNET,
     BITNET_B158,
@@ -249,6 +259,7 @@ pub const ALL: &[&str] = &[
     QWEN3_MOE,
     GEMMA3,
     GEMMA4,
+    GEMMA_EMBEDDING2,
     DIFFUSION_GEMMA,
     BITNET,
     BITNET_B158,

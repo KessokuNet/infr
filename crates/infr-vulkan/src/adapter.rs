@@ -2757,6 +2757,15 @@ fn lower_op(
             // only coupled K==V==Q8 (or no Q8 at all).
             let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
+            // The embedding-model symmetric band has no shader yet (docs/plan/22-embedding-models.md
+            // P3): refuse it here, before any kernel selection, so no eligibility arm has to carry
+            // a mask mode it cannot express.
+            if let AttnMask::Banded { .. } = mask {
+                return Err(be(
+                    "vulkan adapter: AttnMask::Banded (embedding-model symmetric window) has no \
+                     kernel yet — run the embedding path on the CPU backend",
+                ));
+            }
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
@@ -2795,6 +2804,7 @@ fn lower_op(
                     AttnMask::SlidingWindow(w) => *w,
                     // `check_attention` refused a canvas mask.
                     AttnMask::Causal | AttnMask::Canvas { .. } => 0,
+                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                 };
                 let sk = sinks.map(r).transpose()?;
                 let cb = c.bias.map(r).transpose()?;
@@ -2853,6 +2863,7 @@ fn lower_op(
                              bidirectional `lo`",
                         ));
                     }
+                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                 };
                 match (sinks, key_bias) {
                     (Some(sk), Some(kb)) => rec.attention_kv_sinks_bias(
@@ -2919,6 +2930,7 @@ fn lower_op(
                     // denoise is a rows=C static forward, never eligible for this path) — never
                     // actually reached with Canvas; 0 is an arbitrary but harmless placeholder.
                     AttnMask::Canvas { .. } => 0usize,
+                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                 };
                 let def_scale = (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 let pscale = if def_scale { 0.0 } else { *scale };
@@ -3548,6 +3560,7 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => unreachable!("nonfa_ok excludes Canvas"),
+                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                     };
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
@@ -3591,6 +3604,7 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => unreachable!("nc_fa_ok excludes Canvas"),
+                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                     };
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
@@ -3623,6 +3637,7 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => 0,
+                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                     };
                     let n_chunks = span.div_ceil(chunk);
                     // Scratch scales with rows (rows*nh partial planes); rows==1 keeps the old
@@ -3735,6 +3750,7 @@ fn lower_op(
                                  a bidirectional `lo` override",
                             ));
                         }
+                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
                     };
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
@@ -5111,6 +5127,12 @@ fn lower_op(
                 AttnMask::Causal => (0u32, 0u32, 0u32),
                 AttnMask::SlidingWindow(w) => (1u32, *w as u32, 0u32),
                 AttnMask::Canvas { lo } => (2u32, 0u32, *lo as u32),
+                AttnMask::Banded { .. } => {
+                    return Err(be(
+                        "vulkan adapter: Op::Mla with AttnMask::Banded — the MLA kernels carry no \
+                         symmetric-window mode",
+                    ));
+                }
             };
             let ff = freq_factors.map(r).transpose()?;
             let kbias = key_bias.map(r).transpose()?;

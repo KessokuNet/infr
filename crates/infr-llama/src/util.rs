@@ -81,11 +81,16 @@ pub(crate) fn build_per_layer_embd(
     if cfg.n_embd_per_layer == 0 {
         return Ok(None);
     }
-    let te = g
+    // Projection-only per-layer inputs (embeddinggemma-2) carry no token table: the per-layer
+    // vector is `per_layer_model_proj` alone (`gemma-embedding2.cpp`'s `build_inp_per_layer`), so
+    // there is nothing to gather per token and the caller's PLE prologue skips the combine.
+    let Some(te) = g
         .tensors()
         .iter()
         .find(|t| t.name == "per_layer_token_embd.weight")
-        .ok_or_else(|| anyhow!("per_layer_token_embd.weight not found"))?;
+    else {
+        return Ok(None);
+    };
     // Bytes per token row = total bytes / vocab (te shape is GGUF [npl*n_layer, vocab]).
     let te_vocab = *te.shape.last().unwrap();
     Ok(Some(PerLayerEmbd {

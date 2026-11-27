@@ -55,6 +55,15 @@ pub struct Config {
     pub rope_theta: f32,
     pub rms_eps: f32,
     pub vocab: usize,
+    /// The head's output width when it is not the vocabulary: EmbeddingGemma 2 projects the final
+    /// hidden state to `embedding_length_out` (768) instead of to vocab logits, so `output.weight`
+    /// is `[n_embd_out, n_embd]` and the "logits" rows ARE per-token embedding vectors. `0` for
+    /// every decoder arch, where [`Config::head_rows`] is `vocab`.
+    pub n_embd_out: usize,
+    /// Bidirectional (`attention.causal = false`) attention, as EmbeddingGemma 2 declares. Every
+    /// layer attends both directions: full layers over the whole prompt, SWA layers over a
+    /// SYMMETRIC window of `swa_window / 2` on each side. `false` for every decoder arch.
+    pub non_causal: bool,
     pub eos: u32,
     /// All tokens that end generation (the GGUF eos plus `<|im_end|>` / `<|endoftext|>` when present
     /// in the vocab). A chat model can emit any of these; stopping only on `eos` lets it ramble.
@@ -501,6 +510,16 @@ fn qwen35_kv_heads(
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
+    /// Width of the LM head's output: [`Config::n_embd_out`] on an embedding model, whose "vocab"
+    /// is the embedding dimension, and `vocab` on every decoder.
+    pub fn head_rows(&self) -> usize {
+        if self.n_embd_out > 0 {
+            self.n_embd_out
+        } else {
+            self.vocab
+        }
+    }
+
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
     /// attention on a fixed period, LFM3 names each layer in [`Config::swa_layers`]; every other
     /// model is always full.
@@ -832,6 +851,7 @@ impl Config {
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4
+            | crate::arch::GEMMA_EMBEDDING2
             | crate::arch::DIFFUSION_GEMMA
             | crate::arch::LFM3 => true,
             // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/qwen35.md`).
@@ -895,7 +915,12 @@ impl Config {
         // freq_factors, softcap) verbatim — see docs/diffusion-gemma.md — so it folds into the same
         // gate as every other gemma4-shared parse below. `diffusion_gemma` gates only what's
         // actually different (dual FFN, canvas/mask fields, encoder-scalar tensor name).
-        let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma;
+        // embeddinggemma-2 IS gemma4's dense block — heterogeneous per-layer head dims, weightless
+        // V-norm, 1.0 attention scale, per-layer output scalars, projection-only PLE — with a
+        // non-causal mask and an embedding head instead of vocab logits. It therefore rides every
+        // `gemma4` parse below; `embedding` gates only what actually differs.
+        let embedding = arch == crate::arch::GEMMA_EMBEDDING2;
+        let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma || embedding;
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
         // gemma4 MoE (26B-A4B): the same gemma4 backbone with a routed-expert FFN — structurally
         // identical to diffusion-gemma's dual FFN (dense GeGLU ∥ 128-expert MoE, fused `gate_up_exps`
@@ -1666,6 +1691,28 @@ impl Config {
         } else {
             0
         };
+        // EmbeddingGemma 2's head width and its bidirectional mask. `attention.causal` is written
+        // by the converter for this arch (`conversion/gemma.py:822`); a file that omits it gets the
+        // decoder default (causal) rather than a silent bidirectional pass over a decoder, which
+        // would produce an embedding that looks plausible and is wrong.
+        let n_embd_out = if embedding {
+            let key = mk("embedding_length_out");
+            let n = meta_u64(g, &key).with_context(|| format!("{key} missing"))? as usize;
+            if n == 0 {
+                bail!("{key} is zero");
+            }
+            n
+        } else {
+            0
+        };
+        let non_causal = embedding
+            && g.metadata()
+                .get(&mk("attention.causal"))
+                .and_then(|v| match v {
+                    MetaValue::Bool(causal) => Some(!causal),
+                    _ => None,
+                })
+                .unwrap_or(false);
         let n_layer_kv_from_start = if gemma4 {
             let key = mk("attention.shared_kv_layers");
             let shared = meta_u64(g, &key).unwrap_or(0) as usize;
@@ -1938,6 +1985,8 @@ impl Config {
             rope_theta,
             rms_eps,
             vocab,
+            n_embd_out,
+            non_causal,
             eos,
             eos_ids,
             qk_norm,

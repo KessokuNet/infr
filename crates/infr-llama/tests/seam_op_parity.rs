@@ -1103,6 +1103,8 @@ fn mla_attends(mask: AttnMask, abs: usize, kv_len: usize) -> std::ops::Range<usi
         AttnMask::SlidingWindow(w) => (abs + 1).saturating_sub(w)..(abs + 1).min(kv_len),
         // One fixed span for EVERY row — `abs` is not consulted at all.
         AttnMask::Canvas { lo } => lo..kv_len,
+        // The symmetric band: `half` positions on either side, clipped to what is cached.
+        AttnMask::Banded { half } => abs.saturating_sub(half)..(abs + half + 1).min(kv_len),
     }
 }
 

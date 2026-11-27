@@ -576,6 +576,21 @@ enum Cmd {
         #[command(flatten)]
         device: DeviceOpts,
     },
+    /// Embed text with an embedding model (EmbeddingGemma 2): one mean-pooled, L2-normalized
+    /// vector per input, printed as JSON. CPU reference backend only for now — the Vulkan kernel
+    /// for the symmetric window is `docs/plan/22-embedding-models.md` P3.
+    Embed {
+        model: String,
+        /// Text to embed; repeat the flag for several inputs.
+        #[arg(short = 'p', long = "prompt", value_name = "TEXT", num_args = 1.., required = true)]
+        input: Vec<String>,
+        /// Truncate each vector to this many leading dimensions (Matryoshka) and renormalize.
+        #[arg(long)]
+        dimensions: Option<usize>,
+        /// Shared device/config flags (`--dev`, `-t`).
+        #[command(flatten)]
+        device: DeviceOpts,
+    },
     /// Compare infr vs llama.cpp on coding-agent-shaped workloads (long context, replies at depth,
     /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
     Compare {
@@ -781,6 +796,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             sampling.overrides(&mut layer);
         }
         Cmd::Perplexity { device, .. } => device.overrides(&mut layer)?,
+        Cmd::Embed { device, .. } => device.overrides(&mut layer)?,
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
@@ -876,6 +892,12 @@ fn dispatch(
             ngl,
             ..
         } => cmd_perplexity(&model, &file, ctx_size, chunks, ngl, cfg),
+        Cmd::Embed {
+            model,
+            input,
+            dimensions,
+            ..
+        } => cmd_embed(&model, &input, dimensions, cfg),
         Cmd::Compare {
             models,
             sweep,
@@ -2352,6 +2374,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
         lock_recovered(&self.model).supports_logprobs()
     }
 
+    fn embed(&self, text: &str, dimensions: Option<usize>) -> anyhow::Result<(Vec<f32>, usize)> {
+        lock_recovered(&self.model).embed(text, dimensions)
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -3115,6 +3141,36 @@ fn cmd_perplexity(
         // print-ok: program OUTPUT — the `infr perplexity` result line users pipe.
         None => println!("Final estimate: PPL = {:.4}", report.ppl()),
     }
+    Ok(())
+}
+
+// `infr embed`: one mean-pooled, L2-normalized vector per input, as an OpenAI-shaped JSON list.
+fn cmd_embed(
+    model: &str,
+    inputs: &[String],
+    dimensions: Option<usize>,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    let (gguf, tok) = resolve(model, cfg)?;
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
+    let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    let mut data = Vec::with_capacity(inputs.len());
+    for (index, text) in inputs.iter().enumerate() {
+        let (embedding, _tokens) = loaded.embed_cpu(text, dimensions)?;
+        data.push(serde_json::json!({
+            "object": "embedding",
+            "index": index,
+            "embedding": embedding,
+        }));
+    }
+    watch.check()?;
+    let out = serde_json::json!({
+        "object": "list",
+        "model": model,
+        "data": data,
+    });
+    // print-ok: program OUTPUT — the JSON `infr embed` prints for scripts to pipe.
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
