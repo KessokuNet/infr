@@ -1565,11 +1565,7 @@ impl SeamModel {
     /// as the reference embedding tool's `common_tokenize(vocab, text, true, true)` does. The EOS
     /// is one of the rows that gets pooled, so leaving it out moves the vector by ~0.1 cosine.
     pub fn embed_cpu(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
-        let md = self.weights.metadata();
-        let mut tokens = Vec::new();
-        tokens.extend(special_bos(md));
-        tokens.extend(self.encode(text)?);
-        tokens.extend(special_eos(md));
+        let tokens = self.embedding_tokens(text)?;
         let vector = crate::seam::embed_cpu(
             &*self.weights,
             &self.cfg,
@@ -1580,6 +1576,37 @@ impl SeamModel {
             dimensions,
         )?;
         Ok((vector, tokens.len()))
+    }
+
+    /// [`embed_cpu`](Self::embed_cpu) on the Vulkan backend: the same batched all-rows forward, one
+    /// device, the host pooling unchanged (`docs/plan/22-embedding-models.md` P3).
+    pub fn embed_vulkan(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        let tokens = self.embedding_tokens(text)?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vector = crate::seam::embed_vulkan(
+            &vk,
+            &*self.weights,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &tokens,
+            dimensions,
+        )?;
+        Ok((vector, tokens.len()))
+    }
+
+    /// An embedding input's token ids: the model's `<bos>`/`<eos>` framing around the text, which is
+    /// what the reference embedding tool feeds (`common_tokenize(vocab, text, true, true)`). The EOS
+    /// is one of the pooled rows, so dropping it moves the vector by ~0.1 cosine.
+    fn embedding_tokens(&self, text: &str) -> Result<Vec<u32>> {
+        let md = self.weights.metadata();
+        let mut tokens = Vec::new();
+        tokens.extend(special_bos(md));
+        tokens.extend(self.encode(text)?);
+        tokens.extend(special_eos(md));
+        Ok(tokens)
     }
 
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s MTP Phase 1 twin (issue #33,

@@ -178,6 +178,11 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
+        // An embedding model has nothing to warm: the only generation this would run is a throwaway
+        // decode, which its bidirectional mask cannot express (and `generate` refuses).
+        if self.model.config().non_causal {
+            return Ok(());
+        }
         // The shared session warmup (throwaway generate + reset so the first real prompt prefills
         // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
         crate::with_profiling_suppressed(|| self.warmup_session())
@@ -187,6 +192,10 @@ impl ChatModel for DenseSeamChat {
         true
     }
 
+    fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.model.embed_vulkan(text, dimensions)
+    }
+
     fn generate(
         &mut self,
         prompt: &str,
@@ -194,6 +203,12 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.model.config().non_causal {
+            anyhow::bail!(
+                "this is an embedding model — it has no decode path; use `infr embed` or \
+                 POST /v1/embeddings"
+            );
+        }
         let mtp_ok = !crate::sampling::adjusts_logits(req);
         if mtp_ok && self.wants_gemma4_mtp()? {
             self.ensure_mtp_backend()?;

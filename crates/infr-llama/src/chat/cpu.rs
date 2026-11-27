@@ -53,6 +53,12 @@ impl ChatModel for CpuDenseChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.model.config().non_causal {
+            anyhow::bail!(
+                "this is an embedding model — it has no decode path; use `infr embed` or \
+                 POST /v1/embeddings"
+            );
+        }
         if self.metal {
             #[cfg(target_os = "macos")]
             return self

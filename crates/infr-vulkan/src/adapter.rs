@@ -1160,13 +1160,15 @@ enum RopeMode<'a> {
 /// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
 /// parameterized by.
 pub(crate) const ATTN_MAX_CHUNKS: usize = 1024;
-
 /// `attn_partial.comp` stages one chunk's scores in `shared float sc[ATTN_PARTIAL_MAX_CHUNK]`, so a
 /// chunk of more keys is an OOB shared-memory write. Every chunk size the adapter hands that kernel
 /// is capped here first (the count then rises to cover the span); a span past
 /// `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` keys fits neither cap and does not take the split-K
 /// kernel. `attn_partial_chunk_bound_matches_host` keeps the shader's copy in step.
 const ATTN_PARTIAL_MAX_CHUNK: usize = 1024;
+/// `AttnMask::Banded`'s marker in the `window` push constant's high bit: the low bits are the band
+/// half-width. Mirrors `BANDED_FLAG` in `attn_partial.comp`.
+const BANDED_WINDOW_FLAG: usize = 1 << 31;
 
 /// The rows-batched split-K tier (`attn_partial_mrows_c256`) stages its chunk scores in a shared
 /// array sized by its `-DSC_MAX` build define (`build.rs`): its fixed chunk, and its bound.
@@ -2757,15 +2759,15 @@ fn lower_op(
             // only coupled K==V==Q8 (or no Q8 at all).
             let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
-            // The embedding-model symmetric band has no shader yet (docs/plan/22-embedding-models.md
-            // P3): refuse it here, before any kernel selection, so no eligibility arm has to carry
-            // a mask mode it cannot express.
-            if let AttnMask::Banded { .. } = mask {
-                return Err(be(
-                    "vulkan adapter: AttnMask::Banded (embedding-model symmetric window) has no \
-                     kernel yet — run the embedding path on the CPU backend",
-                ));
-            }
+            // The embedding-model symmetric band rides `attn_partial`: it is the only tier that
+            // carries a per-row softmax RANGE (`lo` + causal end) rather than a causal-only mask.
+            // The band size travels in the high bits of the `window` push constant (see
+            // `BANDED_FLAG` in attn_partial.comp); every flash/coopmat tier below masks causally
+            // and is excluded from it.
+            let banded = match mask {
+                AttnMask::Banded { half } => Some(*half),
+                _ => None,
+            };
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
@@ -2804,7 +2806,7 @@ fn lower_op(
                     AttnMask::SlidingWindow(w) => *w,
                     // `check_attention` refused a canvas mask.
                     AttnMask::Causal | AttnMask::Canvas { .. } => 0,
-                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                    AttnMask::Banded { .. } => unreachable!("a comp cache never takes Banded"),
                 };
                 let sk = sinks.map(r).transpose()?;
                 let cb = c.bias.map(r).transpose()?;
@@ -2863,7 +2865,7 @@ fn lower_op(
                              bidirectional `lo`",
                         ));
                     }
-                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                    AttnMask::Banded { .. } => unreachable!("sinks/key_bias never takes Banded"),
                 };
                 match (sinks, key_bias) {
                     (Some(sk), Some(kb)) => rec.attention_kv_sinks_bias(
@@ -2930,7 +2932,8 @@ fn lower_op(
                     // denoise is a rows=C static forward, never eligible for this path) — never
                     // actually reached with Canvas; 0 is an arbitrary but harmless placeholder.
                     AttnMask::Canvas { .. } => 0usize,
-                    AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                    // Rows==1 is refused for Banded before any path is chosen.
+                    AttnMask::Banded { .. } => unreachable!("Banded is a prefill-only mask"),
                 };
                 let def_scale = (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 let pscale = if def_scale { 0.0 } else { *scale };
@@ -3258,6 +3261,7 @@ fn lower_op(
                 };
                 let nonfa_ok = !flash_ok
                     && canvas_lo.is_none()
+                    && banded.is_none()
                     && paged.is_none()
                     && rows >= 64
                     // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
@@ -3352,6 +3356,7 @@ fn lower_op(
                     && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
+                    && banded.is_none()
                     && hd % 4 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
@@ -3425,6 +3430,23 @@ fn lower_op(
                     AttnMask::SlidingWindow(w) => *w,
                     _ => 0,
                 };
+                // A banded row reaches FORWARD (`+half`), so a ring-wrapped SWA cache would have
+                // overwritten keys this pass still has to read. Refuse instead of reading the
+                // wrong rows: the embedding pass is one batch, so the only way here is a prompt
+                // longer than the window's ring.
+                if banded.is_some() && kv_len > att_cap_rows {
+                    return Err(be(format!(
+                        "vulkan adapter: AttnMask::Banded needs {kv_len} KV rows (a symmetric band \
+                         reads forward), but the SWA ring cache holds {att_cap_rows} — shorten the \
+                         input or run it on the CPU backend"
+                    )));
+                }
+                if banded.is_some() && rows < 2 {
+                    return Err(be(
+                        "vulkan adapter: AttnMask::Banded needs a prefill batch (rows >= 2) — the \
+                         decode kernels carry no symmetric window",
+                    ));
+                }
                 let swa_base = if swa_window > 0 && !batched_attn && canvas_lo.is_none() {
                     (pos + 1).saturating_sub(swa_window)
                 } else {
@@ -3479,11 +3501,12 @@ fn lower_op(
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
-                // A paged cache may only use the split path, so the span has to be splittable: leave
-                // the live span above one chunk even at a handful of rows (n_chunks 1 is fine).
-                let chunk = match paged {
-                    Some(_) => chunk.min(span.saturating_sub(1).max(1)),
-                    None => chunk,
+                // A paged cache, and a banded mask, may only use the split path — so the span has
+                // to be splittable: leave the live span above one chunk even at a handful of rows
+                // (n_chunks 1 is fine).
+                let chunk = match (paged, banded) {
+                    (Some(_), _) | (_, Some(_)) => chunk.min(span.saturating_sub(1).max(1)),
+                    _ => chunk,
                 };
                 // ...and the chunk SIZE: a span past both caps (more than a million keys) would
                 // need a chunk the partial kernel cannot stage, so it does not take split-K.
@@ -3494,13 +3517,17 @@ fn lower_op(
                 };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok =
-                    (rows < 64 || canvas_lo.is_some() || ring_past || cap_short || paged.is_some())
-                        && chunk <= chunk_max
-                        && span > chunk
-                        && hd % 4 == 0
-                        && hd <= 512
-                        && (rows == 1 || !(k_q8_eff || v_q8_eff));
+                let split_ok = (rows < 64
+                    || canvas_lo.is_some()
+                    || banded.is_some()
+                    || ring_past
+                    || cap_short
+                    || paged.is_some())
+                    && chunk <= chunk_max
+                    && span > chunk
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && (rows == 1 || !(k_q8_eff || v_q8_eff));
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -3560,7 +3587,7 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => unreachable!("nonfa_ok excludes Canvas"),
-                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                        AttnMask::Banded { .. } => unreachable!("nonfa_ok excludes Banded"),
                     };
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
@@ -3604,7 +3631,7 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => unreachable!("nc_fa_ok excludes Canvas"),
-                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                        AttnMask::Banded { .. } => unreachable!("nc_fa_ok excludes Banded"),
                     };
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
@@ -3637,7 +3664,8 @@ fn lower_op(
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => 0,
-                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                        // High bit = banded, low bits = `half` (attn_partial.comp's BANDED_FLAG).
+                        AttnMask::Banded { half } => *half | BANDED_WINDOW_FLAG,
                     };
                     let n_chunks = span.div_ceil(chunk);
                     // Scratch scales with rows (rows*nh partial planes); rows==1 keeps the old
@@ -3750,7 +3778,13 @@ fn lower_op(
                                  a bidirectional `lo` override",
                             ));
                         }
-                        AttnMask::Banded { .. } => unreachable!("Banded refused at the op entry"),
+                        AttnMask::Banded { .. } => {
+                            return Err(be(
+                                "vulkan adapter: AttnMask::Banded requires the split-K attention \
+                                 path (split_ok) — the scalar attention_kv fallback carries no \
+                                 symmetric window",
+                            ));
+                        }
                     };
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),

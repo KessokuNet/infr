@@ -9,9 +9,10 @@
 //! projection, which is linear.
 
 use super::runner::generate_dense_backend_bound;
-use super::{cpu_upload_bind, TokenEmbd};
+use super::{cpu_upload_bind, BindWeight, TokenEmbd};
 use crate::{Config, EngineConfig, PerLayerEmbd};
 use anyhow::{bail, Result as AResult};
+use infr_core::backend::Backend;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 
@@ -28,6 +29,27 @@ pub(crate) fn embed_cpu(
     tokens: &[u32],
     dimensions: Option<usize>,
 ) -> AResult<Vec<f32>> {
+    let cpu_be = CpuBackend::new_with(ec.clone());
+    let bind = cpu_upload_bind(&cpu_be);
+    embed_on(
+        &cpu_be, &bind, g, cfg, ec, token_embd, ple, tokens, dimensions,
+    )
+}
+
+/// [`embed_cpu`] on any backend — the Vulkan twin is `docs/plan/22-embedding-models.md` P3, and
+/// both reach the same graph: the batched all-rows forward, whose per-row "logits" ARE the embedding
+/// vectors on an embedding arch.
+pub(crate) fn embed_on(
+    be: &dyn Backend,
+    bind: &BindWeight<'_>,
+    g: &dyn WeightSource,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+    dimensions: Option<usize>,
+) -> AResult<Vec<f32>> {
     if !cfg.non_causal || cfg.n_embd_out == 0 {
         bail!(
             "embed: not an embedding model — the GGUF must declare attention.causal = false and \
@@ -37,7 +59,6 @@ pub(crate) fn embed_cpu(
     if tokens.is_empty() {
         bail!("embed: empty input");
     }
-    let cpu_be = CpuBackend::new_with(ec.clone());
     // The teacher-forced (`verify`) branch is the forward this wants: one batched pass over EVERY
     // token, with the head run over all of its rows. That is what a teacher-forced scoring harness
     // uses to read a whole prompt at once, and a bidirectional embedding pass is the same shape —
@@ -47,8 +68,8 @@ pub(crate) fn embed_cpu(
     let mut state = None;
     generate_dense_backend_bound(
         None, // prebound
-        &cpu_be,
-        &cpu_upload_bind(&cpu_be),
+        be,
+        bind,
         g,
         cfg,
         ec,

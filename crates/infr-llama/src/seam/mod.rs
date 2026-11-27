@@ -32,7 +32,7 @@ mod sc;
 mod weights;
 mod wshape;
 
-pub(crate) use embed::embed_cpu;
+pub(crate) use embed::{embed_cpu, embed_on};
 pub(crate) use kv_store::{capture_upto, prefix_store_for, store_key, BlockCache};
 pub(crate) use kv_tier::{KvStore, NoStore};
 pub(crate) use mirror::{attach as attach_mirror, LiveWindow};
@@ -5172,6 +5172,22 @@ pub(crate) fn verify_rows_vulkan(
         1,    // slot_copies
     )?;
     Ok(logits)
+}
+
+/// [`verify_rows_vulkan`]'s embedding twin (`docs/plan/22-embedding-models.md` P3): the same
+/// batched all-rows forward, pooled on the host.
+pub(crate) fn embed_vulkan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &dyn WeightSource,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+    dimensions: Option<usize>,
+) -> AResult<Vec<f32>> {
+    let bind = vulkan_upload_bind(vk);
+    embed_on(vk, &bind, g, cfg, ec, token_embd, ple, tokens, dimensions)
 }
 
 /// Logits for rows `from..tokens.len()` of `tokens`, extending whatever `state` already holds as a

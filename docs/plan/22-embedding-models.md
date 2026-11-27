@@ -1,8 +1,9 @@
 # Plan 22: embedding models
 
-Status: P1–P4 in progress (this file lands with P1). Scope fixed by cappy on 2026-11-27: text first,
-then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an upstream PR;
-expose `/v1/embeddings`; CPU and Vulkan (Metal last).
+Status: P1–P3 shipped (`infr embed` and `POST /v1/embeddings` on CPU and Vulkan, cosine
+0.9993–0.9999 against `llama-embedding`); P4 (image input) open. Scope fixed by cappy on 2026-11-27:
+text first, then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an
+upstream PR; expose `/v1/embeddings`; CPU and Vulkan (Metal last).
 
 ## Problem
 
@@ -52,9 +53,17 @@ that a truncated vector must be renormalized.
 
 **Masks.** Full-attention layers already have exactly the right variant: `AttnMask::Canvas { lo: 0 }`
 means "every row attends `[0, kv_len)`", which is bidirectional full attention. SWA layers need the
-symmetric band, which nothing expresses — add `AttnMask::Banded { half }` to `infr-core` and teach
-the CPU executor the `[p1 - half, p1 + half]` clip; `half = swa_window / 2`, matching
-`is_masked_swa`'s symmetric arm. Vulkan gets the same variant in P3.
+symmetric band, which nothing expressed — `AttnMask::Banded { half }` is that variant, with
+`half = swa_window / 2`, matching `is_masked_swa`'s symmetric arm.
+
+On Vulkan the band rides `attn_partial.comp` (the only kernel that carries a per-row softmax RANGE
+rather than a causal-only mask), marked by the high bit of the `window` push constant; every
+flash/coopmat tier is excluded from it. Two consequences fall out of a band reading FORWARD: the
+chunk grid must span the whole `[0, kv_len)` (base 0), and the SWA ring cache has to hold every row
+the pass touches — a prompt longer than the ring (`kv_len > cap_rows`, i.e. beyond the 1024-token
+window) is refused with a named error rather than read past, until the cache can be sized per
+request. The embedding pass is one batch, because a chunk cannot attend keys the next chunk has not
+written yet.
 
 **No softcap, no sampling.** The arch sets `final_softcap = 0` and refuses generation surfaces
 (sampling flags, tool-call template work) with a clear message rather than producing nonsense.
@@ -80,8 +89,11 @@ caller-side and get documented.
   these toward 1.0).
 - **P2 — `/v1/embeddings`.** Route, request/response types, `dimensions`, `encoding_format`,
   batching, `serve` model kind, `Host`/auth gating like every other route, request-size limits.
-- **P3 — Vulkan.** `AttnMask::Banded` in `infr-vulkan`'s attention path, device-side pooling if the
-  round trip is measurable, `gpu-run` benchmarks versus the CPU reference vector.
+- **P3 — Vulkan.** `AttnMask::Banded` in `attn_partial.comp` + the adapter's eligibility (flash and
+  coopmat tiers excluded, split-K forced, ring overflow refused), `SeamModel::embed_vulkan`, and the
+  serve route: an embedding model skips the concurrent slot engine and serves through the serialised
+  seam, so `/v1/embeddings` reaches the device without a second embeddings engine. GPU vs CPU
+  0.9995–0.9999, GPU vs `llama-embedding` 0.9998–0.9999.
 - **P4 — image input.** EmbeddingGemma 2's `mmproj` is Gemma 4's vision (170M) plus audio (300M)
   encoders; vision rides the existing `serve.mmproj` plumbing from INFR-46 for image inputs to the
   embeddings route. Audio is its own task.

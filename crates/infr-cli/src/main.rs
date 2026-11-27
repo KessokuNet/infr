@@ -3155,8 +3155,15 @@ fn cmd_embed(
     let watch = infr_llama::WeightWatch::open_model(&gguf)?;
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
     let mut data = Vec::with_capacity(inputs.len());
+    // `--dev vulkan` runs the same batched forward on the device; the CPU reference backend is the
+    // default. Both pool on the host, so the vectors differ only by the kernels' rounding.
+    let on_vulkan = matches!(selected_backend(cfg)?, Backend::Vulkan(_));
     for (index, text) in inputs.iter().enumerate() {
-        let (embedding, _tokens) = loaded.embed_cpu(text, dimensions)?;
+        let (embedding, _tokens) = if on_vulkan {
+            loaded.embed_vulkan(text, dimensions)?
+        } else {
+            loaded.embed_cpu(text, dimensions)?
+        };
         data.push(serde_json::json!({
             "object": "embedding",
             "index": index,
@@ -5277,7 +5284,13 @@ fn cmd_serve(
     // the resolved config and divides it across the slots. One grammar, one meaning
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
+    // An embedding model serves through the SERIALISED seam (`DenseSeamChat`), whose `embed`
+    // reaches the same batched forward on whichever backend it owns — the concurrent slot engine
+    // has no embeddings pass yet (`docs/plan/22-embedding-models.md` P3).
+    let is_embedding_model =
+        infr_llama::arch::arch_of(&gguf).as_deref() == Some(infr_llama::arch::GEMMA_EMBEDDING2);
+    let is_vulkan =
+        !is_dg && !is_embedding_model && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
     let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
 

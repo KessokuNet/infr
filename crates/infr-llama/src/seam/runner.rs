@@ -6073,7 +6073,11 @@ pub(crate) fn generate_dense_backend_bound(
             gpu_verify_ids,
             false,
             false,
-            true, // mtp_verify: this IS the speculative-VERIFY batched forward
+            // mtp_verify: this IS the speculative-VERIFY batched forward — except on a
+            // non-causal (embedding) model, whose batched pass is a plain prefill: the MTP-verify
+            // tier masks each row at its own causal end (`attn_partial_mrows`), which is exactly
+            // the window a bidirectional pass must not have.
+            !c.non_causal,
             None, // span: the whole model in one graph
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();

@@ -285,9 +285,22 @@ void main() {
     // caller's value directly, ignoring the sliding-window formula entirely (the canvas mask
     // isn't a window relative to the query's own position — see `AttnMask::Canvas`'s doc).
     bool canvas = pc.rows > 0u;
-    uint qpos1 = canvas ? kv_len : (pc.pos + row + 1u);
-    uint lo = canvas ? (pc.rows - 1u)
-                     : ((pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u);
+    // EmbeddingGemma 2's symmetric band (AttnMask::Banded): `window`'s HIGH BIT marks it and the low
+    // bits hold the band half-width. Row `row` (absolute position `pc.pos + row`) attends
+    // `[abs - w, abs + w + 1)`, clipped to `[0, kv_len)` — llama.cpp's SYMMETRIC non-causal window
+    // (`src/llama-hparams.h:553`). `base` stays 0 for this mask: the chunk grid has to span the
+    // union of every row's band, which is the whole `[0, kv_len)` here. (`half` is a reserved GLSL
+    // word, hence `bw`.)
+    const uint BANDED_FLAG = 0x80000000u;
+    bool banded = (pc.window & BANDED_FLAG) != 0u;
+    uint bw = pc.window & ~BANDED_FLAG;
+    uint qpos1 = banded
+                     ? min(kv_len, pc.pos + row + 1u + bw)
+                     : (canvas ? kv_len : (pc.pos + row + 1u));
+    uint lo = banded
+                  ? ((pc.pos + row > bw) ? pc.pos + row - bw : 0u)
+                  : (canvas ? (pc.rows - 1u)
+                            : ((pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u));
 #endif
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
@@ -326,8 +339,9 @@ void main() {
 #ifdef USE_PARAMS
     uint base = 0u;
 #else
-    uint base = (!canvas && pc.window > 0u && pc.pos + 1u > pc.window) ? pc.pos + 1u - pc.window
-                                                                       : 0u;
+    uint base = (!canvas && !banded && pc.window > 0u && pc.pos + 1u > pc.window)
+                    ? pc.pos + 1u - pc.window
+                    : 0u;
 #endif
     // Clamp to the window AND this row's causal end: a chunk fully outside either gets an empty
     // range → zero-weight partial (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
