@@ -1,6 +1,7 @@
 # Plan 22: embedding models
 
-Status: P1–P4 shipped. `infr embed` and `POST /v1/embeddings` serve text and images on CPU and
+Status: P1–P4 shipped, plus the Metal backend (implemented, `cfg(target_os = "macos")`, unverified here
+— no macOS host in this lab). `infr embed` and `POST /v1/embeddings` serve text and images on CPU and
 Vulkan; text matches `llama-embedding` at cosine 0.9993–0.9999 and image embedding is 0.9998 across
 the two backends. Audio is its own task (INFR-71). Scope fixed by cappy on 2026-11-27: text first,
 then image input over the Gemma 4 `mmproj` path; land on the fork's `main`, not an upstream PR;
@@ -110,6 +111,12 @@ documented.
   CPU vs Vulkan on the same image: 0.999805 and 0.999833; two different images: 0.7775; one image
   is bit-identical run to run. Video is frames through this path plus audio, so it is not separate
   code; audio is INFR-71.
+
+- **Metal (last).** `EmbedBackend::Metal`, `SeamModel::embed_metal` and the two Metal chat models'
+  `embed`/`embed_image`/`validate_images`, all under `cfg(target_os = "macos")` and mirroring the
+  Vulkan path. NOT compiled or run in this lab: the host is Linux, and a cross `cargo check
+  --target aarch64-apple-darwin` dies in `esaxx-rs`/`ring` C++ builds that need a macOS SDK. Verify
+  on Apple hardware with the same corpus (CPU vs Metal cosine ≥ 0.999).
 
 ## Non-goals
 

@@ -5190,6 +5190,23 @@ pub(crate) fn embed_vulkan(
     embed_on(vk, &bind, g, cfg, ec, token_embd, ple, tokens, dimensions)
 }
 
+/// [`embed_vulkan`]'s Metal twin (`docs/plan/22-embedding-models.md`, Metal last): the reference
+/// Metal backend drives the same batched all-rows forward, so this is the bind plus a call.
+#[cfg(target_os = "macos")]
+pub(crate) fn embed_metal(
+    mtl: &infr_metal::MetalBackend,
+    g: &dyn WeightSource,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+    dimensions: Option<usize>,
+) -> AResult<Vec<f32>> {
+    let bind = metal_upload_bind(mtl);
+    embed_on(mtl, &bind, g, cfg, ec, token_embd, ple, tokens, dimensions)
+}
+
 /// Logits for rows `from..tokens.len()` of `tokens`, extending whatever `state` already holds as a
 /// prefix. Call with [`SeamKv::reset`] first for a fresh window, then with growing prefixes to walk
 /// it in bounded pieces.

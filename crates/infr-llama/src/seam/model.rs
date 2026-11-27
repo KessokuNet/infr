@@ -63,12 +63,14 @@ pub struct BenchPlacement {
     pub submit_cap: usize,
 }
 
-/// Which backend an embedding pass runs on (`docs/plan/22-embedding-models.md`): both reach the
-/// same batched all-rows forward, and the pooling stays on the host either way.
+/// Which backend an embedding pass runs on (`docs/plan/22-embedding-models.md`): all of them reach
+/// the same batched all-rows forward, and the pooling stays on the host either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbedBackend {
     Cpu,
     Vulkan,
+    /// macOS only; refuses elsewhere.
+    Metal,
 }
 
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
@@ -1642,6 +1644,25 @@ impl SeamModel {
                     tokens,
                     dimensions,
                 )
+            }
+            EmbedBackend::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
+                        .map_err(|e| anyhow!("metal init: {e}"))?;
+                    crate::seam::embed_metal(
+                        &mtl,
+                        &*self.weights,
+                        &self.cfg,
+                        &self.ecfg,
+                        self.embd(),
+                        self.per_layer_embd.as_ref(),
+                        tokens,
+                        dimensions,
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("the Metal backend is only available on macOS")
             }
         }
     }

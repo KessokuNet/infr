@@ -3179,9 +3179,7 @@ fn cmd_embed(
     let backend = match selected_backend(cfg)? {
         Backend::Vulkan(_) => infr_llama::EmbedBackend::Vulkan,
         Backend::Cpu => infr_llama::EmbedBackend::Cpu,
-        Backend::Metal => {
-            anyhow::bail!("`infr embed` has no Metal embedding path yet — use --dev cpu")
-        }
+        Backend::Metal => infr_llama::EmbedBackend::Metal,
     };
     let mut data = Vec::with_capacity(inputs.len() + images.len());
     for (index, text) in inputs.iter().enumerate() {

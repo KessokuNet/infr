@@ -78,7 +78,25 @@ impl ChatModel for MetalSeamChat {
         super::reset_session(&mut self.session);
     }
 
+    fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.model
+            .embed(text, dimensions, crate::EmbedBackend::Metal)
+    }
+
+    fn embed_image(&self, image: &[u8], dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.model
+            .embed_image(image, dimensions, crate::EmbedBackend::Metal)
+    }
+
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.model.preflight_images(images)
+    }
+
     fn warmup(&mut self) -> Result<()> {
+        // An embedding model has nothing to warm (and no decode path to warm it with).
+        if self.model.config().non_causal {
+            return Ok(());
+        }
         // The shared session warmup, UNWRAPPED — no `with_profiling_suppressed` here, unlike the
         // vulkan/diffusion paths. The Metal backend resolves `prof.ops` at CONSTRUCTION, which
         // happens inside this first generate, so wrapping the call would resolve `profiling: false`
@@ -189,6 +207,20 @@ impl SpecMetalChat {
 impl ChatModel for SpecMetalChat {
     fn render_model(&self) -> &SeamModel {
         &self.target
+    }
+
+    fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.target
+            .embed(text, dimensions, crate::EmbedBackend::Metal)
+    }
+
+    fn embed_image(&self, image: &[u8], dimensions: Option<usize>) -> Result<(Vec<f32>, usize)> {
+        self.target
+            .embed_image(image, dimensions, crate::EmbedBackend::Metal)
+    }
+
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.target.preflight_images(images)
     }
 
     /// The draft/verify loop has no grammar path.
