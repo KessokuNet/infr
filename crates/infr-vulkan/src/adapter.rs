@@ -332,6 +332,14 @@ fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
                     kind: "LightningIndexer",
                 });
             }
+            // The attention temperature's factor depends on the position baked into the op at
+            // record time; a replayed tape would scale every later token by the recorded one.
+            Op::AttnTemp { .. } => {
+                return Some(DecodeRefusal::NoDynKernel {
+                    op: i,
+                    kind: "AttnTemp",
+                });
+            }
             // A multi-row EXL3 projection folds on the host per call; the record-once replay
             // pipeline has no params-driven twin for it.
             Op::LinearExl3 { m, .. } if *m != 1 => {
@@ -11348,6 +11356,12 @@ mod tests {
         ) else {
             return; // no Vulkan — self-skip
         };
+        // A software rasterizer (llvmpipe) enumerates as a device but cannot be pinned at this
+        // backend's subgroup size, so it is not a second rank — the test needs two GPUs.
+        let devs: Vec<_> = devs
+            .into_iter()
+            .filter(|d| d.device_type != "cpu")
+            .collect();
         if devs.len() < 2 {
             eprintln!("skip: ep_matches_single_device_synthetic needs >=2 Vulkan devices");
             return;
