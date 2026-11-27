@@ -508,6 +508,117 @@ fn qknormrope_attn_chain() {
     assert!(!nan && maxerr(&c, &v) < 5e-2, "qwen35 attn chain diverges");
 }
 
+/// `AttnMask::Banded` (the embedding-model symmetric window) against an f64 reference, on the CPU
+/// backend. Every row `ti` at absolute position `pos + ti` must attend exactly
+/// `[abs - half, abs + half + 1)` clipped to `[0, kv_len)` — the clip arithmetic
+/// `attn_partial.comp` and the CPU executor share with llama.cpp's `is_masked_swa`. Not gated on
+/// a GPU: the mask semantics are what this pins, and the K/V are rounded to f16 first so the
+/// reference sees the same numbers the kernel does.
+#[test]
+fn banded_attention_matches_f64_reference() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, nkv, hd) = (4usize, 2usize, 1usize, 8usize);
+    let (kv_len, pos, band) = (6usize, 1usize, 2usize);
+    let mut g = Graph::new();
+    let q = g.input(f32d(rows * nh * hd));
+    let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+    let dst = g.output(f32d(rows * nh * hd));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: AttnMask::Banded { half: band },
+        pos: pos as u32,
+        sinks: None,
+        key_bias: None,
+        comp: None,
+    });
+    let qv = gen(rows * nh * hd, 11);
+    // f16 round-trip, so the reference and the kernel read identical K/V bytes.
+    let f16r = |vals: Vec<f32>| -> Vec<f32> {
+        vals.into_iter()
+            .map(|v| half::f16::from_f32(v).to_f32())
+            .collect()
+    };
+    let kf = f16r(gen(kv_len * nkv * hd, 3));
+    let vf = f16r(gen(kv_len * nkv * hd, 7));
+    let f16b = |vals: &[f32]| -> Vec<u8> {
+        vals.iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect()
+    };
+    let (kb, vb) = (f16b(&kf), f16b(&vf));
+    // A local runner: the shared `run` helper takes f32 inputs, and the KV cache here is f16 bytes.
+    let plan = cpu.compile(&g).unwrap();
+    let qbuf = cpu.alloc(qv.len() * 4, BufferUsage::Activations).unwrap();
+    cpu.upload(qbuf.as_ref(), bytemuck::cast_slice(&qv))
+        .unwrap();
+    let kbuf = cpu.alloc(kb.len(), BufferUsage::Activations).unwrap();
+    cpu.upload(kbuf.as_ref(), &kb).unwrap();
+    let vbuf = cpu.alloc(vb.len(), BufferUsage::Activations).unwrap();
+    cpu.upload(vbuf.as_ref(), &vb).unwrap();
+    let obuf = cpu
+        .alloc(rows * nh * hd * 4, BufferUsage::Readback)
+        .unwrap();
+    let mut bind = Bindings::new();
+    bind.bind(q, qbuf.as_ref());
+    bind.bind(kc, kbuf.as_ref());
+    bind.bind(vc, vbuf.as_ref());
+    bind.bind(dst, obuf.as_ref());
+    cpu.execute(plan.as_ref(), &bind).unwrap();
+    let mut out = vec![0f32; rows * nh * hd];
+    cpu.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut out))
+        .unwrap();
+
+    // Reference: banded softmax attention in f64, one row at a time.
+    let scale = 1.0 / (hd as f64).sqrt();
+    let mut want = vec![0f64; rows * nh * hd];
+    for ti in 0..rows {
+        let abs = pos + ti;
+        let lo = abs.saturating_sub(band);
+        let hi = (abs + band + 1).min(kv_len);
+        for h in 0..nh {
+            let kvh = h / (nh / nkv.max(1));
+            let qrow = &qv[(ti * nh + h) * hd..(ti * nh + h + 1) * hd];
+            let mut scores = Vec::new();
+            for j in lo..hi {
+                let krow = &kf[(j * nkv + kvh) * hd..(j * nkv + kvh + 1) * hd];
+                let dot: f64 = qrow
+                    .iter()
+                    .zip(krow)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
+                scores.push(dot * scale);
+            }
+            let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            for (n, j) in (lo..hi).enumerate() {
+                let w = exps[n] / sum;
+                let vrow = &vf[(j * nkv + kvh) * hd..(j * nkv + kvh + 1) * hd];
+                for d in 0..hd {
+                    want[(ti * nh + h) * hd + d] += w * vrow[d] as f64;
+                }
+            }
+        }
+    }
+    let want: Vec<f32> = want.into_iter().map(|v| v as f32).collect();
+    let err = maxerr(&out, &want);
+    println!("AttnMask::Banded CPU max_err={err:e}");
+    assert!(
+        err < 1e-5,
+        "banded attention diverges from the reference: {err:e}"
+    );
+}
+
 /// FULL qwen35 attention core in ONE graph/command buffer: QkNormRope(K)→WriteKv (fused peephole,
 /// f16 cache write at rows>1) + WriteKv(V) + Attention — all reading/writing the SAME kc/vc cache
 /// buffers within a single execute. This is what the seam does but the isolated chain above does
